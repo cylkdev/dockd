@@ -3,7 +3,7 @@ defmodule Dockd.GitTool do
   Clones git repositories on the host and uploads them into a running container.
 
   Each spec is a `%{url, dest, ref?, depth?, history?}` map. Cloning happens on the host
-  using the host's `git` binary — so HTTPS or SSH credentials, SSH agents, and `~/.gitconfig`
+  using the host's `git` binary - so HTTPS or SSH credentials, SSH agents, and `~/.gitconfig`
   are reused as-is. The clone runs in a tempdir and is tar-streamed into the container via
   `Docker.put_archive/4`; nothing about the host filesystem outside the tempdir is touched.
 
@@ -11,7 +11,7 @@ defmodule Dockd.GitTool do
   the upload (`history: false`). Set `history: true` to ship the full repository history
   alongside the working tree, and tune `depth` for partial-history mirrors.
 
-  Errors are tagged with phase `:fetch` and carry the partial `Dockd.Session` so the caller
+  Errors are tagged with phase `:fetch` and carry the partial `Dockd.Workspace` so the caller
   can clean up the container.
 
   ## Responsibilities
@@ -25,18 +25,18 @@ defmodule Dockd.GitTool do
 
   ## Examples
 
-      iex> Dockd.GitTool.run([], %Dockd.Session{})
+      iex> Dockd.GitTool.run([], %Dockd.Workspace{})
       :ok
 
   """
 
   alias Dockd.Error
-  alias Dockd.Session
+  alias Dockd.Workspace
 
-  @spec run([map()], Session.t()) :: :ok | {:error, Error.t()}
+  @spec run([map()], Workspace.t()) :: :ok | {:error, Error.t()}
   def run([], _session), do: :ok
 
-  def run(specs, %Session{} = session) when is_list(specs) do
+  def run(specs, %Workspace{} = session) when is_list(specs) do
     with :ok <- ensure_git(session) do
       Enum.reduce_while(specs, :ok, fn spec, :ok ->
         case fetch_one(spec, session) do
@@ -149,7 +149,7 @@ defmodule Dockd.GitTool do
 
   defp ensure_parent("/", _session), do: :ok
 
-  defp ensure_parent(parent, %Session{container_id: id, docker_options: opts} = session) do
+  defp ensure_parent(parent, %Workspace{container_id: id, docker_options: opts} = session) do
     case Docker.exec_run_with_status(id, ["mkdir", "-p", parent], opts) do
       {:ok, %{exit_code: 0}} ->
         :ok
@@ -168,7 +168,7 @@ defmodule Dockd.GitTool do
     end
   end
 
-  defp upload(tar, parent, %Session{container_id: id, docker_options: opts} = session) do
+  defp upload(tar, parent, %Workspace{container_id: id, docker_options: opts} = session) do
     case Docker.put_archive(id, parent, tar, opts) do
       {:ok, _} ->
         :ok

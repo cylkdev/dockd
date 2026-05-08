@@ -196,13 +196,13 @@ defmodule Dockd.EnvTest do
       assert {:error, %Error{phase: phase}} = run(tmp_dir, entries)
       refute phase === :validate
 
-      # Scenario 2: BAZ + QUX unset — default kicks in for BAZ, QUX dropped.
+      # Scenario 2: BAZ + QUX unset - default kicks in for BAZ, QUX dropped.
       System.delete_env("DOCKD_E2E_BAZ")
       System.delete_env("DOCKD_E2E_QUX")
       assert {:error, %Error{phase: phase}} = run(tmp_dir, entries)
       refute phase === :validate
 
-      # Scenario 3: required BAR also unset — validate error names BAR.
+      # Scenario 3: required BAR also unset - validate error names BAR.
       System.delete_env("DOCKD_E2E_BAR")
       assert {:error, %Error{phase: :validate, message: msg}} = run(tmp_dir, entries)
       assert msg =~ "DOCKD_E2E_BAR"

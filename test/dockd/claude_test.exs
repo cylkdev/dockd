@@ -240,7 +240,7 @@ defmodule Dockd.ClaudeTest do
         on_exit(fn -> Dockd.destroy(session) end)
 
         # This test only needs a non-zero exit, which an unauthenticated
-        # session will also produce — that's still a valid error shape
+        # session will also produce - that's still a valid error shape
         # for the contract under test, so we don't gate on auth here.
         assert {:error, err} =
                  Claude.ask(session, "hi",
@@ -299,7 +299,7 @@ defmodule Dockd.ClaudeTest do
           assert {:ok, stream} =
                    Claude.ask_stream(session, "list ten primes", timeout: 120_000)
 
-          # Take just one event then halt — after_fun must close the socket.
+          # Take just one event then halt - after_fun must close the socket.
           first = stream |> Enum.take(1)
           assert length(first) == 1
 

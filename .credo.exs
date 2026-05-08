@@ -114,7 +114,7 @@ allowed_imports = [
           {Credo.Check.Warning.UnusedTupleOperation, []},
           {Credo.Check.Warning.UnsafeExec, []},
 
-          ## Experimental (disabled — enable selectively as the project matures)
+          ## Experimental (disabled - enable selectively as the project matures)
           {Credo.Check.Consistency.MultiAliasImportRequireUse, false},
           {Credo.Check.Consistency.UnusedVariableNames, false},
           {Credo.Check.Design.DuplicatedCode, false},

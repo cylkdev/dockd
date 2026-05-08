@@ -27,7 +27,7 @@ defmodule Mix.Tasks.DockdTest do
       assert ready_msg =~ "docker exec -it"
 
       assert_received {:mix_shell, :info, ["Stopping container..."]}
-      assert_received {:mix_shell, :info, ["Done — container removed."]}
+      assert_received {:mix_shell, :info, ["Done - container removed."]}
     end
   end
 
@@ -47,7 +47,7 @@ defmodule Mix.Tasks.DockdTest do
       assert ready_msg =~ "Destroy:"
 
       refute_received {:mix_shell, :info, ["Stopping container..."]}
-      refute_received {:mix_shell, :info, ["Done — container removed."]}
+      refute_received {:mix_shell, :info, ["Done - container removed."]}
 
       [_, container_name] = Regex.run(~r/docker exec -it (\S+)/, ready_msg)
       assert Docker.container_running?(container_name)
@@ -95,7 +95,7 @@ defmodule Mix.Tasks.DockdTest do
       assert ready_msg =~ "docker exec -it"
 
       assert_received {:mix_shell, :info, ["Stopping container..."]}
-      assert_received {:mix_shell, :info, ["Done — container removed."]}
+      assert_received {:mix_shell, :info, ["Done - container removed."]}
     end
 
     test "builds from a directory containing a Dockerfile" do

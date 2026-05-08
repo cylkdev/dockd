@@ -6,7 +6,7 @@ defmodule Dockd.Error do
   or `Dockd.Package.load/1` is wrapped in this struct. The `phase` field identifies which
   pipeline step failed (`:validate`, `:build`, `:pull`, `:create`, `:start`, `:fetch`,
   `:copy`, `:setup`, `:destroy`) so callers can route on it. When the failure happened after a container was
-  created, `session` carries the partial `Dockd.Session` so the caller can clean up with
+  created, `session` carries the partial `Dockd.Workspace` so the caller can clean up with
   `Dockd.destroy/1`. When the failure was a setup-step exit, `exit_code` and `output` are
   populated from the failing exec.
 
@@ -16,7 +16,7 @@ defmodule Dockd.Error do
 
     - Tag a failure with the pipeline phase that produced it
     - Carry a human-readable `message` summarizing the cause
-    - Attach the partial `Dockd.Session` when a container was created before the failure,
+    - Attach the partial `Dockd.Workspace` when a container was created before the failure,
       so the caller knows what to destroy
     - Capture `exit_code` and `output` from a failing setup step's exec result
     - Normalize structured Docker reasons (status/body, exit_code, output) into a flat
@@ -40,7 +40,7 @@ defmodule Dockd.Error do
   #       nil for non-exec failures.
   #     - output: for :setup failures, the captured stdout/stderr of the failing command;
   #       for HTTP/Docker errors, a body summary; nil otherwise.
-  #     - session: the partial workspace state at the moment of failure — nil when no
+  #     - session: the partial workspace state at the moment of failure - nil when no
   #       container had been created yet (e.g., :validate or :pull errors).
   #   Base case: %Dockd.Error{} with all fields nil represents a generic, unphased error;
   #   real errors always have at least :phase and :message populated.
@@ -49,8 +49,8 @@ defmodule Dockd.Error do
   #   1. When the error originates from `docker_phase_error/4`, :phase and :message are
   #      both non-nil binaries/atoms.
   #   2. :exit_code, when non-nil, is an integer extracted from the underlying reason.
-  #   3. :output, when non-nil, is a binary — never a struct or arbitrary term.
-  #   4. :session is either nil or a valid `Dockd.Session.t()`; never an arbitrary map.
+  #   3. :output, when non-nil, is a binary - never a struct or arbitrary term.
+  #   4. :session is either nil or a valid `Dockd.Workspace.t()`; never an arbitrary map.
   #
   # Commutative Diagram (docker_phase_error/4):
   #
@@ -74,10 +74,10 @@ defmodule Dockd.Error do
           message: binary() | nil,
           exit_code: integer() | nil,
           output: binary() | nil,
-          session: Dockd.Session.t() | nil
+          session: Dockd.Workspace.t() | nil
         }
 
-  @spec docker_phase_error(atom(), binary(), term(), Dockd.Session.t()) :: t()
+  @spec docker_phase_error(atom(), binary(), term(), Dockd.Workspace.t()) :: t()
   def docker_phase_error(phase, message, reason, session) do
     %__MODULE__{
       phase: phase,

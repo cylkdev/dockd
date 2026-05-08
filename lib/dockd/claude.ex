@@ -1,7 +1,7 @@
 defmodule Dockd.Claude do
   @moduledoc """
   Programmatic Q&A against a `claude --print` process inside a prepared
-  `Dockd.Session`.
+  `Dockd.Workspace`.
 
   This module wraps the Claude Code CLI's non-interactive print mode so
   callers can ask questions and receive structured replies without
@@ -37,7 +37,8 @@ defmodule Dockd.Claude do
   `:env`).
   """
 
-  alias Dockd.Session
+  alias Dockd.Workspace
+  alias Docker.Engine.Streaming.Session
 
   @type response :: map()
 
@@ -114,15 +115,15 @@ defmodule Dockd.Claude do
 
   ## Returns
 
-    - `{:ok, decoded}` — exit code was 0 and stdout parsed as JSON.
-    - `{:error, %{reason: :unknown_opt, key: atom}}` — `opts` contained
+    - `{:ok, decoded}` - exit code was 0 and stdout parsed as JSON.
+    - `{:error, %{reason: :unknown_opt, key: atom}}` - `opts` contained
       an unrecognised key. No exec is performed.
-    - `{:error, %{reason: :invalid_json, output: binary}}` — exit code
+    - `{:error, %{reason: :invalid_json, output: binary}}` - exit code
       was 0 but stdout was not valid JSON.
-    - `{:error, %{exit_code: int, output: binary}}` — the CLI exited
+    - `{:error, %{exit_code: int, output: binary}}` - the CLI exited
       non-zero. `output` is the merged stdout+stderr returned by the
       Docker exec primitive.
-    - `{:error, term}` — anything else propagated from the Docker layer.
+    - `{:error, term}` - anything else propagated from the Docker layer.
 
   ## Options
 
@@ -130,8 +131,8 @@ defmodule Dockd.Claude do
   Docker exec primitive as `:receive_timeout`; all other recognised
   keys map to CLI flags via `to_argv/2`.
   """
-  @spec ask(Session.t(), binary(), ask_opts()) :: {:ok, response()} | {:error, term()}
-  def ask(%Session{} = session, prompt, opts \\ []) when is_binary(prompt) and is_list(opts) do
+  @spec ask(Workspace.t(), binary(), ask_opts()) :: {:ok, response()} | {:error, term()}
+  def ask(%Workspace{} = session, prompt, opts \\ []) when is_binary(prompt) and is_list(opts) do
     with {:ok, argv} <- to_argv(opts, :sync) do
       argv = argv ++ [prompt]
       exec_opts = build_exec_opts(session, opts)
@@ -163,23 +164,23 @@ defmodule Dockd.Claude do
 
   ## Returns
 
-    - `{:ok, stream}` — the resource is ready to enumerate. Items are
+    - `{:ok, stream}` - the resource is ready to enumerate. Items are
       maps with at least a `"type"` field (`"system"`, `"assistant"`,
       `"result"`, …).
-    - `{:error, %{reason: :unknown_opt, key: atom}}` — `opts` contained
+    - `{:error, %{reason: :unknown_opt, key: atom}}` - `opts` contained
       an unrecognised key. No exec is performed.
-    - `{:error, %{reason: :stream_only_opt, key: atom}}` — propagated
+    - `{:error, %{reason: :stream_only_opt, key: atom}}` - propagated
       from `to_argv/2` if a stream-only key reaches the sync path
       (cannot happen here in practice).
-    - `{:error, term}` — anything else propagated from the Docker layer.
+    - `{:error, term}` - anything else propagated from the Docker layer.
 
   Each line is decoded with `Jason.decode!/1`; a malformed line will
-  raise `Jason.DecodeError` from inside the stream — the CLI is
+  raise `Jason.DecodeError` from inside the stream - the CLI is
   contractually expected to emit valid newline-delimited JSON.
   """
-  @spec ask_stream(Session.t(), binary(), stream_opts()) ::
+  @spec ask_stream(Workspace.t(), binary(), stream_opts()) ::
           {:ok, Enumerable.t()} | {:error, term()}
-  def ask_stream(%Session{} = session, prompt, opts \\ [])
+  def ask_stream(%Workspace{} = session, prompt, opts \\ [])
       when is_binary(prompt) and is_list(opts) do
     with {:ok, argv} <- to_argv(opts, :stream) do
       argv = argv ++ [prompt]
@@ -206,7 +207,7 @@ defmodule Dockd.Claude do
 
   Pure function exposed for testing. `mode` selects between the
   synchronous (`:sync`) and streaming (`:stream`) output formats. The
-  prompt is *not* included — callers append it as the final positional
+  prompt is *not* included - callers append it as the final positional
   argument.
 
   Returns `{:ok, argv}` on success, or `{:error, %{reason: …}}` if an
@@ -304,13 +305,13 @@ defmodule Dockd.Claude do
   defp opt_to_argv({:include_hook_events, _}, :stream), do: []
 
   # Anything that survived check_opt_keys/2 but didn't match a clause:
-  # be tolerant — drop it.
+  # be tolerant - drop it.
   defp opt_to_argv(_, _), do: []
 
   defp number_to_string(n) when is_integer(n), do: Integer.to_string(n)
   defp number_to_string(n) when is_float(n), do: :erlang.float_to_binary(n, [:short])
 
-  defp build_exec_opts(%Session{docker_options: docker_options}, opts) do
+  defp build_exec_opts(%Workspace{docker_options: docker_options}, opts) do
     case Keyword.fetch(opts, :timeout) do
       {:ok, t} when is_integer(t) and t > 0 ->
         Keyword.put(docker_options, :receive_timeout, t)
@@ -329,21 +330,21 @@ defmodule Dockd.Claude do
 
   # Stream construction.
   #
-  # The accumulator carries the live `Docker.Session.t()` (which is
-  # stateful — recv/3 returns an updated session each call) plus a
+  # The accumulator carries the live `Docker.Engine.Streaming.Session.t()` (which is
+  # stateful - recv/3 returns an updated session each call) plus a
   # leftover-buffer string for any partial line read at the previous
   # boundary.
   defp build_event_stream(exec_session, timeout) do
     Stream.resource(
       fn -> {exec_session, ""} end,
       fn state -> next_events(state, timeout) end,
-      fn {s, _leftover} -> Docker.Session.close(s) end
+      fn {s, _leftover} -> Session.close(s) end
     )
   end
 
   # Returns {events, new_state} | {:halt, state}.
   defp next_events({session, leftover}, timeout) do
-    case Docker.Session.recv(session, {:until, "\n"}, timeout: timeout) do
+    case Session.recv(session, {:until, "\n"}, timeout: timeout) do
       {:ok, chunk, session2} ->
         # `chunk` includes everything up to and including the newline.
         combined = leftover <> chunk
@@ -384,7 +385,7 @@ defmodule Dockd.Claude do
   defp flush_leftover(leftover, session) do
     case Jason.decode(leftover) do
       # Emit the final event, then on the next call we'll see {leftover: ""}
-      # plus a closed session — recv returns {:error, :closed, _}, which
+      # plus a closed session - recv returns {:error, :closed, _}, which
       # will halt cleanly.
       {:ok, event} -> {[event], {session, ""}}
       {:error, _} -> {:halt, {session, ""}}

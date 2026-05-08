@@ -2,7 +2,7 @@ defmodule Dockd do
   @moduledoc """
   A lifecycle manager for ephemeral Docker workspaces.
 
-  Each call to `prepare/2` or `prepare_package/1` yields a `Dockd.Session` struct that
+  Each call to `prepare/2` or `prepare_package/1` yields a `Dockd.Workspace` struct that
   represents a running container, the setup commands that have completed inside it, and the
   `docker exec -it` invocation a caller can paste into a terminal to attach. `destroy/1`
   releases the container when the workspace is no longer needed.
@@ -10,27 +10,27 @@ defmodule Dockd do
   Two complementary modes of use:
 
     - `session.shell_command` is what a *human* pastes into a terminal to attach to the
-      workspace — an interactive REPL.
+      workspace - an interactive REPL.
     - `Dockd.Claude` is the *programmatic* counterpart: it issues `claude --print`
       invocations against a prepared session and returns parsed JSON or a stream of
       JSON events, without any PTY/attach plumbing.
 
   ## Responsibilities
 
-    - Prepare a workspace — pull or build an image, create and start a container, run an
+    - Prepare a workspace - pull or build an image, create and start a container, run an
       ordered list of setup commands inside it
-    - Surface phase-tagged errors — `:validate`, `:build`, `:pull`, `:create`, `:start`,
-      `:fetch`, `:copy`, `:setup` — with a partial `Session` attached when a container was
+    - Surface phase-tagged errors - `:validate`, `:build`, `:pull`, `:create`, `:start`,
+      `:fetch`, `:copy`, `:setup` - with a partial `Workspace` attached when a container was
       created before the failure
-    - Load workspace recipes from JSON packages — bundled by name string
-      (`"claude_code_live_workspace"`, `"claude_code_isolated_workspace"`) or user-authored
+    - Load workspace recipes from JSON packages - bundled by name string
+      (`"claude_code"`, `"claude_code_isolated_workspace"`) or user-authored
       on disk (path string)
-    - Destroy a workspace — stop and remove the container by session or by ID, idempotently
+    - Destroy a workspace - stop and remove the container by session or by ID, idempotently
     - Compute the interactive shell command for a session
 
   ## Examples
 
-      # Side-effectful — requires a running Docker daemon.
+      # Side-effectful - requires a running Docker daemon.
       {:ok, session} = Dockd.prepare("busybox:latest")
       session.shell_command
       #=> "docker exec -it dockd-1 /bin/sh"
@@ -48,14 +48,14 @@ defmodule Dockd do
       :ok = Dockd.destroy(session)
 
       # Load a bundled package and prepare in one call.
-      {:ok, session} = Dockd.prepare_package("claude_code_live_workspace")
+      {:ok, session} = Dockd.prepare_package("claude_code")
 
   """
 
   require Logger
 
   alias Dockd.Error
-  alias Dockd.Session
+  alias Dockd.Workspace
   alias Dockd.StepResult
 
   @option_spec %{
@@ -120,14 +120,14 @@ defmodule Dockd do
     - `options` - `keyword()`. Optional configuration:
       - `:name` - container name (defaults to an auto-generated `"dockd-<id>"`)
       - `:shell` - shell path (defaults to `"/bin/sh"`). Becomes the container's
-        PID 1 — runs as the foreground process, receives stdin from `docker exec`
+        PID 1 - runs as the foreground process, receives stdin from `docker exec`
         attach, and is what `shell_command/1` reuses for the attach invocation.
         The binary must already exist in the image at container start time; if
         the image lacks it, install it via `:build` rather than `:steps`.
       - `:steps` - list of `t:step_spec/0` maps to execute after the container starts
       - `:env` - list of container environment variable entries. Each entry can be a
         literal `"FOO=bar"` string, a bare `"FOO"` (inherits from host; `:validate`
-        error if unset), `{"FOO", value: "bar"}` (literal — no host lookup),
+        error if unset), `{"FOO", value: "bar"}` (literal - no host lookup),
         `{"FOO", default: "fallback"}` (inherits, falls back to a literal default), or
         `{"FOO", optional: true}` (inherits if set; entry is dropped if unset).
       - `:build` - map describing how to build the image locally instead of pulling it
@@ -142,7 +142,7 @@ defmodule Dockd do
       - `:copy` - list of host-to-container file/directory copies, applied after `:repos`
         and before `:steps`. Each entry is a map with `:src` (host path) and `:dest`
         (absolute container path), plus optional `:mode` (e.g. `"0600"`) and `:owner`
-        (e.g. `"root:root"`). Unlike `:mounts`, copies are one-way snapshots — container
+        (e.g. `"root:root"`). Unlike `:mounts`, copies are one-way snapshots - container
         writes do not propagate to the host.
       - `:disk_mount_enabled` - boolean (defaults to `true`). When `false`, every
         option that would expose host files, directories, or host environment is
@@ -156,9 +156,9 @@ defmodule Dockd do
 
   ## Returns
 
-  `{:ok, Session.t()}` when the container is running and all setup steps have completed
+  `{:ok, Workspace.t()}` when the container is running and all setup steps have completed
   with exit code 0. The session contains the `container_id`, computed `shell_command`, and
-  ordered `step_results` matching the input `steps` order. Not idempotent — each call
+  ordered `step_results` matching the input `steps` order. Not idempotent - each call
   creates a new container.
 
   `{:error, Error.t()}` when any phase fails. The error's `phase` field indicates where
@@ -173,7 +173,7 @@ defmodule Dockd do
 
   ## Examples
 
-      # Side-effectful — requires a running Docker daemon.
+      # Side-effectful - requires a running Docker daemon.
       {:ok, session} = Dockd.prepare("busybox:latest")
       session.shell_command
       #=> "docker exec -it dockd-123 /bin/sh"
@@ -204,7 +204,7 @@ defmodule Dockd do
       )
 
   """
-  @spec prepare(binary(), keyword()) :: {:ok, Session.t()} | {:error, Error.t()}
+  @spec prepare(binary(), keyword()) :: {:ok, Workspace.t()} | {:error, Error.t()}
   def prepare(image, options \\ []) when is_binary(image) and is_list(options) do
     with :ok <- check_unknown_options(options),
          {:ok, options} <- enforce_disk_mount_policy(options),
@@ -225,7 +225,7 @@ defmodule Dockd do
   end
 
   # Keys whose presence exposes host files or directories to the container.
-  # `:mounts` covers both legacy bind strings and structured Docker mount maps —
+  # `:mounts` covers both legacy bind strings and structured Docker mount maps -
   # `normalize_mounts/1` runs after this step, so stripping `:mounts` here also
   # prevents `:binds` from being generated downstream.
   @host_path_keys [:mounts, :repos, :copy]
@@ -318,7 +318,7 @@ defmodule Dockd do
       |> rename_keyword(:api_version, :version)
 
     session =
-      Session.new(%{
+      Workspace.new(%{
         container_name: name,
         image: image,
         shell: shell,
@@ -334,12 +334,12 @@ defmodule Dockd do
            normalize_copies(Keyword.get(options, :copy, []), session),
          {:ok, _image_ref} <- resolve_image(session, build),
          {:ok, container_id} <- create_container(session),
-         session <- Session.put(session, %{container_id: container_id}),
+         session <- Workspace.put(session, %{container_id: container_id}),
          {:ok, _} <- start_container(session),
          :ok <- Dockd.GitTool.run(repos, session),
          :ok <- Dockd.CopyTool.run(copies, session),
          {:ok, step_results} <- run_steps(steps, session) do
-      {:ok, Session.put(session, %{step_results: step_results})}
+      {:ok, Workspace.put(session, %{step_results: step_results})}
     end
   end
 
@@ -494,7 +494,7 @@ defmodule Dockd do
 
   ## Returns
 
-  Same as `prepare/2`: `{:ok, Session.t()}` on success, or `{:error, Error.t()}` if the
+  Same as `prepare/2`: `{:ok, Workspace.t()}` on success, or `{:error, Error.t()}` if the
   package cannot be loaded or any prepare phase fails.
 
   ## Side Effects
@@ -504,13 +504,13 @@ defmodule Dockd do
   ## Examples
 
       # Bundled package.
-      {:ok, session} = Dockd.prepare_package("claude_code_live_workspace")
+      {:ok, session} = Dockd.prepare_package("claude_code")
 
       # User-authored package on disk.
       {:ok, session} = Dockd.prepare_package("./packages/my-stack.json")
 
   """
-  @spec prepare_package(binary()) :: {:ok, Session.t()} | {:error, Error.t()}
+  @spec prepare_package(binary()) :: {:ok, Workspace.t()} | {:error, Error.t()}
   def prepare_package(ref) when is_binary(ref) do
     with {:ok, {image, opts}} <- Dockd.Package.load(ref) do
       prepare(image, opts)
@@ -522,13 +522,13 @@ defmodule Dockd do
 
   ## Parameters
 
-    - `session_or_ref` - `Session.t() | binary()`. A session returned by `prepare/2`, or
+    - `session_or_ref` - `Workspace.t() | binary()`. A session returned by `prepare/2`, or
       a container ID or name as a string. When a string is given, a temporary session is
       constructed internally.
 
   ## Returns
 
-  `:ok` when the container has been stopped and removed. Idempotent — returns `:ok` even
+  `:ok` when the container has been stopped and removed. Idempotent - returns `:ok` even
   if the container was already stopped or removed (Docker 304/404 responses are tolerated).
 
   `{:error, Error.t()}` when the container cannot be destroyed. Returns an error if the
@@ -540,7 +540,7 @@ defmodule Dockd do
 
   ## Examples
 
-      # Side-effectful — requires a running Docker daemon.
+      # Side-effectful - requires a running Docker daemon.
       {:ok, session} = Dockd.prepare("busybox:latest")
       :ok = Dockd.destroy(session)
 
@@ -548,8 +548,8 @@ defmodule Dockd do
       :ok = Dockd.destroy("my-container-id")
 
   """
-  @spec destroy(Session.t() | binary()) :: :ok | {:error, Error.t()}
-  def destroy(%Session{container_id: nil} = session) do
+  @spec destroy(Workspace.t() | binary()) :: :ok | {:error, Error.t()}
+  def destroy(%Workspace{container_id: nil} = session) do
     {:error,
      %Error{
        phase: :destroy,
@@ -558,7 +558,7 @@ defmodule Dockd do
      }}
   end
 
-  def destroy(%Session{} = session) do
+  def destroy(%Workspace{} = session) do
     with :ok <- stop_container(session),
          :ok <- delete_container(session) do
       :ok
@@ -567,7 +567,7 @@ defmodule Dockd do
 
   def destroy(container_ref) when is_binary(container_ref) do
     session =
-      Session.new(%{
+      Workspace.new(%{
         container_id: container_ref,
         container_name: container_ref,
         shell: @default_shell
@@ -584,23 +584,23 @@ defmodule Dockd do
 
   ## Parameters
 
-    - `session` - `Session.t()`. A session with `container_name` and `shell` fields set.
+    - `session` - `Workspace.t()`. A session with `container_name` and `shell` fields set.
 
   ## Returns
 
-  `binary()` — a shell command string with special characters in `container_name` and `shell`
-  escaped for safe use in a terminal. Deterministic — the same session always produces the
+  `binary()` - a shell command string with special characters in `container_name` and `shell`
+  escaped for safe use in a terminal. Deterministic - the same session always produces the
   same command. Never `nil`.
 
   ## Examples
 
-      iex> session = %Dockd.Session{container_name: "dockd-1", shell: "/bin/bash"}
+      iex> session = %Dockd.Workspace{container_name: "dockd-1", shell: "/bin/bash"}
       iex> Dockd.shell_command(session)
       "docker exec -it dockd-1 /bin/bash"
 
   """
-  @spec shell_command(Session.t()) :: binary()
-  def shell_command(%Session{} = session), do: Session.shell_command(session)
+  @spec shell_command(Workspace.t()) :: binary()
+  def shell_command(%Workspace{} = session), do: Workspace.shell_command(session)
 
   defp validate_source(_image, %{} = build, session) do
     case Map.get(build, :dockerfile) || Map.get(build, "dockerfile") do
@@ -795,7 +795,7 @@ defmodule Dockd do
   defp resolve_image(session, %{} = build), do: build_image(session, build)
   defp resolve_image(session, nil), do: pull_image(session)
 
-  defp build_image(%Session{image: tag, docker_options: docker_options} = session, build) do
+  defp build_image(%Workspace{image: tag, docker_options: docker_options} = session, build) do
     dockerfile = atomize_key(build, :dockerfile)
     context = atomize_key(build, :context)
     expanded = Path.expand(dockerfile)
@@ -882,14 +882,14 @@ defmodule Dockd do
     end
   end
 
-  defp pull_image(%Session{image: image, docker_options: docker_options} = session) do
+  defp pull_image(%Workspace{image: image, docker_options: docker_options} = session) do
     docker_call(session, :pull, "failed to pull Docker image", fn ->
       Docker.pull_image(image, %{}, docker_options)
     end)
   end
 
   defp create_container(
-         %Session{
+         %Workspace{
            container_name: name,
            image: image,
            shell: shell,
@@ -912,7 +912,7 @@ defmodule Dockd do
   end
 
   defp start_container(
-         %Session{container_id: container_id, docker_options: docker_options} = session
+         %Workspace{container_id: container_id, docker_options: docker_options} = session
        ) do
     docker_call(session, :start, "failed to start Docker container", fn ->
       Docker.start_container(container_id, docker_options)
@@ -921,7 +921,7 @@ defmodule Dockd do
 
   defp run_steps(
          steps,
-         %Session{container_id: container_id, docker_options: docker_options} = session
+         %Workspace{container_id: container_id, docker_options: docker_options} = session
        ) do
     Enum.reduce_while(steps, {:ok, []}, fn step, {:ok, acc} ->
       exec_options =
@@ -945,7 +945,7 @@ defmodule Dockd do
           if exit_code in [0, nil] do
             {:cont, {:ok, acc ++ [step_result]}}
           else
-            error_session = Session.put(session, %{step_results: acc ++ [step_result]})
+            error_session = Workspace.put(session, %{step_results: acc ++ [step_result]})
 
             {:halt,
              {:error,
@@ -972,7 +972,7 @@ defmodule Dockd do
   end
 
   defp stop_container(
-         %Session{container_id: container_id, docker_options: docker_options} = session
+         %Workspace{container_id: container_id, docker_options: docker_options} = session
        ) do
     docker_call_tolerant(session, :destroy, "failed to stop Docker container", [304, 404], fn ->
       Docker.stop_container(container_id, docker_options)
@@ -980,7 +980,7 @@ defmodule Dockd do
   end
 
   defp delete_container(
-         %Session{container_id: container_id, docker_options: docker_options} = session
+         %Workspace{container_id: container_id, docker_options: docker_options} = session
        ) do
     docker_call_tolerant(session, :destroy, "failed to delete Docker container", [404], fn ->
       Docker.delete_container(container_id, %{force: true}, docker_options)

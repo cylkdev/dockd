@@ -13,16 +13,16 @@ defmodule Dockd.Package do
   default produces a validation error that names the variable and its JSON path. Keys are
   never interpolated.
 
-  The `"env"` field accepts only JSON objects — strings are not permitted in package
+  The `"env"` field accepts only JSON objects - strings are not permitted in package
   JSON. Each object has a required `"name"` key plus at most one of:
 
-    - `"value": "literal"` — set `name=literal` in the container; no host lookup.
-    - `"default": "fallback"` — inherit from the host; fall back to the literal default
+    - `"value": "literal"` - set `name=literal` in the container; no host lookup.
+    - `"default": "fallback"` - inherit from the host; fall back to the literal default
       when the host variable is unset.
-    - `"optional": true` — inherit from the host when set; drop the entry when unset.
+    - `"optional": true` - inherit from the host when set; drop the entry when unset.
 
   A bare `{"name": "FOO"}` (no `value`, `default`, or `optional`) is a required
-  passthrough — a `:validate` error is raised when `FOO` is unset on the host.
+  passthrough - a `:validate` error is raised when `FOO` is unset on the host.
 
   Bare strings and tuples remain available through the Elixir API (`Dockd.prepare/2`
   with `env: [...]`); only the JSON loader enforces the object-only shape.
@@ -31,7 +31,7 @@ defmodule Dockd.Package do
   container before setup steps run. `"repos"` clones git repositories on the host and
   uploads the working tree (a shallow clone by default; opt into history with
   `"history": true`). `"copy"` ships host files or directories into the container as
-  one-way snapshots. The third — `"mounts"` — accepts both legacy `"host:container[:ro]"`
+  one-way snapshots. The third - `"mounts"` - accepts both legacy `"host:container[:ro]"`
   strings (mapped to Docker's `HostConfig.Binds`) and modern structured maps
   (`{"type": "tmpfs", "target": "/scratch"}`, mapped to `HostConfig.Mounts`). Use
   `"mounts"` when you want the host and container to share a directory live; use
@@ -39,7 +39,7 @@ defmodule Dockd.Package do
 
   ## Responsibilities
 
-    - Resolve a package reference — string name (bundled) or path (file) — to a JSON
+    - Resolve a package reference - string name (bundled) or path (file) - to a JSON
       file and read it
     - Recursively expand `${VAR}` substitutions from the host environment, with
       JSON-path-aware errors when a variable is unset
@@ -47,7 +47,7 @@ defmodule Dockd.Package do
       allow-list mirroring `Dockd.prepare/2` options, `image` must be present and a string
     - Convert validated string keys to the atom keyword list shape `Dockd.prepare/2`
       requires, including the nested `build` map's allow-listed keys
-    - Pass `setup_steps`-style entries through verbatim — `Dockd.prepare/2` already
+    - Pass `setup_steps`-style entries through verbatim - `Dockd.prepare/2` already
       accepts string-keyed step maps, so no nested conversion happens here
 
   ## Example packages
@@ -70,7 +70,7 @@ defmodule Dockd.Package do
 
   Share the host's `~/.claude` directory so the OAuth login persists across container
   restarts. On macOS the credentials live in the system keychain, so log in once with
-  `claude login` inside the container — the token is then written to
+  `claude login` inside the container - the token is then written to
   `~/.claude/.credentials.json`, which sits on the host via the bind:
 
       {
@@ -140,13 +140,13 @@ defmodule Dockd.Package do
   @doc """
   Loads a package and returns `{image, opts}` ready for `Dockd.prepare/2`.
 
-  Always takes a string — never an atom — so package selection stays stateless and
+  Always takes a string - never an atom - so package selection stays stateless and
   doesn't grow the BEAM atom table at runtime. The string is resolved to a JSON file
   using a single deterministic rule:
 
     - If `ref` ends with `.json` or contains `/`, it is a path to a JSON file on disk
       (loaded as-is, relative paths resolved against the current working directory).
-    - Otherwise, `ref` is a **bundled name** — the basename of a file shipped in
+    - Otherwise, `ref` is a **bundled name** - the basename of a file shipped in
       `priv/packages/<ref>.json`.
 
   Bundled names are tied 1:1 to filenames in `priv/packages/`, so listing the
@@ -159,7 +159,7 @@ defmodule Dockd.Package do
 
   ## Returns
 
-  `{:ok, {binary(), keyword()}}` on success — `image` is the first positional argument and
+  `{:ok, {binary(), keyword()}}` on success - `image` is the first positional argument and
   `opts` is the keyword list of remaining options.
 
   `{:error, Dockd.Error.t()}` with `phase: :validate` for any failure: file read errors,

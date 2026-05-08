@@ -3,8 +3,8 @@ defmodule Mix.Tasks.Dockd do
   A CLI front-end for `Dockd` that starts an ephemeral Docker workspace and prints the
   attach command.
 
-  The task picks one of four sources for the workspace — registry image, Dockerfile,
-  JSON package on disk, or bundled package by name — calls into `Dockd.prepare/2` (or
+  The task picks one of four sources for the workspace - registry image, Dockerfile,
+  JSON package on disk, or bundled package by name - calls into `Dockd.prepare/2` (or
   `Dockd.Package.load/1` first), prints the `docker exec -it` invocation the user should
   run in another terminal, and blocks on `IO.gets/1`. Pressing Enter destroys the
   container and exits.
@@ -17,7 +17,7 @@ defmodule Mix.Tasks.Dockd do
       package …", "Loading preset …") so the caller knows what's happening
     - Hand off to `Dockd.prepare/2` and surface its phase-tagged errors verbatim
     - Block the invoking terminal until the user presses Enter, then call
-      `Dockd.destroy/1` to clean up — the workspace is always torn down before the task
+      `Dockd.destroy/1` to clean up - the workspace is always torn down before the task
       exits successfully
 
   ## Usage
@@ -54,14 +54,14 @@ defmodule Mix.Tasks.Dockd do
 
       ANTHROPIC_API_KEY=<your-key> mix dockd --preset claude_code_live_workspace
 
-  Suppress all output except the bare attach command — useful when scripting:
+  Suppress all output except the bare attach command - useful when scripting:
 
       mix dockd --preset claude_code_live_workspace --short
 
   In `--short` mode the task still blocks on Enter and destroys the container when
   released; only the progress and ready/cleanup banners are silenced.
 
-  Start a container and exit without waiting — the container keeps running after the
+  Start a container and exit without waiting - the container keeps running after the
   task ends, so closing the terminal doesn't tear it down:
 
       mix dockd --preset claude_code_live_workspace --detached
@@ -75,7 +75,7 @@ defmodule Mix.Tasks.Dockd do
   `docker rm -f <name>` or `Dockd.destroy/1`).
 
   Pin a known container name so cleanup doesn't depend on remembering the auto-generated
-  one — pairs well with `--detached`:
+  one - pairs well with `--detached`:
 
       mix dockd --preset claude_code_live_workspace --detached --name claude-work
       # ...later, from anywhere:
@@ -184,7 +184,7 @@ defmodule Mix.Tasks.Dockd do
           IO.gets("")
           unless short?, do: Mix.shell().info("Stopping container...")
           Dockd.destroy(session)
-          unless short?, do: Mix.shell().info("Done — container removed.")
+          unless short?, do: Mix.shell().info("Done - container removed.")
         end
 
       {:error, error} ->
@@ -198,7 +198,7 @@ defmodule Mix.Tasks.Dockd do
   defp announce_ready(session, false, true = _detached) do
     Mix.shell().info("""
 
-    Container is ready (detached — will keep running after this task exits).
+    Container is ready (detached - will keep running after this task exits).
 
         Connect: #{session.shell_command}
         Destroy: docker rm -f #{session.container_name}

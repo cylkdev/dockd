@@ -78,8 +78,8 @@ Dockd.destroy(session)
 | `:steps` | `[]` | Commands to run inside the container before it's ready |
 | `:repos` | `[]` | Git repositories to clone on the host and upload into the container |
 | `:copy` | `[]` | Files or directories to ship from the host into the container as one-way snapshots |
-| `:mounts` | `[]` | Live host↔container shares — strings (`"host:container[:ro]"`) or structured maps (`%{type:, source:, target:, ...}`) |
-| `:env` | `[]` | Container env entries — literal `"K=V"`, bare `"FOO"` (inherits from host), or `{"FOO", default: "x"}` |
+| `:mounts` | `[]` | Live host↔container shares - strings (`"host:container[:ro]"`) or structured maps (`%{type:, source:, target:, ...}`) |
+| `:env` | `[]` | Container env entries - literal `"K=V"`, bare `"FOO"` (inherits from host), or `{"FOO", default: "x"}` |
 | `:build` | `nil` | Build the image locally from a `%{dockerfile:, context:, args:, ...}` map instead of pulling |
 | `:api_version` | daemon default | Docker Engine API version to talk to |
 
@@ -91,8 +91,8 @@ Each setup step is a map with a `:label` and a `:cmd` (list of strings):
 
 ## Packages
 
-A **package** is a JSON file that describes a complete workspace — image, shell,
-files to bring in, setup commands — so you can launch a reusable environment with
+A **package** is a JSON file that describes a complete workspace - image, shell,
+files to bring in, setup commands - so you can launch a reusable environment with
 one call. Packages are the fastest way to share a "stack" (e.g. "Node 20 with
 claude-code installed and `~/.claude` mounted") with someone else: hand them the
 file, they run `Dockd.prepare_package("./my-stack.json")`, and they get the same
@@ -176,7 +176,7 @@ image will receive instead.
 #### `shell` (string, default `"/bin/sh"`)
 
 Path inside the container that an interactive `docker exec -it` should launch.
-Use the entrypoint of whatever tool you actually want — for an SSH-style shell,
+Use the entrypoint of whatever tool you actually want - for an SSH-style shell,
 `"/bin/bash"`; for a CLI tool that runs as a single binary, point directly at it
 (e.g. `"claude"`).
 
@@ -192,11 +192,11 @@ Container environment variables. Each entry can be one of three shapes:
 
 | Shape | Behavior |
 |-------|----------|
-| `"FOO=bar"` | literal — passed through unchanged |
+| `"FOO=bar"` | literal - passed through unchanged |
 | `"FOO"` (no `=`) | inherit from the host environment; **`:validate` error if unset** |
 | `["FOO", {"default": "fallback"}]` (Elixir tuple `{"FOO", default: "fallback"}`) | inherit, fall back to the literal default if unset |
 
-`${VAR}` substitutions inside values still work — see
+`${VAR}` substitutions inside values still work - see
 [Environment interpolation](#environment-interpolation).
 
 ```json
@@ -214,11 +214,11 @@ Live host↔container shares. Each entry can be one of two shapes:
 
 | Shape | Maps to | Use when |
 |-------|---------|----------|
-| `"host:container"` or `"host:container:ro"` | `HostConfig.Binds` (legacy string format) | the simple case — sharing one directory |
+| `"host:container"` or `"host:container:ro"` | `HostConfig.Binds` (legacy string format) | the simple case - sharing one directory |
 | `%{type:, source:, target:, ...}` map | `HostConfig.Mounts` (structured) | tmpfs, named volumes, or bind mounts with options |
 
 Both sides see each other's writes (when applicable). The map shape mirrors
-Docker's modern `--mount` flag — use `type: "bind"` with `:source` and `:target`,
+Docker's modern `--mount` flag - use `type: "bind"` with `:source` and `:target`,
 or `type: "tmpfs"` with `:target`, etc.
 
 ```json
@@ -236,14 +236,14 @@ entry supports:
 
 | Key | Required | Description |
 |-----|----------|-------------|
-| `url` | yes | Git URL — anything `git clone` accepts (HTTPS, SSH, file path) |
+| `url` | yes | Git URL - anything `git clone` accepts (HTTPS, SSH, file path) |
 | `dest` | yes | Absolute path inside the container; the working tree appears here |
 | `ref` | no | Branch or tag to check out (passed as `--branch`) |
 | `depth` | no | Clone depth; defaults to `1` (shallow). Set to a larger integer for partial history |
 | `history` | no | If `true`, ship the `.git` directory along with the working tree. Defaults to `false` |
 
 Cloning runs on the host using your installed `git` binary, so HTTPS credentials,
-SSH keys/agents, and `~/.gitconfig` are reused as-is — there's no need to bake
+SSH keys/agents, and `~/.gitconfig` are reused as-is - there's no need to bake
 credentials into the image.
 
 ```json
@@ -264,7 +264,7 @@ One-way snapshots from the host into the container. Each entry supports:
 | `mode` | no | Permission bits applied with `chmod -R` after upload (e.g. `"0600"`) |
 | `owner` | no | Ownership applied with `chown -R` after upload (e.g. `"root:root"`) |
 
-Unlike `binds`, the container receives its own copy — writes inside the container
+Unlike `binds`, the container receives its own copy - writes inside the container
 do **not** propagate to the host. Use this when you want the container to be
 isolated from later host edits, or when you want to copy in something Docker
 volumes can't represent (a single file with tightened permissions, for example).
@@ -278,10 +278,10 @@ volumes can't represent (a single file with tightened permissions, for example).
 
 When to choose `repos` vs. `copy` vs. `mounts`:
 
-- **`mounts`** — the container should see live host changes, and vice versa.
-- **`copy`** — the container needs an isolated snapshot, and the host should be
+- **`mounts`** - the container should see live host changes, and vice versa.
+- **`copy`** - the container needs an isolated snapshot, and the host should be
   unaffected by container writes.
-- **`repos`** — the source of truth lives in git and shouldn't have to be on the
+- **`repos`** - the source of truth lives in git and shouldn't have to be on the
   host already.
 
 #### `steps` (list of maps)
@@ -292,7 +292,7 @@ the workspace is considered ready. Each step is a map:
 | Key | Required | Description |
 |-----|----------|-------------|
 | `label` | yes | Human-readable name shown in errors and `step_results` |
-| `cmd` | yes | Argv list (e.g. `["npm", "install"]`) — never a single string |
+| `cmd` | yes | Argv list (e.g. `["npm", "install"]`) - never a single string |
 | `env` | no | Per-step env entries, on top of the container's env |
 | `workdir` | no | Working directory for this step |
 | `user` | no | User to run the step as |
@@ -332,7 +332,7 @@ triggers the pull path.
 
 #### Connection options
 
-`socket`, `host`, `api_version`, `platform`, `networks`, `network_mode` — passed
+`socket`, `host`, `api_version`, `platform`, `networks`, `network_mode` - passed
 through to the Docker connection. Default to your daemon's defaults; only set
 when you need to talk to a non-default daemon.
 
@@ -352,9 +352,9 @@ can land on top of a directory that was just created by a `repo` clone.
 Every string value (not key) is recursively scanned for `${VAR}` references and
 substituted from your shell's environment:
 
-- `${HOME}` — required: missing variables produce a `:validate` error pointing
+- `${HOME}` - required: missing variables produce a `:validate` error pointing
   at the JSON path (e.g. `$.copy[0].src`).
-- `${HOME:-default}` — fall back to a literal default when the variable is unset.
+- `${HOME:-default}` - fall back to a literal default when the variable is unset.
 - Multiple references in one string are all substituted (`"${USER}@${HOST}"`).
 - Substitution happens before validation, so a `${VAR}` inside a list or nested
   map is fine.
@@ -372,10 +372,10 @@ substituted from your shell's environment:
 Two entry points:
 
 ```elixir
-# A path on disk — typical for project-local packages.
+# A path on disk - typical for project-local packages.
 {:ok, session} = Dockd.prepare_package("./packages/python.json")
 
-# A bare name — resolves to priv/packages/<name>.json shipped with dockd.
+# A bare name - resolves to priv/packages/<name>.json shipped with dockd.
 {:ok, session} = Dockd.prepare_package("claude_code_live_workspace")
 ```
 
@@ -397,19 +397,19 @@ canonical catalog of presets. The bundled presets:
 
 | Name | What you get |
 |------|--------------|
-| `"claude_code_live_workspace"` | Live bind of `${PWD}` at `/workspace`, shared `~/.claude` for OAuth — claude's edits land back on the host. |
-| `"claude_code_isolated_workspace"` | One-way snapshot of `${PWD}` at `/workspace/project`, plus a single `~/dockd-output → /workspace/output` bind — host source stays pristine, results land in one named directory. Uses `ANTHROPIC_API_KEY` rather than shared OAuth. |
+| `"claude_code_live_workspace"` | Live bind of `${PWD}` at `/workspace`, shared `~/.claude` for OAuth - claude's edits land back on the host. |
+| `"claude_code_isolated_workspace"` | One-way snapshot of `${PWD}` at `/workspace/project`, plus a single `~/dockd-output → /workspace/output` bind - host source stays pristine, results land in one named directory. Uses `ANTHROPIC_API_KEY` rather than shared OAuth. |
 | `"claude_code_repo_workspace"` | Shallow-clones `${DOCKD_REPO_URL}` (optional `${DOCKD_REPO_REF}`, default `main`) into `/workspace/repo`, plus a single `~/dockd-output → /workspace/output` bind. Host's `git` credentials handle the clone; `ANTHROPIC_API_KEY` is required and `GITHUB_TOKEN` is forwarded if set. |
 
 To add your own bundled package, drop a JSON file in that directory (or its
 equivalent in your dependent project's priv) and reference it with
 `Dockd.prepare_package("my_name")`. Pick a filename that describes the
-workspace shape — `python_test_runner.json`, `node_with_postgres.json`, etc. —
+workspace shape - `python_test_runner.json`, `node_with_postgres.json`, etc. -
 so collaborators can tell presets apart at a glance.
 
 The lookup rule is purely lexical: a string with no `/` and no `.json` suffix
 is a bundled name; anything else is a path. This keeps `Package.load/1`
-deterministic and stateless — the BEAM atom table never grows from preset
+deterministic and stateless - the BEAM atom table never grows from preset
 names.
 
 ### Error handling
@@ -425,7 +425,7 @@ where things went wrong:
 | `:create`, `:start` | Docker daemon refused the container |
 | `:fetch` | `git clone` failed, or upload to the container failed |
 | `:copy` | Source path doesn't exist on the host, or upload failed |
-| `:setup` | A `step` exited non-zero — `error.exit_code` and `error.output` are populated |
+| `:setup` | A `step` exited non-zero - `error.exit_code` and `error.output` are populated |
 
 When a container was created before the failure, `error.session` is a partial
 session you should pass to `Dockd.destroy/1` to clean up.
@@ -450,9 +450,9 @@ end
 
 - **Keep packages in your repo** so collaborators get the same workspace.
   `./packages/<stack>.json` is a good convention.
-- **Prefer bare-name `env` entries over hard-coded literals** for secrets —
+- **Prefer bare-name `env` entries over hard-coded literals** for secrets -
   `"env": ["GITHUB_TOKEN"]` reads from the host without committing the value.
 - **Use `${PWD}` and `${HOME}`** in `mounts`/`copy` so the same package works
   for everyone on the team.
 - **Test a package locally** with `Dockd.Package.load("./mystack.json")` before
-  preparing — load runs all validation without touching Docker.
+  preparing - load runs all validation without touching Docker.

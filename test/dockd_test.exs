@@ -313,7 +313,7 @@ defmodule DockdTest do
   describe "prepare/2 with :disk_mount_enabled" do
     # Use a path that exists locally so validate_source/3 short-circuits with a
     # :validate error after enforce_disk_mount_policy/1 has already emitted its
-    # logs — exercising the policy without needing a Docker daemon.
+    # logs - exercising the policy without needing a Docker daemon.
     @local_image "."
 
     test "default leaves host-exposing options intact and emits no strip log" do

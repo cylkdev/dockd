@@ -2,8 +2,8 @@ defmodule Dockd.Application do
   @moduledoc """
   The OTP application entry point for `Dockd`.
 
-  Dockd has no long-lived processes of its own — every workspace is short-lived and
-  managed by the calling process — so `start/2` brings up an empty `:one_for_one`
+  Dockd has no long-lived processes of its own - every workspace is short-lived and
+  managed by the calling process - so `start/2` brings up an empty `:one_for_one`
   supervisor named `Dockd.Supervisor`. The supervisor exists so that future additions
   (background workers, telemetry handlers) have a defined parent without callers needing
   to restructure their app.

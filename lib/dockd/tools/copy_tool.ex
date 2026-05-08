@@ -5,13 +5,13 @@ defmodule Dockd.CopyTool do
   Each spec is a `%{src, dest, mode?, owner?}` map. `src` is a host path (file or directory);
   `dest` is the absolute path the entry should appear at inside the container. The contents
   of `src` are tar-streamed to the container via `Docker.put_archive/4`, so the host files
-  are never modified — unlike a bind mount, the container has its own copy.
+  are never modified - unlike a bind mount, the container has its own copy.
 
   Missing parent directories at `dest` are created with `mkdir -p` before the upload, so
   callers don't need to bake that into setup steps. After upload, `:mode` (e.g., `"0600"`)
   and `:owner` (e.g., `"root:root"`) are applied with `chmod`/`chown` exec calls.
 
-  Errors are tagged with phase `:copy` and carry the partial `Dockd.Session` so the caller
+  Errors are tagged with phase `:copy` and carry the partial `Dockd.Workspace` so the caller
   can clean up the container.
 
   ## Responsibilities
@@ -27,18 +27,18 @@ defmodule Dockd.CopyTool do
 
   ## Examples
 
-      iex> Dockd.CopyTool.run([], %Dockd.Session{})
+      iex> Dockd.CopyTool.run([], %Dockd.Workspace{})
       :ok
 
   """
 
   alias Dockd.Error
-  alias Dockd.Session
+  alias Dockd.Workspace
 
-  @spec run([map()], Session.t()) :: :ok | {:error, Error.t()}
+  @spec run([map()], Workspace.t()) :: :ok | {:error, Error.t()}
   def run([], _session), do: :ok
 
-  def run(specs, %Session{} = session) when is_list(specs) do
+  def run(specs, %Workspace{} = session) when is_list(specs) do
     Enum.reduce_while(specs, :ok, fn spec, :ok ->
       case copy_one(spec, session) do
         :ok -> {:cont, :ok}
@@ -119,7 +119,7 @@ defmodule Dockd.CopyTool do
 
   defp ensure_parent("/", _session), do: :ok
 
-  defp ensure_parent(parent, %Session{container_id: id, docker_options: opts} = session) do
+  defp ensure_parent(parent, %Workspace{container_id: id, docker_options: opts} = session) do
     case Docker.exec_run_with_status(id, ["mkdir", "-p", parent], opts) do
       {:ok, %{exit_code: 0}} ->
         :ok
@@ -137,7 +137,7 @@ defmodule Dockd.CopyTool do
     end
   end
 
-  defp upload(tar, parent, %Session{container_id: id, docker_options: opts} = session) do
+  defp upload(tar, parent, %Workspace{container_id: id, docker_options: opts} = session) do
     case Docker.put_archive(id, parent, tar, opts) do
       {:ok, _} -> :ok
       {:error, reason} -> error(:copy, "failed to upload archive to #{parent}", reason, session)
@@ -146,7 +146,7 @@ defmodule Dockd.CopyTool do
 
   defp maybe_chmod(nil, _dest, _session), do: :ok
 
-  defp maybe_chmod(mode, dest, %Session{container_id: id, docker_options: opts} = session) do
+  defp maybe_chmod(mode, dest, %Workspace{container_id: id, docker_options: opts} = session) do
     case Docker.exec_run_with_status(id, ["chmod", "-R", mode, dest], opts) do
       {:ok, %{exit_code: 0}} ->
         :ok
@@ -166,7 +166,7 @@ defmodule Dockd.CopyTool do
 
   defp maybe_chown(nil, _dest, _session), do: :ok
 
-  defp maybe_chown(owner, dest, %Session{container_id: id, docker_options: opts} = session) do
+  defp maybe_chown(owner, dest, %Workspace{container_id: id, docker_options: opts} = session) do
     case Docker.exec_run_with_status(id, ["chown", "-R", owner, dest], opts) do
       {:ok, %{exit_code: 0}} ->
         :ok

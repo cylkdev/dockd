@@ -3,7 +3,7 @@ defmodule Dockd.StepResult do
   The captured outcome of a single setup step that ran inside a Dockd container.
 
   Each step from a `Dockd.prepare/2` `:steps` list produces one of these in
-  `Dockd.Session.step_results`, in input order. Together with the step's `:label` and
+  `Dockd.Workspace.step_results`, in input order. Together with the step's `:label` and
   `:cmd`, the struct preserves the env/workdir/user the step ran with, the captured
   combined stdout+stderr, and the process exit code.
 
@@ -32,13 +32,13 @@ defmodule Dockd.StepResult do
   #     - env / workdir / user: the per-step exec options the step ran with, copied from
   #       the spec; nil when the spec did not set them.
   #   Base case: %Dockd.StepResult{} with all fields nil/empty has no meaningful
-  #   interpretation — every materialized step result has at least :label, :cmd, and
+  #   interpretation - every materialized step result has at least :label, :cmd, and
   #   :output populated.
   #
   # Data Invariant:
-  #   1. :label is a non-empty binary — always populated when the step ran.
-  #   2. :cmd is a non-empty list of binaries — the argv that was exec'd.
-  #   3. :output is a binary (possibly empty), never nil — the capture is always defined.
+  #   1. :label is a non-empty binary - always populated when the step ran.
+  #   2. :cmd is a non-empty list of binaries - the argv that was exec'd.
+  #   3. :output is a binary (possibly empty), never nil - the capture is always defined.
   #   4. :exit_code is either an integer or nil; never a binary or other type.
   #   5. :env, when non-nil, is a list of binaries; :workdir and :user, when non-nil,
   #      are binaries.
