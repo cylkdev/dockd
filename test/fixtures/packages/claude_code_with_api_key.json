@@ -1,0 +1,12 @@
+{
+  "image": "node:20-slim",
+  "shell": "claude",
+  "env": [{"name": "ANTHROPIC_API_KEY"}],
+  "mounts": ["${PWD}:/workspace"],
+  "steps": [
+    {
+      "label": "install claude-code",
+      "cmd": ["npm", "install", "-g", "@anthropic-ai/claude-code"]
+    }
+  ]
+}

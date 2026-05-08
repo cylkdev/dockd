@@ -1,0 +1,2 @@
+# .dialyzer-ignore.exs
+[]

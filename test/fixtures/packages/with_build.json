@@ -1,0 +1,4 @@
+{
+  "image": "dockd-test:rel-build",
+  "build": { "dockerfile": "../Dockerfile" }
+}
