@@ -6,7 +6,7 @@ HTTP request/response behavior, so regular HTTP libraries can handle them withou
 problems.
 
 Interactive container execution is different. When you start or attach to a running
-exec session using endpoints like `/exec/{id}/start`, Docker replies with `101 Switching Protocols`.
+exec instance using endpoints like `/exec/{id}/start`, Docker replies with `101 Switching Protocols`.
 That response means HTTP is finished and the underlying socket connection is now
 handed directly to the client for raw two-way communication.
 
@@ -42,7 +42,7 @@ handles the differences between framed and raw stream behavior using the `tty` f
 
 The full execution flow in this repository works like this:
 
-`Docker.exec_session/3`
+`Docker.exec_instance/3`
 1. creates an exec instance in Docker and receives an `exec_id`
 
 `Sorrel.tunnel/5`
@@ -51,7 +51,7 @@ The full execution flow in this repository works like this:
 3. returns the upgraded raw socket and any leftover buffered bytes
 
 `Docker.Engine.Streaming.Session.from_upgrade/3`
-1. wraps the socket and stream state into a session struct
+1. wraps the socket and stream state into a instance struct
 
 `Session.recv/3`
 1. reads bytes from the socket

@@ -1,23 +1,20 @@
 {
+  "name": "claude_code",
+  "description": "Anthropic Claude Code CLI with the current working directory mounted at /instance and host Claude credentials shared in.",
   "image": "dockd/claude-code:latest",
   "shell": "claude",
-  "build": { "dockerfile": "claude_code.Dockerfile" },
+  "build": { "dockerfile": "Dockerfile" },
   "mounts": [
-    "${PWD}:/workspace",
+    "${PWD}:/instance",
     "${HOME}/.claude:/root/.claude",
     "${HOME}/.claude.json:/root/.claude.json"
   ],
   "env": [
     {"name": "ANTHROPIC_API_KEY", "optional": true},
     {"name": "CLAUDE_CODE_OAUTH_TOKEN", "optional": true},
-    {"name": "CLAUDE_CODE_USE_BEDROCK", "optional": true},
     {"name": "AWS_ACCESS_KEY_ID", "optional": true},
     {"name": "AWS_SECRET_ACCESS_KEY", "optional": true},
     {"name": "AWS_SESSION_TOKEN", "optional": true},
-    {"name": "AWS_REGION", "optional": true},
-    {"name": "CLAUDE_CODE_USE_VERTEX", "optional": true},
-    {"name": "ANTHROPIC_VERTEX_PROJECT_ID", "optional": true},
-    {"name": "CLOUD_ML_REGION", "optional": true},
-    {"name": "GOOGLE_APPLICATION_CREDENTIALS", "optional": true}
+    {"name": "AWS_REGION", "optional": true}
   ]
 }

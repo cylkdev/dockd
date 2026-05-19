@@ -1,0 +1,27 @@
+{
+  "name": "claude_code_isolated_workspace",
+  "description": "Claude Code CLI running in an isolated workspace with the host project copied into /instance/project and an output volume mounted from ~/dockd-output.",
+  "image": "dockd/claude-code:latest",
+  "shell": "claude",
+  "build": { "dockerfile": "Dockerfile" },
+  "env": [
+    {"name": "ANTHROPIC_API_KEY", "optional": true},
+    {"name": "CLAUDE_CODE_OAUTH_TOKEN", "optional": true},
+    {"name": "AWS_ACCESS_KEY_ID", "optional": true},
+    {"name": "AWS_SECRET_ACCESS_KEY", "optional": true},
+    {"name": "AWS_SESSION_TOKEN", "optional": true},
+    {"name": "AWS_REGION", "optional": true}
+  ],
+  "mounts": [
+    "${HOME}/dockd-output:/instance/output"
+  ],
+  "copy": [
+    {"src": "${PWD}", "dest": "/instance/project"}
+  ],
+  "steps": [
+    {
+      "label": "scaffold output dir",
+      "cmd": ["mkdir", "-p", "/instance/output"]
+    }
+  ]
+}

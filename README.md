@@ -52,8 +52,8 @@ For programmatic use, Dockd exposes three functions:
 
 ```elixir
 # Start a container with setup steps
-{:ok, session} =
-  Dockd.prepare("debian:trixie",
+{:ok, instance} =
+  Dockd.run("debian:trixie",
     shell: "/bin/bash",
     steps: [
       %{label: "update", cmd: ["apt-get", "update"]},
@@ -61,13 +61,25 @@ For programmatic use, Dockd exposes three functions:
     ]
   )
 
-# Get the command to connect
-session.shell_command
-#=> "docker exec -it dockd-123 /bin/bash"
+# Run a one-off command inside the instance
+{:ok, %{output: "hello\n", exit_code: 0}} =
+  Dockd.shell_command(instance, "echo hello")
+
+# Or open a persistent shell that preserves state between commands
+{:ok, shell} = Dockd.open_shell(instance)
+{:ok, _, shell}      = Dockd.shell_send(shell, "cd /tmp")
+{:ok, out, shell}    = Dockd.shell_send(shell, "pwd")  # out =~ "/tmp"
+:ok = Dockd.close_shell(shell)
 
 # Clean up when done
-Dockd.destroy(session)
+Dockd.destroy(instance)
 ```
+
+Both `shell_command/2` and `open_shell/1` are thin wrappers over
+[`Docker.Terminal`](https://hexdocs.pm/docker/Docker.Terminal.html): use
+`shell_command/2` for stateless one-shot commands (output + exit code),
+and `open_shell` + `shell_send` + `close_shell` when commands must build
+on each other (working directory, shell variables, etc.).
 
 ### Options
 
@@ -91,7 +103,7 @@ Each setup step is a map with a `:label` and a `:cmd` (list of strings):
 
 ## Packages
 
-A **package** is a JSON file that describes a complete workspace - image, shell,
+A **package** is a JSON file that describes a complete instance - image, shell,
 files to bring in, setup commands - so you can launch a reusable environment with
 one call. Packages are the fastest way to share a "stack" (e.g. "Node 20 with
 claude-code installed and `~/.claude` mounted") with someone else: hand them the
@@ -111,10 +123,10 @@ Save this as `hello.json`:
 Run it:
 
 ```elixir
-{:ok, session} = Dockd.prepare_package("./hello.json")
-IO.puts(session.shell_command)
-#=> docker exec -it dockd-1 /bin/sh
-Dockd.destroy(session)
+{:ok, instance} = Dockd.prepare_package("./hello.json")
+{:ok, %{output: out}} = Dockd.shell_command(instance, "uname -a")
+IO.puts(out)
+Dockd.destroy(instance)
 ```
 
 That's the whole contract. The package's keys mirror the options accepted by
@@ -124,7 +136,7 @@ to the same defaults `Dockd.prepare/2` uses.
 
 ### A realistic package
 
-Here's a Python workspace that clones a repo, copies a config file with locked-down
+Here's a Python instance that clones a repo, copies a config file with locked-down
 permissions, and runs an install step before handing you a shell:
 
 ```json
@@ -132,12 +144,12 @@ permissions, and runs an install step before handing you a shell:
   "image": "python:3.12-slim",
   "shell": "/bin/bash",
   "env": ["GITHUB_TOKEN"],
-  "mounts": ["${PWD}:/workspace"],
+  "mounts": ["${PWD}:/instance"],
   "repos": [
     {
       "url": "https://github.com/psf/requests",
       "ref": "main",
-      "dest": "/workspace/requests"
+      "dest": "/instance/requests"
     }
   ],
   "copy": [
@@ -148,7 +160,7 @@ permissions, and runs an install step before handing you a shell:
     }
   ],
   "steps": [
-    {"label": "install", "cmd": ["pip", "install", "-e", "/workspace/requests"]}
+    {"label": "install", "cmd": ["pip", "install", "-e", "/instance/requests"]}
   ]
 }
 ```
@@ -156,7 +168,7 @@ permissions, and runs an install step before handing you a shell:
 Run it the same way:
 
 ```elixir
-{:ok, session} = Dockd.prepare_package("./python-workspace.json")
+{:ok, instance} = Dockd.prepare_package("./python-instance.json")
 ```
 
 ### Field reference
@@ -223,7 +235,7 @@ or `type: "tmpfs"` with `:target`, etc.
 
 ```json
 "mounts": [
-  "${PWD}:/workspace",
+  "${PWD}:/instance",
   "${HOME}/.ssh:/root/.ssh:ro",
   {"type": "tmpfs", "target": "/scratch"}
 ]
@@ -248,7 +260,7 @@ credentials into the image.
 
 ```json
 "repos": [
-  {"url": "https://github.com/octocat/Hello-World.git", "dest": "/workspace/hello"},
+  {"url": "https://github.com/octocat/Hello-World.git", "dest": "/instance/hello"},
   {"url": "git@github.com:my-org/private-repo", "ref": "v1.2", "dest": "/srv/app", "history": true}
 ]
 ```
@@ -287,7 +299,7 @@ When to choose `repos` vs. `copy` vs. `mounts`:
 #### `steps` (list of maps)
 
 Commands to run inside the container after files have been put in place but before
-the workspace is considered ready. Each step is a map:
+the instance is considered ready. Each step is a map:
 
 | Key | Required | Description |
 |-----|----------|-------------|
@@ -299,11 +311,11 @@ the workspace is considered ready. Each step is a map:
 
 A step exiting non-zero halts the prepare with a `:setup` error that carries the
 captured output and exit code. Earlier steps' results are preserved in
-`error.session.step_results`.
+`error.instance.step_results`.
 
 ```json
 "steps": [
-  {"label": "install deps", "cmd": ["npm", "install"], "workdir": "/workspace"},
+  {"label": "install deps", "cmd": ["npm", "install"], "workdir": "/instance"},
   {"label": "run migrations", "cmd": ["npx", "prisma", "migrate", "deploy"]}
 ]
 ```
@@ -362,7 +374,7 @@ substituted from your shell's environment:
 ```json
 {
   "image": "node:20-slim",
-  "binds": ["${PWD}:/workspace"],
+  "binds": ["${PWD}:/instance"],
   "env": ["LOG_LEVEL=${LOG_LEVEL:-info}"]
 }
 ```
@@ -373,20 +385,10 @@ Two entry points:
 
 ```elixir
 # A path on disk - typical for project-local packages.
-{:ok, session} = Dockd.prepare_package("./packages/python.json")
+{:ok, instance} = Dockd.prepare_package("./packages/python.json")
 
 # A bare name - resolves to priv/packages/<name>.json shipped with dockd.
-{:ok, session} = Dockd.prepare_package("claude_code_live_workspace")
-```
-
-`prepare_package/1` is a thin wrapper: it calls `Dockd.Package.load/1` to read
-and validate the file, then `Dockd.prepare/2` with the resulting options. If you
-want to inspect or tweak the loaded options first:
-
-```elixir
-{:ok, {image, opts}} = Dockd.Package.load("./packages/python.json")
-opts = Keyword.put(opts, :name, "scratch")
-{:ok, session} = Dockd.prepare(image, opts)
+{:ok, instance} = Dockd.prepare_package("claude_code_live_instance")
 ```
 
 ### Bundled packages
@@ -397,18 +399,18 @@ canonical catalog of presets. The bundled presets:
 
 | Name | What you get |
 |------|--------------|
-| `"claude_code_live_workspace"` | Live bind of `${PWD}` at `/workspace`, shared `~/.claude` for OAuth - claude's edits land back on the host. |
-| `"claude_code_isolated_workspace"` | One-way snapshot of `${PWD}` at `/workspace/project`, plus a single `~/dockd-output → /workspace/output` bind - host source stays pristine, results land in one named directory. Uses `ANTHROPIC_API_KEY` rather than shared OAuth. |
-| `"claude_code_repo_workspace"` | Shallow-clones `${DOCKD_REPO_URL}` (optional `${DOCKD_REPO_REF}`, default `main`) into `/workspace/repo`, plus a single `~/dockd-output → /workspace/output` bind. Host's `git` credentials handle the clone; `ANTHROPIC_API_KEY` is required and `GITHUB_TOKEN` is forwarded if set. |
+| `"claude_code_live_instance"` | Live bind of `${PWD}` at `/instance`, shared `~/.claude` for OAuth - claude's edits land back on the host. |
+| `"claude_code_isolated_instance"` | One-way snapshot of `${PWD}` at `/instance/project`, plus a single `~/dockd-output → /instance/output` bind - host source stays pristine, results land in one named directory. Uses `ANTHROPIC_API_KEY` rather than shared OAuth. |
+| `"claude_code_repo_instance"` | Shallow-clones `${DOCKD_REPO_URL}` (optional `${DOCKD_REPO_REF}`, default `main`) into `/instance/repo`, plus a single `~/dockd-output → /instance/output` bind. Host's `git` credentials handle the clone; `ANTHROPIC_API_KEY` is required and `GITHUB_TOKEN` is forwarded if set. |
 
 To add your own bundled package, drop a JSON file in that directory (or its
 equivalent in your dependent project's priv) and reference it with
 `Dockd.prepare_package("my_name")`. Pick a filename that describes the
-workspace shape - `python_test_runner.json`, `node_with_postgres.json`, etc. -
+instance shape - `python_test_runner.json`, `node_with_postgres.json`, etc. -
 so collaborators can tell presets apart at a glance.
 
 The lookup rule is purely lexical: a string with no `/` and no `.json` suffix
-is a bundled name; anything else is a path. This keeps `Package.load/1`
+is a bundled name; anything else is a path. This keeps package loading
 deterministic and stateless - the BEAM atom table never grows from preset
 names.
 
@@ -427,32 +429,33 @@ where things went wrong:
 | `:copy` | Source path doesn't exist on the host, or upload failed |
 | `:setup` | A `step` exited non-zero - `error.exit_code` and `error.output` are populated |
 
-When a container was created before the failure, `error.session` is a partial
-session you should pass to `Dockd.destroy/1` to clean up.
+When a container was created before the failure, `error.instance` is a partial
+instance you should pass to `Dockd.destroy/1` to clean up.
 
 ```elixir
 case Dockd.prepare_package("./mystack.json") do
-  {:ok, session} ->
-    IO.puts(session.shell_command)
-    session
+  {:ok, instance} ->
+    {:ok, %{output: out}} = Dockd.shell_command(instance, "uname -a")
+    IO.puts(out)
+    instance
 
-  {:error, %Dockd.Error{phase: :setup, exit_code: code, output: output, session: session}} ->
+  {:error, %Dockd.Error{phase: :setup, exit_code: code, output: output, instance: instance}} ->
     IO.puts("setup failed (exit #{code}):\n#{output}")
-    if session, do: Dockd.destroy(session)
+    if instance, do: Dockd.destroy(instance)
 
   {:error, error} ->
     IO.puts("prepare failed at #{error.phase}: #{error.message}")
-    if error.session, do: Dockd.destroy(error.session)
+    if error.instance, do: Dockd.destroy(error.instance)
 end
 ```
 
 ### Tips
 
-- **Keep packages in your repo** so collaborators get the same workspace.
+- **Keep packages in your repo** so collaborators get the same instance.
   `./packages/<stack>.json` is a good convention.
 - **Prefer bare-name `env` entries over hard-coded literals** for secrets -
   `"env": ["GITHUB_TOKEN"]` reads from the host without committing the value.
 - **Use `${PWD}` and `${HOME}`** in `mounts`/`copy` so the same package works
   for everyone on the team.
-- **Test a package locally** with `Dockd.Package.load("./mystack.json")` before
-  preparing - load runs all validation without touching Docker.
+- **Test a package locally** with `Dockd.Instance.from_json_file("./mystack.json")`
+  before preparing - load runs all validation without touching Docker.

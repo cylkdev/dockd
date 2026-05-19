@@ -2,8 +2,8 @@ defmodule Dockd.StepResult do
   @moduledoc """
   The captured outcome of a single setup step that ran inside a Dockd container.
 
-  Each step from a `Dockd.prepare/2` `:steps` list produces one of these in
-  `Dockd.Workspace.step_results`, in input order. Together with the step's `:label` and
+  Each step from a `Dockd.apply/2` `:steps` list produces one of these in
+  `Dockd.ApplyResult.step_results`, in input order. Together with the step's `:label` and
   `:cmd`, the struct preserves the env/workdir/user the step ran with, the captured
   combined stdout+stderr, and the process exit code.
 
@@ -23,7 +23,7 @@ defmodule Dockd.StepResult do
   """
 
   # Abstraction Function:
-  #   A %Dockd.StepResult{} represents one completed setup step in a Dockd workspace.
+  #   A %Dockd.StepResult{} represents one completed setup step in a Dockd instance.
   #     - label: the human-readable name the step was given in the spec.
   #     - cmd: the argv list that was exec'd inside the container.
   #     - output: the combined stdout+stderr captured from the exec.

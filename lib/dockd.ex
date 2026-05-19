@@ -1,1020 +1,698 @@
 defmodule Dockd do
   @moduledoc """
-  A lifecycle manager for ephemeral Docker workspaces.
+  Public API for dockd.
 
-  Each call to `prepare/2` or `prepare_package/1` yields a `Dockd.Workspace` struct that
-  represents a running container, the setup commands that have completed inside it, and the
-  `docker exec -it` invocation a caller can paste into a terminal to attach. `destroy/1`
-  releases the container when the workspace is no longer needed.
+  Dockd manages local Docker containers as named instances ("instances"). The
+  API is intentionally stateless: there is no in-process registry, no GenServer,
+  no local store. Every container that dockd creates carries the marker label
+  `org.dockd.instance=true` plus its instance name as
+  `org.dockd.instance.name`, so a fresh BEAM can rediscover the full set of
+  managed instances by querying Docker alone.
 
-  Two complementary modes of use:
+  ## Getting Started
 
-    - `session.shell_command` is what a *human* pastes into a terminal to attach to the
-      workspace - an interactive REPL.
-    - `Dockd.Claude` is the *programmatic* counterpart: it issues `claude --print`
-      invocations against a prepared session and returns parsed JSON or a stream of
-      JSON events, without any PTY/attach plumbing.
+  With a Docker daemon running locally, apply a bundled package by
+  name and you have a live instance:
 
-  ## Responsibilities
+      > claude setup-token
+      > export CLAUDE_CODE_OAUTH_TOKEN=<token>
+      > {:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("claude_code")
 
-    - Prepare a workspace - pull or build an image, create and start a container, run an
-      ordered list of setup commands inside it
-    - Surface phase-tagged errors - `:validate`, `:build`, `:pull`, `:create`, `:start`,
-      `:fetch`, `:copy`, `:setup` - with a partial `Workspace` attached when a container was
-      created before the failure
-    - Load workspace recipes from JSON packages - bundled by name string
-      (`"claude_code"`, `"claude_code_isolated_workspace"`) or user-authored
-      on disk (path string)
-    - Destroy a workspace - stop and remove the container by session or by ID, idempotently
-    - Compute the interactive shell command for a session
+  ### One-shot commands
 
-  ## Examples
+  `shell_command/3` runs a single command and returns its output and
+  exit code. Each call is independent — no shell state carries over
+  between calls.
 
-      # Side-effectful - requires a running Docker daemon.
-      {:ok, session} = Dockd.prepare("busybox:latest")
-      session.shell_command
-      #=> "docker exec -it dockd-1 /bin/sh"
-      :ok = Dockd.destroy(session)
+      > {:ok, %{output: _, running: false, exit_code: 0}} =
+      ...>   Dockd.shell_command(instance, ["claude", "--print", "what is 2+2?"])
 
-      # With setup steps that run before the workspace is considered ready.
-      {:ok, session} = Dockd.prepare("node:20-slim",
-        steps: [
-          %{label: "install deps", cmd: ["npm", "install"]},
-          %{label: "seed data", cmd: ["node", "seed.js"]}
-        ]
-      )
-      Enum.map(session.step_results, & &1.exit_code)
-      #=> [0, 0]
-      :ok = Dockd.destroy(session)
+      # Fresh exec each time — `cd` in one call does not affect the next.
+      > {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, "cd /tmp")
+      > {:ok, %{output: "/\\n"}} = Dockd.shell_command(instance, "pwd")
 
-      # Load a bundled package and prepare in one call.
-      {:ok, session} = Dockd.prepare_package("claude_code")
+  ### Longer-term interactive shells
 
+  When you need state to persist across commands (cwd, environment
+  variables, an authenticated session), open a single shell with
+  `open_shell/2` and thread the handle through `shell_send/3`. Close
+  it with `close_shell/1` when done.
+
+      > {:ok, shell} = Dockd.open_shell(instance)
+      > {:ok, {_, shell}} = Dockd.shell_send(shell, "cd /tmp")
+      > {:ok, {"/tmp\\n", shell}} = Dockd.shell_send(shell, "pwd")
+      > {:ok, {_, shell}} = Dockd.shell_send(shell, "export FOO=bar")
+      > {:ok, {"bar\\n", shell}} = Dockd.shell_send(shell, "echo $FOO")
+      > :ok = Dockd.close_shell(shell)
+
+      > :ok = Dockd.destroy(instance)
+
+  `apply_package/2` resolves `"claude_code"` to
+  `priv/packages/claude_code/package.json` and runs the full
+  provisioning pipeline (pull or build, create, start, fetch repos,
+  copy files, run setup steps). The returned `Dockd.Instance` is a
+  view of the live container — pass it (or its name) to any other
+  function in this module. See "Packages" below for the full
+  resolution rules and how to install additional package sets from
+  git.
+
+  ## Lifecycle
+
+    - `apply/2` — create a container from a `Dockd.Spec`. Returns a
+      `Dockd.ApplyResult` carrying the resulting `Dockd.Instance` and any
+      step results from provisioning.
+    - `apply_package/2` — same as `apply/2` but loads the `Spec` from a
+      JSON package file (see "Packages" below).
+    - `list/1` — enumerate every dockd-managed `Instance` currently on the
+      daemon.
+    - `get/2` — fetch one `Instance` by its instance name.
+    - `start/2` / `stop/2` / `restart/2` — control the container without
+      destroying it.
+    - `destroy/2` — stop and remove an instance.
+
+  ## Packages
+
+  A package is a directory under `priv/packages/<name>/` containing a
+  `package.json` (the serialized `Dockd.Spec`: image, shell, env,
+  mounts, repos, copies, setup steps, etc.) plus any supporting files
+  the spec references — typically a `Dockerfile` for `build`-based
+  packages. The directory name is the package's identity.
+
+  `apply_package/2` resolves its reference the same way the `mix dockd`
+  CLI does:
+
+    - any string ending in `.json` is treated as a literal file path
+    - any other string containing `/` is treated as a package directory
+      and resolves to `<dir>/package.json`
+    - any other string is resolved against
+      `priv/packages/<name>/package.json` inside the dockd application
+
+  The bundled `priv/packages/` directory ships ready-to-use recipes
+  (e.g. `claude_code/`, `claude_code_isolated_workspace/`). Apply one
+  by its basename:
+
+      # Resolves to priv/packages/claude_code/package.json
+      {:ok, %Dockd.ApplyResult{instance: instance}} =
+        Dockd.apply_package("claude_code")
+
+      # Same, with per-call Docker options.
+      {:ok, result} =
+        Dockd.apply_package("claude_code", socket: "/var/run/docker.sock")
+
+      # Explicit directory.
+      {:ok, result} = Dockd.apply_package("./my-stack")
+
+      # Explicit file path.
+      {:ok, result} = Dockd.apply_package("./my-stack/package.json")
+
+  Additional packages can be fetched from a git repository with
+  `install_packages/2` (or `mix dockd.package.install --source git --git-url=<url>`).
+  Every `<repo>/packages/<name>/` directory that contains a
+  `package.json` is copied into `priv/packages/<name>/`, after which
+  the package can be applied by name.
+
+  ## Visibility
+
+    - `running?/2` — boolean liveness check.
+    - `logs/2` — fetch container stdout/stderr as a binary.
+    - `inspect/2` — return the raw Docker inspect map (escape hatch for
+      ports, networks, exit code, started_at, etc.).
+    - `refresh/2` — re-fetch a fresh `Instance` from Docker after a state
+      change.
+
+  ## Operating on instances
+
+    - `shell_command/3` — one-shot exec, captures stdout/stderr and exit
+      code.
+    - `open_shell/2` / `shell_send/3` / `close_shell/1` — persistent
+      interactive shell, state preserved between commands.
+    - `copy_to/3` — upload host files into an existing instance.
+
+  ## Host-side staging
+
+  Dockd writes copied files and cloned repos to a staging dir under
+  `<system_tmp>/dockd/` before uploading them into containers. These
+  functions report and clean up that dir on the node selected by RPC
+  routing:
+
+    - `list_temp_files/1`
+    - `delete_temp_files/1`
+
+  And the broader, extension-friendly aggregate:
+
+    - `info/1` — returns `%{temp_files: %{...}}` today, more keys later.
+
+  All public functions accept a per-call `opts` keyword list for caller
+  runtime context: `:socket`, `:host`, `:api_version`, `:platform`,
+  `:networks`, `:network_mode`, and the policy flag `:disk_mount_enabled`.
+  None of these survive on the container.
+
+  The `:dockd` key in `opts` is reserved for internal RPC node filtering
+  and is not a Docker option.
+
+  All implementation lives in `Dockd.Core`; the functions in this module
+  are thin forwarders.
   """
 
-  require Logger
-
+  alias Dockd.ApplyResult
+  alias Dockd.Core
   alias Dockd.Error
-  alias Dockd.Workspace
-  alias Dockd.StepResult
-
-  @option_spec %{
-    # Pipeline-only: consumed by Dockd, not forwarded to Docker.
-    name: :pipeline,
-    shell: :pipeline,
-    steps: :pipeline,
-    build: :pipeline,
-    repos: :pipeline,
-    copy: :pipeline,
-    disk_mount_enabled: :pipeline,
-
-    # Transform: user-supplied; pipeline rewrites in place; then forwarded.
-    env: :transform,
-    mounts: :transform,
-
-    # Internal: never user-supplied; generated by transforms (e.g. normalize_mounts/1
-    # routes a string ":mounts" entry to ":binds" for the sibling lib's legacy translator).
-    binds: :internal,
-
-    # Forward: passed through to the Docker library as-is.
-    socket: :forward,
-    host: :forward,
-    api_version: :forward,
-    platform: :forward,
-    networks: :forward,
-    network_mode: :forward
-  }
-
-  @user_keys for {k, kind} <- @option_spec, kind != :internal, do: k
-  @forward_keys for {k, kind} <- @option_spec,
-                    kind in [:forward, :transform, :internal],
-                    do: k
-
-  @default_shell "/bin/sh"
+  alias Dockd.Instance
+  alias Dockd.Spec
+  alias Dockd.RPC
 
   @doc """
-  Returns the canonical list of user-facing option keys accepted by `prepare/2`.
+  Creates a Docker container from `spec_or_image` and returns the result.
 
-  Single source of truth for `Dockd.Package`'s top-level allow-list. Internal-only
-  keys (e.g. `:binds`, generated by transforms) are excluded.
-  """
-  @spec option_keys() :: [atom()]
-  def option_keys, do: @user_keys
+  Three input shapes are accepted:
 
-  @type step_spec :: %{
-          required(:label) => binary(),
-          required(:cmd) => [binary()],
-          optional(:env) => [binary()] | nil,
-          optional(:workdir) => binary() | nil,
-          optional(:user) => binary() | nil
-        }
+    - a `%Dockd.Spec{}` — used as-is
+    - an image string plus a keyword list of spec options (the Elixir-native
+      shape; equivalent to calling `Dockd.Spec.from_opts/2` first)
+    - an image string alone — equivalent to `Spec.from_opts(image, [])`
 
-  @doc """
-  Prepares a Docker container and returns a session for interactive shell access.
-
-  ## Parameters
-
-    - `image` - `binary()`. A Docker registry image reference (e.g. `"busybox:latest"`) or,
-      when `:build` is provided, the tag to assign to the built image (e.g. `"myapp:dev"`).
-      Must not resolve to a local file path when used as a registry reference.
-    - `options` - `keyword()`. Optional configuration:
-      - `:name` - container name (defaults to an auto-generated `"dockd-<id>"`)
-      - `:shell` - shell path (defaults to `"/bin/sh"`). Becomes the container's
-        PID 1 - runs as the foreground process, receives stdin from `docker exec`
-        attach, and is what `shell_command/1` reuses for the attach invocation.
-        The binary must already exist in the image at container start time; if
-        the image lacks it, install it via `:build` rather than `:steps`.
-      - `:steps` - list of `t:step_spec/0` maps to execute after the container starts
-      - `:env` - list of container environment variable entries. Each entry can be a
-        literal `"FOO=bar"` string, a bare `"FOO"` (inherits from host; `:validate`
-        error if unset), `{"FOO", value: "bar"}` (literal - no host lookup),
-        `{"FOO", default: "fallback"}` (inherits, falls back to a literal default), or
-        `{"FOO", optional: true}` (inherits if set; entry is dropped if unset).
-      - `:build` - map describing how to build the image locally instead of pulling it
-        from a registry. Required keys: `:dockerfile` (path to a Dockerfile or directory
-        containing one). Optional: `:context` (defaults to the Dockerfile's parent
-        directory), `:args` (map of `--build-arg` values), and any other Engine API
-        build option (`:nocache`, `:pull`, `:platform`, `:target`, `:labels`, etc.).
-      - `:repos` - list of git repositories to clone on the host and upload into the
-        container before setup steps run. Each entry is a map with `:url` (required),
-        `:dest` (required, absolute path inside the container), and optional `:ref`,
-        `:depth` (default 1), and `:history` (default false; set true to keep `.git`).
-      - `:copy` - list of host-to-container file/directory copies, applied after `:repos`
-        and before `:steps`. Each entry is a map with `:src` (host path) and `:dest`
-        (absolute container path), plus optional `:mode` (e.g. `"0600"`) and `:owner`
-        (e.g. `"root:root"`). Unlike `:mounts`, copies are one-way snapshots - container
-        writes do not propagate to the host.
-      - `:disk_mount_enabled` - boolean (defaults to `true`). When `false`, every
-        option that would expose host files, directories, or host environment is
-        stripped before the pipeline runs: `:mounts`, `:repos`, `:copy`, and
-        host-derived `:env` entries (bare `"FOO"` names and `{name, opts}` tuples).
-        Literal `"FOO=bar"` `:env` entries are kept. Each stripped value is logged
-        via `Logger.error/1`. Use this to harden a workspace against any leaked
-        mount/copy/repo directive in a downstream package or caller config.
-      - Docker connection options: `:socket`, `:host`, `:api_version`, `:platform`,
-        `:mounts`, `:networks`, `:network_mode`
-
-  ## Returns
-
-  `{:ok, Workspace.t()}` when the container is running and all setup steps have completed
-  with exit code 0. The session contains the `container_id`, computed `shell_command`, and
-  ordered `step_results` matching the input `steps` order. Not idempotent - each call
-  creates a new container.
-
-  `{:error, Error.t()}` when any phase fails. The error's `phase` field indicates where
-  the failure occurred (`:validate`, `:build`, `:pull`, `:create`, `:start`, `:fetch`,
-  `:copy`, or `:setup`). If the container was created before the failure, `error.session`
-  contains a partial session with a valid `container_id` that the caller should destroy.
-
-  ## Side Effects
-
-  Pulls or builds a Docker image, creates and starts a container, and executes setup commands
-  inside it. Requires a running Docker daemon.
+  Per-call options (Docker connection settings and `:disk_mount_enabled`)
+  and spec options share the same flat keyword list as the second
+  argument. `Dockd.Spec.option_keys/0` decides the split: any key it
+  claims is routed into `Spec.from_opts/2`, anything else is treated as
+  a per-call option. Unknown keys are rejected.
 
   ## Examples
 
-      # Side-effectful - requires a running Docker daemon.
-      {:ok, session} = Dockd.prepare("busybox:latest")
-      session.shell_command
-      #=> "docker exec -it dockd-123 /bin/sh"
+      # Image string alone — generates a container name automatically.
+      {:ok, %Dockd.ApplyResult{instance: instance}} =
+        Dockd.apply("busybox:1.37.0")
 
-      # Build from a Dockerfile.
-      {:ok, session} = Dockd.prepare("myapp:dev", build: %{dockerfile: "./Dockerfile"})
+      # Image plus spec options.
+      {:ok, %Dockd.ApplyResult{instance: instance}} =
+        Dockd.apply("busybox:1.37.0",
+          name: "smoke",
+          shell: "/bin/sh",
+          env: ["FOO=bar"],
+          steps: [%{run: "mkdir -p /work"}]
+        )
 
-      # Build with explicit context directory and build args.
-      {:ok, session} = Dockd.prepare("myapp:dev",
-        build: %{
-          dockerfile: "./docker/Dockerfile.dev",
-          context: "./",
-          args: %{"MIX_ENV" => "dev"}
-        }
-      )
+      # Spec options and per-call options share one flat keyword list.
+      {:ok, result} =
+        Dockd.apply("busybox:1.37.0",
+          name: "smoke",
+          shell: "/bin/sh",
+          socket: "/var/run/docker.sock"
+        )
 
-      # With setup steps.
-      {:ok, session} = Dockd.prepare("busybox:latest",
-        steps: [%{label: "greet", cmd: ["echo", "hello"]}]
-      )
-      hd(session.step_results).exit_code
-      #=> 0
+      # A pre-built %Dockd.Spec{} struct — opts is the per-call options list.
+      spec = Dockd.Spec.from_opts("busybox:1.37.0", name: "smoke", shell: "/bin/sh")
+      {:ok, result} = Dockd.apply(spec, socket: "/var/run/docker.sock")
 
-      # Pass host env vars through to the container (bare names) alongside literals.
-      {:ok, session} = Dockd.prepare("node:20-slim",
-        env: ["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "LOG_LEVEL=debug"],
-        shell: "claude"
-      )
+      # Failure path: the error may carry the partially-created instance so
+      # the caller can clean up.
+      case Dockd.apply("busybox:1.37.0", steps: [%{run: "exit 1"}]) do
+        {:ok, %Dockd.ApplyResult{instance: instance}} ->
+          instance
 
+        {:error, %Dockd.Error{instance: instance}} when not is_nil(instance) ->
+          Dockd.destroy(instance)
+      end
   """
-  @spec prepare(binary(), keyword()) :: {:ok, Workspace.t()} | {:error, Error.t()}
-  def prepare(image, options \\ []) when is_binary(image) and is_list(options) do
-    with :ok <- check_unknown_options(options),
-         {:ok, options} <- enforce_disk_mount_policy(options),
-         {:ok, options} <- expand_env(options),
-         {:ok, options} <- normalize_mounts(options) do
-      do_prepare(image, options)
-    end
-  end
-
-  defp check_unknown_options(options) do
-    case Keyword.keys(options) -- option_keys() do
-      [] ->
-        :ok
-
-      [key | _] ->
-        {:error, %Error{phase: :validate, message: "unknown option: #{inspect(key)}"}}
-    end
-  end
-
-  # Keys whose presence exposes host files or directories to the container.
-  # `:mounts` covers both legacy bind strings and structured Docker mount maps -
-  # `normalize_mounts/1` runs after this step, so stripping `:mounts` here also
-  # prevents `:binds` from being generated downstream.
-  @host_path_keys [:mounts, :repos, :copy]
-
-  defp enforce_disk_mount_policy(options) do
-    case Keyword.fetch(options, :disk_mount_enabled) do
-      :error ->
-        {:ok, options}
-
-      {:ok, true} ->
-        {:ok, Keyword.delete(options, :disk_mount_enabled)}
-
-      {:ok, false} ->
-        {:ok, strip_host_exposure(options)}
-
-      {:ok, other} ->
-        {:error,
-         %Error{
-           phase: :validate,
-           message: ":disk_mount_enabled must be a boolean, got: #{inspect(other)}"
-         }}
-    end
-  end
-
-  defp strip_host_exposure(options) do
-    options
-    |> Keyword.delete(:disk_mount_enabled)
-    |> strip_host_path_keys()
-    |> strip_host_env_entries()
-  end
-
-  defp strip_host_path_keys(options) do
-    Enum.reduce(@host_path_keys, options, fn key, acc ->
-      case Keyword.fetch(acc, key) do
-        :error ->
-          acc
-
-        {:ok, value} ->
-          if host_exposure_present?(value) do
-            Logger.error(
-              "dockd: disk_mount_enabled=false stripped #{inspect(key)}: #{inspect(value)}"
-            )
-          end
-
-          Keyword.delete(acc, key)
-      end
-    end)
-  end
-
-  defp host_exposure_present?(nil), do: false
-  defp host_exposure_present?([]), do: false
-  defp host_exposure_present?(_), do: true
-
-  defp strip_host_env_entries(options) do
-    case Keyword.fetch(options, :env) do
-      {:ok, entries} when is_list(entries) ->
-        {kept, dropped} = Enum.split_with(entries, &literal_env_entry?/1)
-
-        Enum.each(dropped, fn entry ->
-          Logger.error(
-            "dockd: disk_mount_enabled=false stripped host-derived :env entry: #{inspect(entry)}"
-          )
-        end)
-
-        case kept do
-          [] -> Keyword.delete(options, :env)
-          _ -> Keyword.put(options, :env, kept)
-        end
-
-      _ ->
-        options
-    end
-  end
-
-  defp literal_env_entry?(entry) when is_binary(entry), do: String.contains?(entry, "=")
-
-  defp literal_env_entry?({name, opts}) when is_binary(name) and is_list(opts),
-    do: Keyword.has_key?(opts, :value)
-
-  defp literal_env_entry?(_), do: false
-
-  defp do_prepare(image, options) do
-    shell = Keyword.get(options, :shell, @default_shell)
-    name = Keyword.get(options, :name, default_container_name())
-    build = Keyword.get(options, :build)
-
-    docker_options =
-      options
-      |> Keyword.take(@forward_keys)
-      |> rename_keyword(:api_version, :version)
-
-    session =
-      Workspace.new(%{
-        container_name: name,
-        image: image,
-        shell: shell,
-        docker_options: docker_options
-      })
-
-    with :ok <- validate_source(image, build, session),
-         {:ok, steps} <-
-           normalize_steps(Keyword.get(options, :steps, []), session),
-         {:ok, repos} <-
-           normalize_repos(Keyword.get(options, :repos, []), session),
-         {:ok, copies} <-
-           normalize_copies(Keyword.get(options, :copy, []), session),
-         {:ok, _image_ref} <- resolve_image(session, build),
-         {:ok, container_id} <- create_container(session),
-         session <- Workspace.put(session, %{container_id: container_id}),
-         {:ok, _} <- start_container(session),
-         :ok <- Dockd.GitTool.run(repos, session),
-         :ok <- Dockd.CopyTool.run(copies, session),
-         {:ok, step_results} <- run_steps(steps, session) do
-      {:ok, Workspace.put(session, %{step_results: step_results})}
-    end
-  end
-
-  defp expand_env(options) do
-    case Keyword.get(options, :env, []) do
-      [] ->
-        {:ok, options}
-
-      entries when is_list(entries) ->
-        with {:ok, expanded} <- resolve_env_entries(entries) do
-          {:ok, Keyword.put(options, :env, expanded)}
-        end
-
-      _other ->
-        {:error, %Error{phase: :validate, message: ":env must be a list"}}
-    end
-  end
-
-  defp resolve_env_entries(entries) do
-    Enum.reduce_while(entries, {:ok, []}, fn entry, {:ok, acc} ->
-      case resolve_env_entry(entry) do
-        {:ok, :drop} -> {:cont, {:ok, acc}}
-        {:ok, str} -> {:cont, {:ok, acc ++ [str]}}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-  end
-
-  defp resolve_env_entry(entry) when is_binary(entry) do
-    if String.contains?(entry, "=") do
-      {:ok, entry}
-    else
-      case System.fetch_env(entry) do
-        {:ok, val} ->
-          {:ok, "#{entry}=#{val}"}
-
-        :error ->
-          {:error, %Error{phase: :validate, message: ":env references unset host var: #{entry}"}}
-      end
-    end
-  end
-
-  defp resolve_env_entry({name, opts}) when is_binary(name) and is_list(opts) do
-    if Keyword.has_key?(opts, :value) do
-      {:ok, "#{name}=#{Keyword.fetch!(opts, :value)}"}
-    else
-      resolve_host_env(name, opts)
-    end
-  end
-
-  defp resolve_env_entry(other) do
-    {:error,
-     %Error{
-       phase: :validate,
-       message: ":env entries must be strings or {name, opts} tuples, got: #{inspect(other)}"
-     }}
-  end
-
-  defp resolve_host_env(name, opts) do
-    case System.fetch_env(name) do
-      {:ok, val} -> {:ok, "#{name}=#{val}"}
-      :error -> resolve_unset_host_env(name, opts)
-    end
-  end
-
-  defp resolve_unset_host_env(name, opts) do
-    case Keyword.fetch(opts, :default) do
-      {:ok, default} when is_binary(default) ->
-        {:ok, "#{name}=#{default}"}
-
-      _ ->
-        if Keyword.get(opts, :optional) === true do
-          {:ok, :drop}
-        else
-          {:error, %Error{phase: :validate, message: ":env references unset host var: #{name}"}}
-        end
-    end
-  end
-
-  defp normalize_mounts(options) do
-    case Keyword.get(options, :mounts) do
-      nil ->
-        {:ok, options}
-
-      entries when is_list(entries) ->
-        with {:ok, {binds, mounts}} <- classify_mounts(entries) do
-          options
-          |> Keyword.delete(:mounts)
-          |> put_unless_empty(:binds, binds)
-          |> put_unless_empty(:mounts, mounts)
-          |> then(&{:ok, &1})
-        end
-
-      _other ->
-        {:error, %Error{phase: :validate, message: ":mounts must be a list"}}
-    end
-  end
-
-  defp classify_mounts(entries) do
-    Enum.reduce_while(entries, {:ok, {[], []}}, fn entry, {:ok, {binds, mounts}} ->
-      case classify_mount_entry(entry) do
-        {:bind, str} -> {:cont, {:ok, {binds ++ [str], mounts}}}
-        {:mount, map} -> {:cont, {:ok, {binds, mounts ++ [map]}}}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-  end
-
-  defp classify_mount_entry(s) when is_binary(s) do
-    case String.split(s, ":", parts: 3) do
-      [_h, _c] -> {:bind, s}
-      [_h, _c, _o] -> {:bind, s}
-      _ -> mount_error("invalid :mounts entry: #{inspect(s)}")
-    end
-  end
-
-  defp classify_mount_entry(m) when is_map(m) do
-    case Map.get(m, :target) || Map.get(m, "target") do
-      target when is_binary(target) and target != "" ->
-        {:mount, atomize_mount_keys(m)}
-
-      _ ->
-        mount_error(":mounts map entry requires a non-empty :target")
-    end
-  end
-
-  defp classify_mount_entry(other),
-    do: mount_error("invalid :mounts entry: #{inspect(other)}")
-
-  defp atomize_mount_keys(m) do
-    for {k, v} <- m, into: %{} do
-      key = if is_binary(k), do: String.to_atom(k), else: k
-      {key, v}
-    end
-  end
-
-  defp mount_error(msg), do: {:error, %Error{phase: :validate, message: msg}}
-
-  defp put_unless_empty(opts, _key, []), do: opts
-  defp put_unless_empty(opts, key, val), do: Keyword.put(opts, key, val)
-
-  @doc """
-  Prepares a Docker container from a package and returns a session for interactive shell access.
-
-  Convenience wrapper that calls `Dockd.Package.load/1` followed by `prepare/2`.
-
-  ## Parameters
-
-    - `ref` - a string. When it contains `/` or ends with `.json`, it's treated as a path
-      to a user-authored JSON package on disk. Otherwise it's treated as the basename of
-      a bundled package shipped in `priv/packages/<ref>.json`.
-
-  ## Returns
-
-  Same as `prepare/2`: `{:ok, Workspace.t()}` on success, or `{:error, Error.t()}` if the
-  package cannot be loaded or any prepare phase fails.
-
-  ## Side Effects
-
-  Reads a package file from disk, then performs all the side effects of `prepare/2`.
-
-  ## Examples
-
-      # Bundled package.
-      {:ok, session} = Dockd.prepare_package("claude_code")
-
-      # User-authored package on disk.
-      {:ok, session} = Dockd.prepare_package("./packages/my-stack.json")
-
-  """
-  @spec prepare_package(binary()) :: {:ok, Workspace.t()} | {:error, Error.t()}
-  def prepare_package(ref) when is_binary(ref) do
-    with {:ok, {image, opts}} <- Dockd.Package.load(ref) do
-      prepare(image, opts)
-    end
+  @spec apply(Spec.t() | binary(), keyword()) ::
+          {:ok, ApplyResult.t()} | {:error, Error.t()}
+  def apply(spec_or_image, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :apply, [spec_or_image, opts])
   end
 
   @doc """
-  Stops and removes a Docker container, releasing all associated resources.
+  Loads a JSON package file and applies it.
 
-  ## Parameters
+  Resolves the package reference the same way `Mix.Tasks.Dockd` does:
 
-    - `session_or_ref` - `Workspace.t() | binary()`. A session returned by `prepare/2`, or
-      a container ID or name as a string. When a string is given, a temporary session is
-      constructed internally.
-
-  ## Returns
-
-  `:ok` when the container has been stopped and removed. Idempotent - returns `:ok` even
-  if the container was already stopped or removed (Docker 304/404 responses are tolerated).
-
-  `{:error, Error.t()}` when the container cannot be destroyed. Returns an error if the
-  session has a `nil` `container_id`.
-
-  ## Side Effects
-
-  Stops and deletes a Docker container. Requires a running Docker daemon.
+    - `<name>.json` or any path containing `/` is treated as a file path
+    - any other string is resolved against `priv/packages/<name>.json`
 
   ## Examples
 
-      # Side-effectful - requires a running Docker daemon.
-      {:ok, session} = Dockd.prepare("busybox:latest")
-      :ok = Dockd.destroy(session)
+      # Resolved against priv/packages/elixir.json.
+      {:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("elixir")
 
-      # Destroy by container ID string.
-      :ok = Dockd.destroy("my-container-id")
+      # Explicit path — anything with `/` or ending in `.json`.
+      {:ok, result} = Dockd.apply_package("./packages/my-stack.json")
+      {:ok, result} = Dockd.apply_package("/abs/path/stack.json")
 
+      # With per-call Docker options.
+      {:ok, result} =
+        Dockd.apply_package("elixir", socket: "/var/run/docker.sock")
   """
-  @spec destroy(Workspace.t() | binary()) :: :ok | {:error, Error.t()}
-  def destroy(%Workspace{container_id: nil} = session) do
-    {:error,
-     %Error{
-       phase: :destroy,
-       message: "cannot destroy a session without a container_id",
-       session: session
-     }}
-  end
-
-  def destroy(%Workspace{} = session) do
-    with :ok <- stop_container(session),
-         :ok <- delete_container(session) do
-      :ok
-    end
-  end
-
-  def destroy(container_ref) when is_binary(container_ref) do
-    session =
-      Workspace.new(%{
-        container_id: container_ref,
-        container_name: container_ref,
-        shell: @default_shell
-      })
-
-    with :ok <- stop_container(session),
-         :ok <- delete_container(session) do
-      :ok
-    end
+  @spec apply_package(binary(), keyword()) ::
+          {:ok, ApplyResult.t()} | {:error, Error.t()}
+  def apply_package(ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :apply_package, [ref, opts])
   end
 
   @doc """
-  Returns the `docker exec -it` command string for interactive shell access to a session's container.
+  Installs packages from a remote git repository into the local
+  `priv/packages/` directory.
 
-  ## Parameters
+  Clones the repo with the host `git` binary and copies every
+  `<repo>/packages/<name>/` directory containing a `package.json` into
+  `priv/packages/<name>/`. An existing target directory is replaced.
 
-    - `session` - `Workspace.t()`. A session with `container_name` and `shell` fields set.
+  The URL can be anything `git clone` accepts (HTTPS, SSH, or the
+  `github.com/user/repo` shorthand).
 
-  ## Returns
+  Options:
 
-  `binary()` - a shell command string with special characters in `container_name` and `shell`
-  escaped for safe use in a terminal. Deterministic - the same session always produces the
-  same command. Never `nil`.
+    - `:ref` — git branch or tag to clone (defaults to the remote's
+      default branch).
+
+  Returns `{:ok, [name]}` with the installed package names.
 
   ## Examples
 
-      iex> session = %Dockd.Workspace{container_name: "dockd-1", shell: "/bin/bash"}
-      iex> Dockd.shell_command(session)
-      "docker exec -it dockd-1 /bin/bash"
+      {:ok, ["foo", "bar"]} =
+        Dockd.install_packages("https://github.com/me/recipes")
 
+      {:ok, _} =
+        Dockd.install_packages("github.com/me/recipes", ref: "v1.2.0")
   """
-  @spec shell_command(Workspace.t()) :: binary()
-  def shell_command(%Workspace{} = session), do: Workspace.shell_command(session)
-
-  defp validate_source(_image, %{} = build, session) do
-    case Map.get(build, :dockerfile) || Map.get(build, "dockerfile") do
-      df when is_binary(df) ->
-        validate_dockerfile_path(df, session)
-
-      _ ->
-        {:error,
-         %Error{
-           phase: :validate,
-           message: ":build map must include a :dockerfile path",
-           session: session
-         }}
-    end
+  @spec install_packages(binary(), keyword()) ::
+          {:ok, [binary()]} | {:error, Error.t()}
+  def install_packages(url, opts \\ []) do
+    Dockd.Packages.install_from_git(url, opts)
   end
 
-  defp validate_source(image, nil, session) do
-    expanded = Path.expand(image)
+  @doc """
+  Lists every dockd-managed `Instance` currently on the Docker daemon.
 
-    if File.regular?(expanded) or File.dir?(expanded) do
-      {:error,
-       %Error{
-         phase: :validate,
-         message: "local image paths are not supported, use the :build option instead",
-         session: session
-       }}
-    else
-      :ok
-    end
+  Discovers containers by filtering on the marker label
+  `org.dockd.instance=true`, then hydrates each one via
+  `Docker.find_container/2`.
+
+  ## Examples
+
+      {:ok, instances} = Dockd.list()
+      Enum.map(instances, & &1.name)
+      #=> ["dockd-smoke", "dockd-builder"]
+
+      # Against a specific Docker daemon.
+      {:ok, instances} = Dockd.list(socket: "/var/run/docker.sock")
+  """
+  @spec list(keyword()) :: {:ok, [Instance.t()]} | {:error, Error.t()}
+  def list(opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :list, [opts])
   end
 
-  defp normalize_steps(step_specs, session) when is_list(step_specs) do
-    step_specs
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {step_spec, index}, {:ok, acc} ->
-      case normalize_step(step_spec, index) do
-        {:ok, step} ->
-          {:cont, {:ok, acc ++ [step]}}
+  @doc """
+  Fetches a single `Instance` by instance name.
 
-        {:error, message} ->
-          {:halt, {:error, %Error{phase: :validate, message: message, session: session}}}
+  Accepts either the short name (`"smoke"`) or the full Docker container
+  name (`"dockd-smoke"`).
+
+  ## Examples
+
+      {:ok, %Dockd.Instance{} = instance} = Dockd.get("smoke")
+      {:ok, %Dockd.Instance{} = instance} = Dockd.get("dockd-smoke")
+
+      case Dockd.get("not-here") do
+        {:ok, instance} -> instance
+        {:error, %Dockd.Error{} = err} -> err
       end
-    end)
+  """
+  @spec get(binary(), keyword()) :: {:ok, Instance.t()} | {:error, Error.t()}
+  def get(name, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :get, [name, opts])
   end
 
-  defp normalize_steps(_step_specs, session) do
-    {:error, %Error{phase: :validate, message: ":steps must be a list", session: session}}
+  @doc """
+  Stops and removes an instance.
+
+  Accepts either an `Instance` struct, a Docker container ID, or a
+  instance name (short or prefixed). Already-stopped and already-removed
+  containers are treated as success.
+
+  ## Examples
+
+      # By instance struct (typical when you've just created it).
+      {:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply("busybox:1.37.0")
+      :ok = Dockd.destroy(instance)
+
+      # By short name.
+      :ok = Dockd.destroy("smoke")
+
+      # By full container name.
+      :ok = Dockd.destroy("dockd-smoke")
+
+      # By container ID.
+      :ok = Dockd.destroy("a1b2c3d4e5f6")
+
+      # Idempotent — destroying something that's already gone is :ok.
+      :ok = Dockd.destroy("smoke")
+      :ok = Dockd.destroy("smoke")
+  """
+  @spec destroy(Instance.t() | binary(), keyword()) :: :ok | {:error, Error.t()}
+  def destroy(instance_or_ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :destroy, [instance_or_ref, opts])
   end
 
-  defp normalize_step(step_spec, index) when is_map(step_spec) do
-    label = get_value(step_spec, :label)
-    cmd = get_value(step_spec, :cmd)
-    env = get_value(step_spec, :env)
-    workdir = get_value(step_spec, :workdir)
-    user = get_value(step_spec, :user)
+  @doc """
+  Starts a stopped instance, leaving it in place.
 
-    cond do
-      not is_binary(label) or label == "" ->
-        {:error, "step #{index + 1} must include a non-empty :label"}
+  Idempotent — starting an already-running instance returns `:ok`.
 
-      not (is_list(cmd) and Enum.all?(cmd, &is_binary/1) and cmd != []) ->
-        {:error, "step #{index + 1} must include a non-empty :cmd list"}
+  ## Examples
 
-      not is_nil(env) and not (is_list(env) and Enum.all?(env, &is_binary/1)) ->
-        {:error, "step #{index + 1} has invalid :env"}
-
-      not is_nil(workdir) and not is_binary(workdir) ->
-        {:error, "step #{index + 1} has invalid :workdir"}
-
-      not is_nil(user) and not is_binary(user) ->
-        {:error, "step #{index + 1} has invalid :user"}
-
-      true ->
-        {:ok, %{label: label, cmd: cmd, env: env, workdir: workdir, user: user}}
-    end
+      :ok = Dockd.start(instance)
+      :ok = Dockd.start("smoke")
+  """
+  @spec start(Instance.t() | binary(), keyword()) :: :ok | {:error, Error.t()}
+  def start(instance_or_ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :start, [instance_or_ref, opts])
   end
 
-  defp normalize_step(_step_spec, index) do
-    {:error, "step #{index + 1} must be a map"}
+  @doc """
+  Stops a running instance without removing it.
+
+  Idempotent — stopping an already-stopped instance returns `:ok`.
+
+  ## Examples
+
+      :ok = Dockd.stop(instance)
+      :ok = Dockd.stop("smoke")
+  """
+  @spec stop(Instance.t() | binary(), keyword()) :: :ok | {:error, Error.t()}
+  def stop(instance_or_ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :stop, [instance_or_ref, opts])
   end
 
-  defp normalize_repos(specs, session) when is_list(specs) do
-    specs
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {spec, index}, {:ok, acc} ->
-      case normalize_repo(spec, index) do
-        {:ok, normalized} ->
-          {:cont, {:ok, acc ++ [normalized]}}
+  @doc """
+  Stops then starts an instance.
 
-        {:error, message} ->
-          {:halt, {:error, %Error{phase: :validate, message: message, session: session}}}
-      end
-    end)
+  Equivalent to `stop/2` followed by `start/2`. If the stop step fails
+  the start step is skipped and the stop error is returned.
+
+  ## Examples
+
+      :ok = Dockd.restart(instance)
+  """
+  @spec restart(Instance.t() | binary(), keyword()) :: :ok | {:error, Error.t()}
+  def restart(instance_or_ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :restart, [instance_or_ref, opts])
   end
 
-  defp normalize_repos(_specs, session) do
-    {:error, %Error{phase: :validate, message: ":repos must be a list", session: session}}
+  @doc """
+  Returns `true` when the instance's container is running on the daemon.
+
+  Cheap — a single Docker inspect, no exec.
+
+  ## Examples
+
+      {:ok, true} = Dockd.running?(instance)
+      {:ok, false} = Dockd.running?("smoke")
+  """
+  @spec running?(Instance.t() | binary(), keyword()) :: {:ok, boolean()} | {:error, term()}
+  def running?(instance_or_ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :running?, [instance_or_ref, opts])
   end
 
-  defp normalize_repo(spec, index) when is_map(spec) do
-    url = get_value(spec, :url)
-    dest = get_value(spec, :dest)
-    ref = get_value(spec, :ref)
-    depth = get_value(spec, :depth)
-    history = get_value(spec, :history)
+  @doc """
+  Fetches the instance's container logs as a binary (stdout + stderr,
+  demuxed).
 
-    cond do
-      not is_binary(url) or url == "" ->
-        {:error, "repo #{index + 1} must include a non-empty :url"}
+  Log filter keys are read out of `opts` and forwarded to Docker:
 
-      not is_binary(dest) or dest == "" ->
-        {:error, "repo #{index + 1} must include a non-empty :dest"}
+    - `:tail` — number of lines (or `"all"`)
+    - `:since` / `:until` — Unix timestamps
+    - `:follow` — boolean (note: streaming is not supported by the
+      underlying client, leave unset for one-shot reads)
+    - `:timestamps` — boolean
+    - `:stdout` / `:stderr` — booleans (default both `true`)
 
-      not String.starts_with?(dest, "/") ->
-        {:error, "repo #{index + 1} :dest must be an absolute path inside the container"}
+  Other keys in `opts` are treated as the usual per-call connection
+  options (`:socket`, `:host`, …).
 
-      not is_nil(ref) and not is_binary(ref) ->
-        {:error, "repo #{index + 1} has invalid :ref"}
+  ## Examples
 
-      not is_nil(depth) and not (is_integer(depth) and depth > 0) ->
-        {:error, "repo #{index + 1} :depth must be a positive integer"}
-
-      not is_nil(history) and not is_boolean(history) ->
-        {:error, "repo #{index + 1} :history must be a boolean"}
-
-      true ->
-        {:ok, drop_nil(%{url: url, dest: dest, ref: ref, depth: depth, history: history})}
-    end
+      {:ok, logs} = Dockd.logs(instance)
+      {:ok, tail} = Dockd.logs(instance, tail: 100, timestamps: true)
+      {:ok, stderr} = Dockd.logs("smoke", stdout: false, stderr: true)
+  """
+  @spec logs(Instance.t() | binary(), keyword()) :: Docker.result(binary())
+  def logs(instance_or_ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :logs, [instance_or_ref, opts])
   end
 
-  defp normalize_repo(_spec, index) do
-    {:error, "repo #{index + 1} must be a map"}
+  @doc """
+  Returns the raw Docker `inspect` map for an instance.
+
+  Use this as an escape hatch when you need state that isn't on
+  `%Dockd.Instance{}` — port bindings, network IPs, exit code, started
+  timestamps, restart policy, etc.
+
+  ## Examples
+
+      {:ok, raw} = Dockd.inspect(instance)
+      raw["State"]["StartedAt"]
+      raw["NetworkSettings"]["IPAddress"]
+  """
+  @spec inspect(Instance.t() | binary(), keyword()) :: {:ok, map()} | {:error, term()}
+  def inspect(instance_or_ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :inspect, [instance_or_ref, opts])
   end
 
-  defp normalize_copies(specs, session) when is_list(specs) do
-    specs
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {spec, index}, {:ok, acc} ->
-      case normalize_copy(spec, index) do
-        {:ok, normalized} ->
-          {:cont, {:ok, acc ++ [normalized]}}
+  @doc """
+  Re-fetches an instance from Docker, returning a fresh `%Dockd.Instance{}`.
 
-        {:error, message} ->
-          {:halt, {:error, %Error{phase: :validate, message: message, session: session}}}
-      end
-    end)
+  Useful after `start/2`, `stop/2`, or `restart/2` to refresh the
+  `:running?` field (and anything else hydrated from Docker inspect).
+
+  ## Examples
+
+      {:ok, fresh} = Dockd.refresh(instance)
+      {:ok, fresh} = Dockd.refresh("smoke")
+  """
+  @spec refresh(Instance.t() | binary(), keyword()) :: {:ok, Instance.t()} | {:error, term()}
+  def refresh(instance_or_ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :refresh, [instance_or_ref, opts])
   end
 
-  defp normalize_copies(_specs, session) do
-    {:error, %Error{phase: :validate, message: ":copy must be a list", session: session}}
+  @doc """
+  Runs `command` inside the instance and returns the combined output plus
+  exit code. `command` may be a string (run with the instance's shell) or
+  an argv list (run verbatim).
+
+  ## Examples
+
+      {:ok, %Dockd.ApplyResult{instance: instance}} =
+        Dockd.apply("busybox:1.37.0", shell: "/bin/sh")
+
+      # String form — invoked through the instance's configured shell.
+      {:ok, %{stdout: "hello\\n", exit_code: 0}} =
+        Dockd.shell_command(instance, "echo hello")
+
+      # Argv form — exec'd verbatim, no shell parsing.
+      {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, ["true"])
+      {:ok, %{exit_code: 3}} =
+        Dockd.shell_command(instance, ["sh", "-c", "exit 3"])
+
+      # Also accepts an instance name instead of the struct.
+      {:ok, _} = Dockd.shell_command("smoke", "uname -a")
+  """
+  @spec shell_command(Instance.t() | binary(), [binary()] | binary(), keyword()) ::
+          Docker.result(Docker.exec_result())
+  def shell_command(instance_or_ref, command, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :shell_command, [instance_or_ref, command, opts])
   end
 
-  defp normalize_copy(spec, index) when is_map(spec) do
-    src = get_value(spec, :src)
-    dest = get_value(spec, :dest)
-    mode = get_value(spec, :mode)
-    owner = get_value(spec, :owner)
+  @doc """
+  Opens a persistent interactive shell on the instance.
 
-    cond do
-      not is_binary(src) or src == "" ->
-        {:error, "copy #{index + 1} must include a non-empty :src"}
+  Returns a `Docker.Terminal.handle/0` (the container ref) that
+  preserves shell state (cwd, env, shell variables) across
+  `shell_send/3` calls. The same handle is threaded back through
+  `shell_send/3` and finally `close_shell/2`. Pair every successful
+  `open_shell/2` with `close_shell/2`.
 
-      not is_binary(dest) or dest == "" ->
-        {:error, "copy #{index + 1} must include a non-empty :dest"}
+  ## Examples
 
-      not String.starts_with?(dest, "/") ->
-        {:error, "copy #{index + 1} :dest must be an absolute path inside the container"}
+      {:ok, %Dockd.ApplyResult{instance: instance}} =
+        Dockd.apply("busybox:1.37.0", shell: "/bin/sh")
 
-      not is_nil(mode) and not is_binary(mode) ->
-        {:error, "copy #{index + 1} :mode must be a string (e.g. \"0600\")"}
+      {:ok, shell} = Dockd.open_shell(instance)
+      {:ok, {_, shell}} = Dockd.shell_send(shell, "cd /tmp")
+      {:ok, {"/tmp\\n", shell}} = Dockd.shell_send(shell, "pwd")
+      :ok = Dockd.close_shell(shell)
 
-      not is_nil(owner) and not is_binary(owner) ->
-        {:error, "copy #{index + 1} :owner must be a string (e.g. \"root:root\")"}
-
-      true ->
-        {:ok, drop_nil(%{src: src, dest: dest, mode: mode, owner: owner})}
-    end
+      # Also accepts an instance name.
+      {:ok, shell} = Dockd.open_shell("smoke")
+  """
+  @spec open_shell(Instance.t() | binary(), keyword()) ::
+          Docker.result(Docker.Terminal.handle())
+  def open_shell(instance_or_ref, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :open_shell, [instance_or_ref, opts])
   end
 
-  defp normalize_copy(_spec, index) do
-    {:error, "copy #{index + 1} must be a map"}
+  @doc """
+  Sends `command` to a shell opened with `open_shell/2` and returns the
+  output plus the terminal handle to thread into the next call.
+
+  ## Examples
+
+      {:ok, shell} = Dockd.open_shell("smoke")
+
+      # Successful command — stdout is returned as a binary.
+      {:ok, {"/\\n", shell}} = Dockd.shell_send(shell, "pwd")
+
+      # Commands that produce both streams come back as {stdout, stderr}.
+      {:ok, {{_stdout, _stderr}, shell}} =
+        Dockd.shell_send(shell, "echo out; echo err 1>&2")
+
+      # State persists across calls in the same shell session.
+      {:ok, {_, shell}} = Dockd.shell_send(shell, "export FOO=bar")
+      {:ok, {"bar\\n", shell}} = Dockd.shell_send(shell, "echo $FOO")
+
+      :ok = Dockd.close_shell(shell)
+  """
+  @spec shell_send(Docker.Terminal.handle(), iodata(), keyword()) ::
+          {:ok, {binary() | {binary(), binary()}, Docker.Terminal.handle()}}
+          | {:error, {term(), Docker.Terminal.handle()}}
+  def shell_send(shell, command, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :shell_send, [shell, command, opts])
   end
 
-  defp get_value(map, key) do
-    Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  @doc """
+  Closes a shell handle previously returned by `open_shell/2`.
+
+  Idempotent — safe to call on an already-closed handle.
+
+  ## Examples
+
+      {:ok, shell} = Dockd.open_shell("smoke")
+      {:ok, {_, shell}} = Dockd.shell_send(shell, "echo hi")
+      :ok = Dockd.close_shell(shell)
+  """
+  @spec close_shell(Docker.Terminal.handle(), keyword()) :: :ok
+  def close_shell(shell, opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :close_shell, [shell])
   end
 
-  defp drop_nil(map) do
-    for {k, v} <- map, not is_nil(v), into: %{}, do: {k, v}
+  @doc """
+  Copies host files or directories into an existing instance.
+
+  `copies` is a list of `%{src:, dest:}` maps — the same shape accepted
+  by `Dockd.Spec`'s `:copy` field. Uses the same tar + put_archive
+  pipeline that `apply/2` uses at create time.
+
+  ## Examples
+
+      :ok =
+        Dockd.copy_to(instance, [
+          %{src: "./config/app.env", dest: "/etc/app/app.env"},
+          %{src: "./scripts", dest: "/opt/scripts"}
+        ])
+  """
+  @spec copy_to(Instance.t() | binary(), [map()], keyword()) :: :ok | {:error, Error.t()}
+  def copy_to(instance_or_ref, copies, opts \\ []) when is_list(copies) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :copy_to, [instance_or_ref, copies, opts])
   end
 
-  defp resolve_image(session, %{} = build), do: build_image(session, build)
-  defp resolve_image(session, nil), do: pull_image(session)
+  @doc """
+  Lists the staging directories dockd has left under
+  `<system_tmp>/dockd/` on the local node.
 
-  defp build_image(%Workspace{image: tag, docker_options: docker_options} = session, build) do
-    dockerfile = atomize_key(build, :dockerfile)
-    context = atomize_key(build, :context)
-    expanded = Path.expand(dockerfile)
+  These are created during file copies and git repo fetches when
+  preparing data for upload into a container. They are usually cleaned
+  up automatically; this function exposes whatever is left.
 
-    {context_path, dockerfile_path} =
-      if File.dir?(expanded) do
-        {expanded, Path.join(expanded, "Dockerfile")}
-      else
-        if context do
-          {Path.expand(context), expanded}
-        else
-          {Path.dirname(expanded), expanded}
-        end
-      end
-
-    build_params = build_params_for_engine(build)
-
-    docker_call(session, :build, "failed to build Docker image", fn ->
-      Docker.build_image(context_path, dockerfile_path, tag, build_params, docker_options)
-    end)
+  Operates on the node selected by RPC routing (random in the cluster
+  filter, or local when no cluster is configured). Staging dirs are not
+  shared across nodes, so this reports only what's on the chosen node.
+  """
+  @spec list_temp_files(keyword()) :: {:ok, [Path.t()]}
+  def list_temp_files(opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :list_temp_files, [opts])
   end
 
-  # The :build map carries Compose-style names (`:args`, `:dockerfile`, `:context`).
-  # Strip the dockd-managed `:dockerfile`/`:context` and rename `:args` → `:buildargs`
-  # for the Docker Engine API.
-  defp build_params_for_engine(build) do
-    build
-    |> normalize_build_keys()
-    |> Map.drop([:dockerfile, :context])
-    |> rename_key(:args, :buildargs)
+  @doc """
+  Deletes every staging directory dockd has left under
+  `<system_tmp>/dockd/` on the targeted node.
+
+  Operates on the node selected by RPC routing (random in the cluster
+  filter, or local when no cluster is configured).
+  """
+  @spec delete_temp_files(keyword()) :: :ok
+  def delete_temp_files(opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :delete_temp_files, [opts])
   end
 
-  defp normalize_build_keys(map) do
-    for {k, v} <- map, into: %{} do
-      key = if is_binary(k), do: String.to_atom(k), else: k
-      {key, v}
-    end
-  end
+  @doc """
+  Returns an aggregate info map about dockd's state on the targeted node.
 
-  defp rename_key(map, from, to) do
-    case Map.pop(map, from) do
-      {nil, m} -> m
-      {v, m} -> Map.put(m, to, v)
-    end
-  end
+  The shape is `%{temp_files: %{...}}` and is intentionally
+  extension-friendly: callers should pattern-match on the keys they
+  care about so future additions don't conflict with existing data.
 
-  defp rename_keyword(kw, from, to) do
-    case Keyword.pop(kw, from) do
-      {nil, k} -> k
-      {v, k} -> Keyword.put(k, to, v)
-    end
-  end
+  Currently included:
 
-  defp atomize_key(map, key) do
-    Map.get(map, key) || Map.get(map, Atom.to_string(key))
-  end
+    - `:temp_files` — `%{count, total_bytes, oldest_at, newest_at}` for
+      the staging dir under `<system_tmp>/dockd/`.
 
-  defp validate_dockerfile_path(dockerfile, session) do
-    expanded = Path.expand(dockerfile)
-
-    cond do
-      File.regular?(expanded) ->
-        :ok
-
-      File.dir?(expanded) ->
-        if File.regular?(Path.join(expanded, "Dockerfile")) do
-          :ok
-        else
-          {:error,
-           %Error{
-             phase: :validate,
-             message: "no Dockerfile found in directory: #{dockerfile}",
-             session: session
+  Operates on the node selected by RPC routing.
+  """
+  @spec info(keyword()) ::
+          {:ok,
+           %{
+             temp_files: %{
+               count: non_neg_integer(),
+               total_bytes: non_neg_integer(),
+               oldest_at: DateTime.t() | nil,
+               newest_at: DateTime.t() | nil
+             }
            }}
-        end
-
-      true ->
-        {:error,
-         %Error{
-           phase: :validate,
-           message: "dockerfile path does not exist: #{dockerfile}",
-           session: session
-         }}
-    end
+  def info(opts \\ []) do
+    opts
+    |> get_node_filter()
+    |> RPC.call_on_random_node(Core, :info, [opts])
   end
 
-  defp pull_image(%Workspace{image: image, docker_options: docker_options} = session) do
-    docker_call(session, :pull, "failed to pull Docker image", fn ->
-      Docker.pull_image(image, %{}, docker_options)
-    end)
+  defp get_node_filter(opts) do
+    opts
+    |> Keyword.get(:dockd, [])
+    |> Dockd.Config.node_filter()
   end
-
-  defp create_container(
-         %Workspace{
-           container_name: name,
-           image: image,
-           shell: shell,
-           docker_options: docker_options
-         } = session
-       ) do
-    create_options = Keyword.put(docker_options, :interactive_shell, shell)
-
-    case Docker.create_container(name, image, create_options) do
-      {:ok, container_id} ->
-        {:ok, container_id}
-
-      {:error, {warnings, container_id}} when is_list(warnings) and is_binary(container_id) ->
-        {:ok, container_id}
-
-      {:error, reason} ->
-        {:error,
-         Error.docker_phase_error(:create, "failed to create Docker container", reason, session)}
-    end
-  end
-
-  defp start_container(
-         %Workspace{container_id: container_id, docker_options: docker_options} = session
-       ) do
-    docker_call(session, :start, "failed to start Docker container", fn ->
-      Docker.start_container(container_id, docker_options)
-    end)
-  end
-
-  defp run_steps(
-         steps,
-         %Workspace{container_id: container_id, docker_options: docker_options} = session
-       ) do
-    Enum.reduce_while(steps, {:ok, []}, fn step, {:ok, acc} ->
-      exec_options =
-        docker_options
-        |> put_exec_option(:env, step.env)
-        |> put_exec_option(:workdir, step.workdir)
-        |> put_exec_option(:user, step.user)
-
-      case Docker.exec_run_with_status(container_id, step.cmd, exec_options) do
-        {:ok, %{output: output, exit_code: exit_code}} ->
-          step_result = %StepResult{
-            label: step.label,
-            cmd: step.cmd,
-            output: output,
-            exit_code: exit_code,
-            env: step.env,
-            workdir: step.workdir,
-            user: step.user
-          }
-
-          if exit_code in [0, nil] do
-            {:cont, {:ok, acc ++ [step_result]}}
-          else
-            error_session = Workspace.put(session, %{step_results: acc ++ [step_result]})
-
-            {:halt,
-             {:error,
-              %Error{
-                phase: :setup,
-                message: "setup step failed: #{step.label}",
-                exit_code: exit_code,
-                output: output,
-                session: error_session
-              }}}
-          end
-
-        {:error, reason} ->
-          {:halt,
-           {:error,
-            Error.docker_phase_error(
-              :setup,
-              "failed to run setup step: #{step.label}",
-              reason,
-              session
-            )}}
-      end
-    end)
-  end
-
-  defp stop_container(
-         %Workspace{container_id: container_id, docker_options: docker_options} = session
-       ) do
-    docker_call_tolerant(session, :destroy, "failed to stop Docker container", [304, 404], fn ->
-      Docker.stop_container(container_id, docker_options)
-    end)
-  end
-
-  defp delete_container(
-         %Workspace{container_id: container_id, docker_options: docker_options} = session
-       ) do
-    docker_call_tolerant(session, :destroy, "failed to delete Docker container", [404], fn ->
-      Docker.delete_container(container_id, %{force: true}, docker_options)
-    end)
-  end
-
-  defp default_container_name do
-    "dockd-#{System.unique_integer([:positive])}"
-  end
-
-  defp docker_call(session, phase, message, fun) do
-    case fun.() do
-      {:ok, result} -> {:ok, result}
-      {:error, reason} -> {:error, Error.docker_phase_error(phase, message, reason, session)}
-    end
-  end
-
-  defp docker_call_tolerant(session, phase, message, tolerated_statuses, fun) do
-    case fun.() do
-      {:ok, _} ->
-        :ok
-
-      {:error, %{status: status} = reason} ->
-        if status in tolerated_statuses do
-          :ok
-        else
-          {:error, Error.docker_phase_error(phase, message, reason, session)}
-        end
-
-      {:error, reason} ->
-        {:error, Error.docker_phase_error(phase, message, reason, session)}
-    end
-  end
-
-  defp put_exec_option(options, _key, nil), do: options
-  defp put_exec_option(options, key, value), do: Keyword.put(options, key, value)
 end

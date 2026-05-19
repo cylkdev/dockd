@@ -1,0 +1,282 @@
+defmodule Dockd.Packages do
+  @moduledoc """
+  Storage layer for dockd packages.
+
+  A package is a directory under `priv/packages/<name>/` that contains a
+  `package.json` (the serialized `Dockd.Spec`) plus any supporting files
+  the spec references (typically a `Dockerfile`). The package's identity
+  is its directory name.
+
+  This module owns two concerns:
+
+    - `resolve_path/1` — turn the user-facing reference passed to
+      `Dockd.apply_package/2` or `mix dockd --preset` into a concrete
+      path to a `package.json`.
+    - `install_from_git/2` — clone a remote git repository and copy
+      every `<repo>/packages/<name>/` directory containing a
+      `package.json` into the local `priv/packages/`.
+
+  Remote installs use the host `git` binary (same approach as
+  `Dockd.Git`) so HTTPS/SSH credentials and `~/.gitconfig` are reused
+  as-is. The clone is shallow (`--depth 1`) and the staging tempdir is
+  always cleaned up.
+  """
+
+  alias Dockd.Error
+  alias Dockd.Spec
+  alias Dockd.Spec.Normalizer
+  alias Dockd.Spec.Parser
+  alias Dockd.Spec.Source
+
+  @doc """
+  Resolves the reference passed to `apply_package` or the `--preset` flag
+  into a path to a `package.json` file.
+
+    - any string ending in `.json` is treated as a literal file path
+    - any other string containing `/` is treated as a package directory
+      and joined with `"package.json"`
+    - any other string is resolved against `priv/packages/<name>/package.json`
+  """
+  @spec resolve_path(binary()) :: Path.t()
+  def resolve_path(ref) when is_binary(ref) do
+    cond do
+      String.ends_with?(ref, ".json") ->
+        ref
+
+      String.contains?(ref, "/") ->
+        Path.join(ref, "package.json")
+
+      true ->
+        Path.join([packages_root(), ref, "package.json"])
+    end
+  end
+
+  @doc """
+  Returns the absolute path of the local `priv/packages/` directory.
+  """
+  @spec packages_root() :: Path.t()
+  def packages_root do
+    Path.join(to_string(:code.priv_dir(:dockd)), "packages")
+  end
+
+  @doc """
+  Lists every installed package under `priv/packages/`.
+
+  A subdirectory is considered an installed package when it contains a
+  readable `package.json`. The spec is parsed eagerly so callers can
+  show metadata (image, shell) or surface a parse error per package.
+
+  Returns a list of maps sorted by `:name`:
+
+      %{name: binary(), path: Path.t(),
+        spec: {:ok, Spec.t()} | {:error, Error.t()}}
+
+  When the `priv/packages/` directory does not exist, returns `[]`.
+  """
+  @spec list() :: [
+          %{
+            name: binary(),
+            path: Path.t(),
+            spec: {:ok, Spec.t()} | {:error, Error.t()}
+          }
+        ]
+  def list do
+    root = packages_root()
+
+    case File.ls(root) do
+      {:ok, entries} ->
+        entries
+        |> Enum.sort()
+        |> Enum.map(&{&1, Path.join(root, &1)})
+        |> Enum.filter(fn {_name, path} -> File.dir?(path) end)
+        |> Enum.filter(fn {_name, path} ->
+          File.exists?(Path.join(path, "package.json"))
+        end)
+        |> Enum.map(fn {name, path} ->
+          %{
+            name: name,
+            path: path,
+            spec: load_metadata_spec(Path.join(path, "package.json"))
+          }
+        end)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  defp load_metadata_spec(json_path) do
+    with {:ok, body} <- Source.read_file(json_path),
+         {:ok, decoded} <- Parser.parse(body),
+         {:ok, attrs} <- Normalizer.normalize(decoded, Path.dirname(json_path)) do
+      {:ok, Spec.from_attrs(attrs)}
+    end
+  end
+
+  @doc """
+  Clones a git repository and installs every package found under its
+  `packages/` directory into `priv/packages/`.
+
+  A subdirectory is considered a package when it contains a readable
+  `package.json` that parses as a valid `Dockd.Spec`. Each installed
+  package keeps its source folder name (e.g. `<repo>/packages/foo/`
+  becomes `priv/packages/foo/`). An existing target directory is
+  removed and replaced.
+
+  Options:
+
+    - `:ref` — git branch or tag to clone (defaults to the remote's
+      default branch).
+    - `:dest_dir` — override the install root (defaults to
+      `packages_root/0`). Primarily used by tests.
+
+  Returns `{:ok, [name]}` with the installed package names, or
+  `{:error, %Dockd.Error{}}` tagged with phase `:fetch`.
+  """
+  @spec install_from_git(binary(), keyword()) ::
+          {:ok, [binary()]} | {:error, Error.t()}
+  def install_from_git(url, opts \\ []) when is_binary(url) do
+    dest_dir = Keyword.get(opts, :dest_dir, packages_root())
+    ref = Keyword.get(opts, :ref)
+    normalized_url = normalize_url(url)
+
+    tmp =
+      Path.join([
+        System.tmp_dir!(),
+        "dockd",
+        "dockd-pkg-#{System.unique_integer([:positive])}"
+      ])
+
+    try do
+      with :ok <- ensure_git(),
+           :ok <- wrap(File.mkdir_p(tmp), "could not create staging dir"),
+           :ok <- clone(normalized_url, ref, tmp),
+           {:ok, names} <- install_from_clone(tmp, dest_dir) do
+        {:ok, names}
+      end
+    after
+      File.rm_rf(tmp)
+    end
+  end
+
+  defp install_from_clone(clone_dir, dest_dir) do
+    packages_dir = Path.join(clone_dir, "packages")
+
+    if File.dir?(packages_dir) do
+      case File.mkdir_p(dest_dir) do
+        :ok ->
+          packages_dir
+          |> File.ls!()
+          |> Enum.map(&{&1, Path.join(packages_dir, &1)})
+          |> Enum.filter(fn {_name, path} -> File.dir?(path) end)
+          |> Enum.filter(fn {_name, path} ->
+            File.exists?(Path.join(path, "package.json"))
+          end)
+          |> install_each(dest_dir)
+
+        {:error, reason} ->
+          {:error,
+           Error.docker_phase_error(
+             :fetch,
+             "could not create destination dir #{dest_dir}",
+             reason,
+             nil
+           )}
+      end
+    else
+      {:error,
+       %Error{
+         phase: :fetch,
+         message: "repository has no top-level packages/ directory"
+       }}
+    end
+  end
+
+  defp install_each(candidates, dest_dir) do
+    Enum.reduce_while(candidates, {:ok, []}, fn {name, src}, {:ok, acc} ->
+      with {:ok, _spec} <- load_metadata_spec(Path.join(src, "package.json")),
+           :ok <- copy_package(src, Path.join(dest_dir, name)) do
+        {:cont, {:ok, [name | acc]}}
+      else
+        {:error, %Error{} = err} ->
+          {:halt,
+           {:error,
+            %Error{
+              err
+              | phase: :fetch,
+                message: "package #{inspect(name)}: #{err.message}"
+            }}}
+      end
+    end)
+    |> case do
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
+      err -> err
+    end
+  end
+
+  defp copy_package(src, dest) do
+    _ = File.rm_rf(dest)
+
+    case File.cp_r(src, dest) do
+      {:ok, _files} ->
+        :ok
+
+      {:error, reason, file} ->
+        {:error,
+         Error.docker_phase_error(
+           :fetch,
+           "could not copy package to #{dest}",
+           %{reason: reason, file: file},
+           nil
+         )}
+    end
+  end
+
+  defp ensure_git do
+    case System.find_executable("git") do
+      nil ->
+        {:error,
+         %Error{
+           phase: :fetch,
+           message: "git not found on host PATH; install git to fetch remote packages"
+         }}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp clone(url, ref, target) do
+    args =
+      ["clone", "--quiet", "--depth", "1"]
+      |> maybe_branch(ref)
+      |> Kernel.++([url, target])
+
+    case System.cmd("git", args, stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, code} ->
+        {:error,
+         Error.docker_phase_error(
+           :fetch,
+           "failed to clone #{url}",
+           %{status: code, body: output},
+           nil
+         )}
+    end
+  end
+
+  defp maybe_branch(args, nil), do: args
+  defp maybe_branch(args, ref), do: args ++ ["--branch", ref]
+
+  defp normalize_url("github.com/" <> _rest = shorthand),
+    do: "https://" <> shorthand
+
+  defp normalize_url(url), do: url
+
+  defp wrap(:ok, _msg), do: :ok
+
+  defp wrap({:error, reason}, msg),
+    do: {:error, Error.docker_phase_error(:fetch, msg, reason, nil)}
+end

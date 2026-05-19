@@ -13,13 +13,13 @@ it sounds, and precisely how the `:sorrel` library makes it possible.
 Dockd is a library that spins up short-lived Docker containers, runs setup commands inside
 them, and gives you back a handle you can use to interact with them programmatically.
 
-The one-sentence version: **dockd turns a Docker image into a ready-to-use workspace,
+The one-sentence version: **dockd turns a Docker image into a ready-to-use instance,
 entirely from code.**
 
 Let's take a look at an example:
 
 ```elixir
-{:ok, workspace} = Dockd.prepare("node:20-slim",
+{:ok, instance} = Dockd.run("node:20-slim",
   steps: [
     %{label: "install deps", cmd: ["npm", "install"]},
     %{label: "seed database", cmd: ["node", "seed.js"]}
@@ -27,13 +27,13 @@ Let's take a look at an example:
 )
 
 # The container is now running and both setup steps have completed.
-workspace.shell_command
+instance.shell_command
 #=> "docker exec -it dockd-1 /bin/sh"
 ```
 
 When `prepare/2` returns, you have a live container with your setup already applied.
-`workspace.shell_command` is the string a human can paste into a terminal to drop into the
-container interactively. The same workspace can also be driven entirely from code using
+`instance.shell_command` is the string a human can paste into a terminal to drop into the
+container interactively. The same instance can also be driven entirely from code using
 `Dockd.Claude`.
 
 ---
@@ -84,22 +84,22 @@ Input: image name + options
       └──────┬──────┘
              │
              ▼
-   {:ok, %Dockd.Workspace{}}
+   {:ok, %Dockd.Instance{}}
 ```
 
 If any phase fails, the pipeline stops immediately and returns
 `{:error, %Dockd.Error{phase: :create, ...}}`
 (or whichever phase failed). If a container was created before the failure,
-the error struct carries a partial `Dockd.Workspace` with the container ID,
+the error struct carries a partial `Dockd.Instance` with the container ID,
 so you can call `Dockd.destroy/1` to clean it up.
 
-### The Workspace struct
+### The Instance struct
 
-The `Dockd.Workspace` struct that `prepare/2` returns is the state snapshot
-of your workspace at the moment it was ready:
+The `Dockd.Instance` struct that `prepare/2` returns is the state snapshot
+of your instance at the moment it was ready:
 
 ```elixir
-%Dockd.Workspace{
+%Dockd.Instance{
   container_id:   "a3f9c2d...",         # Docker's internal container ID
   container_name: "dockd-1",            # Human-readable name
   image:          "node:20-slim",       # The image it was started from
@@ -113,7 +113,7 @@ of your workspace at the moment it was ready:
 }
 ```
 
-Think of `Dockd.Workspace` as a **receipt** for the container. It records
+Think of `Dockd.Instance` as a **receipt** for the container. It records
 everything needed to operate on or clean up the container later.
 
 ---
@@ -239,7 +239,7 @@ have agreed to speak something else over the same socket from that point on.
 WebSockets use this mechanism. Docker's exec and attach APIs use it too.
 
 Here is what the exchange looks like at the wire level when dockd opens an
-exec session:
+exec instance:
 
 ```
 Step 1 - dockd sends a normal HTTP POST:
@@ -352,7 +352,7 @@ stream the chunk belongs to and how long the chunk is.
 
 A PTY (pseudo-terminal, sometimes called a TTY) is a fake terminal the operating
 system creates. When you open a terminal application, run `ssh`, or use `tmux`,
-each of those sessions is backed by a PTY. It creates the illusion of a real
+each of those instances is backed by a PTY. It creates the illusion of a real
 terminal - line editing, Ctrl-C, colour codes, and so on all work because the
 PTY kernel driver processes them.
 
@@ -425,7 +425,7 @@ and routing payload bytes to the correct buffer (stdout vs stderr).
 
 ---
 
-## The streaming session struct
+## The streaming instance struct
 
 `Docker.Engine.Streaming.Session` is the struct that wraps the raw socket after
 the 101 upgrade and manages all the bookkeeping for reading from it cleanly.
@@ -441,13 +441,13 @@ the 101 upgrade and manages all the bookkeeping for reading from it cleanly.
 }
 ```
 
-When your code calls `Session.recv(session, {:until, "\n"}, timeout: 120_000)`,
+When your code calls `Session.recv(instance, {:until, "\n"}, timeout: 120_000)`,
 here is what happens internally:
 
 ```
-Session.recv(session, {:until, "\n"}, ...)
+Session.recv(instance, {:until, "\n"}, ...)
   │
-  ├── check: does session.buffer already contain "\n"?
+  ├── check: does instance.buffer already contain "\n"?
   │     └── no → read more bytes from socket
   │
   ├── receive raw bytes from socket (e.g. the 14 bytes above)
@@ -458,13 +458,13 @@ Session.recv(session, {:until, "\n"}, ...)
   │     ├── reads 6 payload bytes: "hello\n"
   │     └── returns {stdout: "hello\n", stderr: "", leftover: ""}
   │
-  ├── append "hello\n" to session.buffer
+  ├── append "hello\n" to instance.buffer
   │
   ├── check: does buffer contain "\n"? YES
   │
   ├── split at "\n": return "hello\n", keep "" in buffer
   │
-  └── returns {:ok, "hello\n", updated_session}
+  └── returns {:ok, "hello\n", updated_instance}
 ```
 
 This loop repeats - reading, demuxing, buffering, checking for the delimiter -
@@ -474,7 +474,7 @@ until the delimiter appears or the timeout fires.
 
 ## How Dockd.Claude uses all of this
 
-`Dockd.Claude` is the module that runs `claude --print` inside a prepared workspace
+`Dockd.Claude` is the module that runs `claude --print` inside a prepared instance
 and returns either a single JSON result (`ask/3`) or a live stream of JSON events
 (`ask_stream/3`).
 
@@ -484,7 +484,7 @@ the raw socket and back:
 ```
 Your code
   │
-  │  {:ok, stream} = Dockd.Claude.ask_stream(workspace, "what is 2+2")
+  │  {:ok, stream} = Dockd.Claude.ask_stream(instance, "what is 2+2")
   │
   ▼
 
@@ -504,29 +504,29 @@ Step 3 - start the exec with a 101 upgrade (Sorrel.tunnel):
 
 Step 4 - wrap the socket:
   Docker.Engine.Streaming.Session.from_upgrade(socket, leftover, tty: false)
-  ← session = %Session{socket: ..., tty: false, buffer: "", ...}
+  ← instance = %Session{socket: ..., tty: false, buffer: "", ...}
 
 Step 5 - build an Elixir Stream (lazy - nothing is read yet):
   Stream.resource(
-    fn -> {session, ""}                         end,  # initial state
+    fn -> {instance, ""}                         end,  # initial state
     fn state -> read_next_json_line(state)       end,  # pull next event
     fn {s, _} -> Session.close(s)               end   # cleanup on halt
   )
 
 Step 6 - each time your code pulls from the stream:
-  Session.recv(session, {:until, "\n"}, timeout: 120_000)
+  Session.recv(instance, {:until, "\n"}, timeout: 120_000)
     ├── reads bytes from socket
     ├── strips Docker frame headers
     ├── buffers until "\n" appears
     └── returns one complete line
 
-  Jason.decode!("{\"type\":\"assistant\",\"message\":{...}}")
+  JSON.decode!("{\"type\":\"assistant\",\"message\":{...}}")
     └── returns %{"type" => "assistant", "message" => {...}}
 
 Step 7 - when the claude process exits:
-  Session.recv returns {:error, :closed, session}
+  Session.recv returns {:error, :closed, instance}
     └── stream halts
-    └── Session.close(session) releases the socket
+    └── Session.close(instance) releases the socket
 ```
 
 ---
@@ -554,7 +554,7 @@ Here is every layer involved, from your code to the bytes on the socket:
 ┌─────────────────────────────────────────────────────────────┐
 │  Docker  (../docker library)                                │
 │                                                             │
-│  Docker.exec_run_with_status   Docker.exec_session          │
+│  Docker.exec_run_with_status   Docker.exec_instance          │
 │  Docker.create_container       Docker.Engine.Streaming      │
 │  Docker.start_container        Docker.Engine.Frame          │
 │  Docker.Engine.Client          Docker.Engine.Streaming      │
