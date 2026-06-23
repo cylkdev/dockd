@@ -385,34 +385,36 @@ Two entry points:
 
 ```elixir
 # A path on disk - typical for project-local packages.
-{:ok, instance} = Dockd.prepare_package("./packages/python.json")
+{:ok, instance} = Dockd.apply_package("./packages/python.json")
 
-# A bare name - resolves to priv/packages/<name>.json shipped with dockd.
-{:ok, instance} = Dockd.prepare_package("claude_code_live_instance")
+# A bare name - resolves to <packages_root>/<name>/package.json.
+{:ok, instance} = Dockd.apply_package("claude_code_live_workspace")
 ```
 
-### Bundled packages
+### Installed packages
 
-Packages shipped in `priv/packages/` are addressable by their filename stem.
-Names are tied 1:1 to the JSON files on disk, so `ls priv/packages` is the
-canonical catalog of presets. The bundled presets:
+Package names resolve from the configured packages root, which defaults to
+`~/.dockd/packages`. Generate the Claude Code package set explicitly:
+
+```sh
+mix dockd.claude_code.install
+```
+
+The generated Claude Code packages:
 
 | Name | What you get |
 |------|--------------|
-| `"claude_code_live_instance"` | Live bind of `${PWD}` at `/instance`, shared `~/.claude` for OAuth - claude's edits land back on the host. |
-| `"claude_code_isolated_instance"` | One-way snapshot of `${PWD}` at `/instance/project`, plus a single `~/dockd-output → /instance/output` bind - host source stays pristine, results land in one named directory. Uses `ANTHROPIC_API_KEY` rather than shared OAuth. |
-| `"claude_code_repo_instance"` | Shallow-clones `${DOCKD_REPO_URL}` (optional `${DOCKD_REPO_REF}`, default `main`) into `/instance/repo`, plus a single `~/dockd-output → /instance/output` bind. Host's `git` credentials handle the clone; `ANTHROPIC_API_KEY` is required and `GITHUB_TOKEN` is forwarded if set. |
+| `"claude_code"` | Claude Code CLI with `${PWD}` live-mounted at `/instance` and host Claude credentials shared in. |
+| `"claude_code_live_workspace"` | Live bind of `${PWD}` at `/instance`, shared `~/.claude` for OAuth - claude's edits land back on the host. |
+| `"claude_code_isolated_workspace"` | One-way snapshot of `${PWD}` at `/instance/project`, plus a single `~/dockd-output` bind at `/instance/output`. |
+| `"claude_code_repo_workspace"` | Clones `${DOCKD_REPO_URL}` into `/instance/repo`, plus a single `~/dockd-output` bind at `/instance/output`. |
 
-To add your own bundled package, drop a JSON file in that directory (or its
-equivalent in your dependent project's priv) and reference it with
-`Dockd.prepare_package("my_name")`. Pick a filename that describes the
-instance shape - `python_test_runner.json`, `node_with_postgres.json`, etc. -
-so collaborators can tell presets apart at a glance.
+To add your own installed package, place a directory at
+`<packages_root>/<name>/` containing `package.json` and any referenced support
+files, then call `Dockd.apply_package("name")`.
 
-The lookup rule is purely lexical: a string with no `/` and no `.json` suffix
-is a bundled name; anything else is a path. This keeps package loading
-deterministic and stateless - the BEAM atom table never grows from preset
-names.
+The lookup rule is lexical: a string with no `/` and no `.json` suffix is a
+package name; anything else is a path.
 
 ### Error handling
 

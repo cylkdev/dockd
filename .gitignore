@@ -8,6 +8,7 @@
 .claude/
 dialyzer/
 erl_crash.dump
+apps/dockd_tui/dockd_tui
 .DS_Store
 .claude/
 *.env
