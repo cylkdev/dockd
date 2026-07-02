@@ -79,15 +79,19 @@ end
 validates each `package.json` parses as a `Dockd.Spec`, and copies it into the
 dest root. Local install is git-install minus the clone.
 
-Expose it through the existing task with a new source type:
+Expose it through the existing task with a new source type, reusing the
+existing `--source` flag for both source types:
 
 ```
-mix dockd.package.install local --path=DIR
+mix dockd.package.install local --source=DIR
+mix dockd.package.install git   --source=URL
 ```
 
-`apps/dockd_cli/lib/mix/tasks/dockd.package.install.ex` gains a `local` branch
-that calls `Dockd.Packages.install_from_path(path)` and validates a required
-`--path` flag, alongside the existing `git --source=URL` branch.
+`--source` means "where the packages come from"; the positional source-type
+word (`local` vs `git`) disambiguates a filesystem path from a clone URL, so no
+second flag is introduced. `apps/dockd_cli/lib/mix/tasks/dockd.package.install.ex`
+gains a `local` branch that calls `Dockd.Packages.install_from_path(source)`,
+alongside the existing `git` branch.
 
 ### 4. Cleanup of dangling references
 
@@ -103,7 +107,10 @@ that calls `Dockd.Packages.install_from_path(path)` and validates a required
   `packages/<name>/package.json`, asserting the package dirs land in a temp dest
   root. Mirrors the existing git-install test but with no network.
 - Smoke-test that each shipped `packages/claude_code*/package.json` parses as a
-  valid `Dockd.Spec`, guarding the static data against drift.
+  valid `Dockd.Spec`, guarding the static data against drift. Resolve the
+  `packages/` path relative to the umbrella root (anchored off `__DIR__`), not
+  the process cwd, so the test passes whether `mix test` runs from the umbrella
+  root or the app directory.
 - Update/replace CLI task tests that assert on `mix dockd.claude_code.install`
   help text.
 
