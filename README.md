@@ -450,13 +450,17 @@ Two entry points:
 ### Installed packages
 
 Package names resolve from the configured packages root, which defaults to
-`~/.dockd/packages`. Generate the Claude Code package set explicitly:
+`~/.dockd/packages`. The Claude Code packages ship as static data in this
+repo's top-level `packages/` directory and are installed into the packages
+root with:
 
 ```sh
-mix dockd.claude_code.install
+mix dockd.package.install local --source=<path-to-dockd-repo>
+# or, from a remote:
+mix dockd.package.install git --source=<url>
 ```
 
-The generated Claude Code packages:
+The Claude Code packages:
 
 | Name | What you get |
 |------|--------------|

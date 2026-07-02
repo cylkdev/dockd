@@ -53,8 +53,11 @@ defmodule Mix.Tasks.Dockd.Package.Install do
       end
 
     url =
-      opts[:source] ||
-        Mix.raise("Missing required --source=<url> flag")
+      case opts[:source] do
+        nil -> Mix.raise("Missing required --source=<url> flag")
+        "" -> Mix.raise("Missing required --source=<url> flag")
+        source -> source
+      end
 
     Mix.Task.run("app.start")
 
