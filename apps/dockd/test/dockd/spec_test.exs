@@ -44,9 +44,9 @@ defmodule Dockd.SpecTest do
 
   describe "from_attrs/1" do
     test "builds a Spec from a normalized attrs map with a name" do
-      spec = Spec.from_attrs(%{image: "node:20", name: "my-box", shell: "claude"})
+      spec = Spec.from_attrs(%{image: "node:20", name: "my-box", shell: "mytool"})
       assert spec.image === "node:20"
-      assert spec.shell === "claude"
+      assert spec.shell === "mytool"
       assert spec.name === "dockd-my-box"
     end
 

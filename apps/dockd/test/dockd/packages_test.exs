@@ -48,13 +48,13 @@ defmodule Dockd.PackagesTest do
   describe "resolve_path/1" do
     test "bare name resolves to <packages_root>/<name>/package.json" do
       root = sandbox_dir("dockd-packages-root")
-      path = Packages.resolve_path("claude_code", packages_path: root)
+      path = Packages.resolve_path("webapp", packages_path: root)
 
       assert Path.basename(path) === "package.json"
-      assert Path.basename(Path.dirname(path)) === "claude_code"
+      assert Path.basename(Path.dirname(path)) === "webapp"
 
       assert path ===
-               Path.join([root, "claude_code", "package.json"])
+               Path.join([root, "webapp", "package.json"])
     end
 
     test "directory path appends package.json" do
@@ -225,26 +225,6 @@ defmodule Dockd.PackagesTest do
       assert {:error, err} = Packages.install_from_path(src, dest_dir: dest)
       assert err.phase === :fetch
       assert err.message =~ "no top-level packages/ directory"
-    end
-  end
-
-  describe "shipped claude_code package data" do
-    test "every shipped package installs (i.e. its package.json parses as a Spec)" do
-      # Repo root = four levels up from this test file
-      # (apps/dockd/test/dockd -> apps/dockd/test -> apps/dockd -> apps -> repo root).
-      repo_root = Path.expand(Path.join([__DIR__, "..", "..", "..", ".."]))
-      dest = sandbox_dir("dockd-shipped-dest")
-
-      assert {:ok, names} = Packages.install_from_path(repo_root, dest_dir: dest)
-
-      for name <- [
-            "claude_code",
-            "claude_code_live_workspace",
-            "claude_code_isolated_workspace",
-            "claude_code_repo_workspace"
-          ] do
-        assert name in names, "shipped package #{name} did not install/parse"
-      end
     end
   end
 

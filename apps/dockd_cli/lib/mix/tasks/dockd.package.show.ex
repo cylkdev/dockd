@@ -14,7 +14,7 @@ defmodule Mix.Tasks.Dockd.Package.Show do
   ## Example output
 
       NAME           IMAGE             DESCRIPTION
-      claude_code    debian:trixie     Anthropic Claude Code CLI ...
+      webapp         debian:trixie     Web app development container ...
       smoke          busybox:1.37.0
   """
   @shortdoc "List installed dockd packages"

@@ -162,7 +162,7 @@ Each setup step is a map with a `:label` and a `:cmd` (list of strings):
 A **package** is a JSON file that describes a complete instance - image, shell,
 files to bring in, setup commands - so you can launch a reusable environment with
 one call. Packages are the fastest way to share a "stack" (e.g. "Node 20 with
-claude-code installed and `~/.claude` mounted") with someone else: hand them the
+your toolchain preinstalled and a project directory mounted") with someone else: hand them the
 file, they run `Dockd.prepare_package("./my-stack.json")`, and they get the same
 container you do.
 
@@ -246,7 +246,7 @@ image will receive instead.
 Path inside the container that an interactive `docker exec -it` should launch.
 Use the entrypoint of whatever tool you actually want - for an SSH-style shell,
 `"/bin/bash"`; for a CLI tool that runs as a single binary, point directly at it
-(e.g. `"claude"`).
+(e.g. `"/usr/local/bin/mytool"`).
 
 #### `name` (string, default auto-generated)
 
@@ -271,8 +271,7 @@ Container environment variables. Each entry can be one of three shapes:
 "env": [
   "NODE_ENV=development",
   "API_KEY=${API_KEY}",
-  "GITHUB_TOKEN",
-  "ANTHROPIC_API_KEY"
+  "GITHUB_TOKEN"
 ]
 ```
 
@@ -444,30 +443,21 @@ Two entry points:
 {:ok, instance} = Dockd.apply_package("./packages/python.json")
 
 # A bare name - resolves to <packages_root>/<name>/package.json.
-{:ok, instance} = Dockd.apply_package("claude_code_live_workspace")
+{:ok, instance} = Dockd.apply_package("webapp")
 ```
 
 ### Installed packages
 
 Package names resolve from the configured packages root, which defaults to
-`~/.dockd/packages`. The Claude Code packages ship as static data in this
-repo's top-level `packages/` directory and are installed into the packages
-root with:
+`~/.dockd/packages`. Package sets live in their own repositories; install every
+`packages/<name>/` directory a repo (or local checkout) ships with:
 
 ```sh
-mix dockd.package.install local --source=<path-to-dockd-repo>
-# or, from a remote:
+# From a remote repository:
 mix dockd.package.install git --source=<url>
+# From a local checkout:
+mix dockd.package.install local --source=<path>
 ```
-
-The Claude Code packages:
-
-| Name | What you get |
-|------|--------------|
-| `"claude_code"` | Claude Code CLI with `${PWD}` live-mounted at `/instance` and host Claude credentials shared in. |
-| `"claude_code_live_workspace"` | Live bind of `${PWD}` at `/instance`, shared `~/.claude` for OAuth - claude's edits land back on the host. |
-| `"claude_code_isolated_workspace"` | One-way snapshot of `${PWD}` at `/instance/project`, plus a single `~/dockd-output` bind at `/instance/output`. |
-| `"claude_code_repo_workspace"` | Clones `${DOCKD_REPO_URL}` into `/instance/repo`, plus a single `~/dockd-output` bind at `/instance/output`. |
 
 To add your own installed package, place a directory at
 `<packages_root>/<name>/` containing `package.json` and any referenced support

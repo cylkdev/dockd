@@ -48,15 +48,15 @@ defmodule Mix.Tasks.Dockd.Instance.Run do
 
   Start a container from a JSON package on disk:
 
-      ANTHROPIC_API_KEY=<your-key> mix dockd.instance.run --package ./packages/my-stack.json
+      mix dockd.instance.run --package ./packages/my-stack.json
 
   Start a container from an installed package:
 
-      ANTHROPIC_API_KEY=<your-key> mix dockd.instance.run --preset claude_code_live_workspace
+      mix dockd.instance.run --preset webapp
 
   Suppress all output except the bare attach command - useful when scripting:
 
-      mix dockd.instance.run --preset claude_code_live_workspace --short
+      mix dockd.instance.run --preset webapp --short
 
   In `--short` mode the task still blocks on Enter and destroys the container when
   released; only the progress and ready/cleanup banners are silenced.
@@ -64,12 +64,12 @@ defmodule Mix.Tasks.Dockd.Instance.Run do
   Start a container and exit without waiting - the container keeps running after the
   task ends, so closing the terminal doesn't tear it down:
 
-      mix dockd.instance.run --preset claude_code_live_workspace --detached
+      mix dockd.instance.run --preset webapp --detached
 
   In `--detached` mode the task prints the attach command plus a `docker rm -f` hint
   for cleanup, then returns. Combine with `--short` for scriptable single-line output:
 
-      eval "$(mix dockd.instance.run --preset claude_code_live_workspace --short --detached)"
+      eval "$(mix dockd.instance.run --preset webapp --short --detached)"
 
   When detached, the caller is responsible for destroying the container later (via
   `docker rm -f <name>` or `Dockd.destroy/1`).
@@ -77,9 +77,9 @@ defmodule Mix.Tasks.Dockd.Instance.Run do
   Pin a known container name so cleanup doesn't depend on remembering the auto-generated
   one - pairs well with `--detached`:
 
-      mix dockd.instance.run --preset claude_code_live_workspace --detached --name claude-work
+      mix dockd.instance.run --preset webapp --detached --name web-work
       # ...later, from anywhere:
-      docker rm -f claude-work
+      docker rm -f web-work
 
   `--name` overrides any `name` set by a package or preset.
   """

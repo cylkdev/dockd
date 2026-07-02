@@ -14,9 +14,7 @@ defmodule Dockd do
   With a Docker daemon running locally, apply an installed package by name and
   you have a live instance:
 
-      > claude setup-token
-      > export CLAUDE_CODE_OAUTH_TOKEN=<token>
-      > {:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("claude_code")
+      > {:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("webapp")
 
   ### One-shot commands
 
@@ -25,7 +23,7 @@ defmodule Dockd do
   between calls.
 
       > {:ok, %{output: _, running: false, exit_code: 0}} =
-      ...>   Dockd.shell_command(instance, ["claude", "--print", "what is 2+2?"])
+      ...>   Dockd.shell_command(instance, ["echo", "hello"])
 
       # Fresh exec each time — `cd` in one call does not affect the next.
       > {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, "cd /tmp")
@@ -90,13 +88,13 @@ defmodule Dockd do
   Packages generated or installed into the package root can be applied by
   basename:
 
-      # Resolves to <packages_root>/claude_code/package.json
+      # Resolves to <packages_root>/webapp/package.json
       {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply_package("claude_code")
+        Dockd.apply_package("webapp")
 
       # Same, with per-call Docker options.
       {:ok, result} =
-        Dockd.apply_package("claude_code", socket: "/var/run/docker.sock")
+        Dockd.apply_package("webapp", socket: "/var/run/docker.sock")
 
       # Explicit directory.
       {:ok, result} = Dockd.apply_package("./my-stack")
