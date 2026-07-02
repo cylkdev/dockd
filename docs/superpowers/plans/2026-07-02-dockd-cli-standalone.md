@@ -1071,39 +1071,7 @@ git commit -m "feat: add Optimus CLI spec, dispatch, and binary entrypoint"
 
 ---
 
-### Task 8: `DOCKD_TMP` runtime config (conditional)
-
-**Before coding:** read `apps/dockd/lib/dockd/config.ex`. If `temp_dir` is already read from an env var at runtime, **skip this task entirely.** Only proceed if it is compile-time frozen from `config/config.exs`.
-
-**Files:** Create/extend `config/runtime.exs`.
-
-- [ ] **Step 1:** Create/extend `config/runtime.exs`:
-
-```elixir
-import Config
-
-if tmp = System.get_env("DOCKD_TMP") do
-  config :dockd, temp_dir: tmp
-end
-```
-
-- [ ] **Step 2:** Verify:
-
-```bash
-mix compile && DOCKD_TMP=/tmp/dockd-alt mix run -e 'IO.inspect(Application.get_env(:dockd, :temp_dir))'
-```
-Expected: prints `"/tmp/dockd-alt"`.
-
-- [ ] **Step 3:** Commit:
-
-```bash
-git add config/runtime.exs
-git commit -m "feat: honor DOCKD_TMP at release runtime"
-```
-
----
-
-### Task 9: Burrito release config + local build + smoke test
+### Task 8: Burrito release config + local build + smoke test
 
 **VERIFY FIRST (blocking):** read the installed Burrito README/source (`deps/burrito`) and confirm the current `releases/0` shape — the `steps` entry (`&Burrito.wrap/1` vs a documented step) and the `burrito:`/`targets` key names. These have shifted across versions.
 
@@ -1157,8 +1125,26 @@ git commit -m "build: add Burrito release for self-contained dockd binary"
 
 ## Self-Review Notes
 
-- **Coverage:** command layer (Tasks 2–6), Optimus dispatch + entrypoint (7), flag-with-env-fallback connection opts (2, 7), conditional temp-dir runtime config (8), Burrito local build + smoke test (9). Mix-task rewiring, ssh subcommands, and Mix-vs-binary parity are intentionally **cut** from v1 per the lean scope decisions above.
+- **Coverage:** command layer (Tasks 2–6), Optimus dispatch + entrypoint (7), flag-with-env-fallback connection opts (2, 7), Burrito local build + smoke test (8). Mix-task rewiring, ssh subcommands, and Mix-vs-binary parity are intentionally **cut** from v1 per the lean scope decisions above.
+- **No runtime.exs / temp-dir handling needed.** `Dockd.Config.temp_dir/1` already resolves per-call as `opts[:temp_dir]` > `DOCKD_TEMP_DIR` env > `config :dockd, :temp_dir` > `System.tmp_dir!()/dockd` — nothing is boot-frozen, so a runtime override already works with no changes. No `--temp-dir` flag in v1 (see tech-debt note below).
 - **Bug fixed:** `DockdCli.Main.run/1` prints help via `IO.puts(Optimus.help(spec))` and returns `:ok` on bare invocation (the prior `tap(Optimus.help)` emitted nothing).
 - **Type consistency:** every command exposes `run(map(), keyword()) :: :ok | {:error, term()}`; `CLI.command_for/1` maps to those exact modules; `Options.resolve/1` is the sole opts source.
-- **Blocking verifications flagged inline (do not assume):** `Optimus.parse/2` return variants + arg/option key names (Task 7 Step 0), Burrito `releases`/`burrito:` config keys (Task 9 Step 0), and the `Dockd.Packages`/`Dockd.Spec.*` helper signatures the `run`/`package` ports use (Tasks 5, 6 preambles). Uncertainty propagates: these modules are only "done" once checked against installed code.
+- **Blocking verifications flagged inline (do not assume):** `Optimus.parse/2` return variants + arg/option key names (Task 7 Step 0), Burrito `releases`/`burrito:` config keys (Task 8 Step 0), and the `Dockd.Packages`/`Dockd.Spec.*` helper signatures the `run`/`package` ports use (Tasks 5, 6 preambles). Uncertainty propagates: these modules are only "done" once checked against installed code.
+
+## Pre-existing tech debt (out of scope — flagged, not fixed here)
+
+`Dockd.Config.temp_dir/1` is the intended single source of truth for the temp
+directory, resolving `opts[:temp_dir]` > `DOCKD_TEMP_DIR` > app config > default.
+But three core call sites **bypass it** and hardcode `System.tmp_dir!()/dockd`,
+so any temp-dir override (opts, env, or config) silently no-ops in those paths:
+
+- `apps/dockd/lib/dockd/file_copy.ex:278` — `defp temp_root, do: Path.join(System.tmp_dir!(), "dockd")`
+- `apps/dockd/lib/dockd/git.ex:54` — `Path.join([System.tmp_dir!(), "dockd", "dockd-fetch-..."])`
+- `apps/dockd/lib/dockd/packages.ex:153` — `Path.join([System.tmp_dir!(), "dockd", "dockd-pkg-..."])`
+
+This is why v1 does **not** add a `--temp-dir` flag: it would appear to work but
+not take effect in file-copy/git-fetch/package-install. Unifying these call sites
+to route through `Dockd.Config.temp_dir/1` is a separate follow-up in the `dockd`
+core app, after which a `--temp-dir` flag (threaded via `opts`, exactly like
+`--socket`/`--host`) becomes trivial.
 ```
