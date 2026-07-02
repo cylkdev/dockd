@@ -6,18 +6,21 @@ defmodule Mix.Tasks.Dockd.Package.Install do
 
       mix dockd.package.install <source> --source=<url>
 
-  Currently only `git` is supported as a source. The URL can be
-  anything `git clone` accepts (HTTPS, SSH, or the
-  `github.com/user/repo` shorthand). Every subdirectory under
-  `<repo>/packages/` that contains a `package.json` is installed as
-  `<packages_root>/<name>/`, overwriting any existing package with the
-  same name.
+  Two source types are supported:
+
+    - `git --source=<url>` clones a remote repo (HTTPS, SSH, or the
+      `github.com/user/repo` shorthand) and installs every
+      `<repo>/packages/<name>/` that contains a `package.json`.
+    - `local --source=<dir>` installs every `<dir>/packages/<name>/`
+      that contains a `package.json` from a local directory.
+
+  Existing packages with the same name are overwritten.
 
   ## Examples
 
       mix dockd.package.install git --source=https://github.com/user/recipes
       mix dockd.package.install git --source=github.com/user/recipes
-      mix dockd.package.install git --source=git@github.com:user/recipes.git
+      mix dockd.package.install local --source=.
   """
 
   use Mix.Task
@@ -40,7 +43,7 @@ defmodule Mix.Tasks.Dockd.Package.Install do
           type
 
         [] ->
-          Mix.raise("Missing required source argument (supported: git)")
+          Mix.raise("Missing required source argument (supported: git, local)")
 
         _ ->
           Mix.raise(
@@ -60,8 +63,11 @@ defmodule Mix.Tasks.Dockd.Package.Install do
         "git" ->
           Dockd.Packages.install_from_git(url, [])
 
+        "local" ->
+          Dockd.Packages.install_from_path(url, [])
+
         other ->
-          Mix.raise("Unsupported source #{inspect(other)} (supported: git)")
+          Mix.raise("Unsupported source #{inspect(other)} (supported: git, local)")
       end
 
     case result do

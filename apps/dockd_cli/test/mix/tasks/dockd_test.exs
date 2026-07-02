@@ -27,7 +27,6 @@ defmodule Mix.Tasks.DockdTest do
             "mix dockd.instance.logs",
             "mix dockd.instance.inspect",
             "mix dockd.info",
-            "mix dockd.claude_code.install",
             "mix dockd.package.install",
             "mix dockd.package.show"
           ] do

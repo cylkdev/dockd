@@ -18,7 +18,7 @@ defmodule Mix.Tasks.Dockd do
       mix dockd.instance.logs     - Print an instance's container logs
       mix dockd.instance.inspect  - Pretty-print the raw Docker inspect map
       mix dockd.info              - Show aggregate dockd state (temp files, etc.)
-      mix dockd.claude_code.install - Generate Claude Code packages
+      mix dockd.package.install local --source=DIR - Install packages from a local dir
       mix dockd.package.install   - Install packages from a remote source
       mix dockd.package.show      - List installed packages
       mix dockd.tui               - Start the terminal UI for an instance
@@ -39,8 +39,7 @@ defmodule Mix.Tasks.Dockd do
     {"mix dockd.instance.logs NAME", "Print an instance's container logs"},
     {"mix dockd.instance.inspect NAME", "Pretty-print the raw Docker inspect map"},
     {"mix dockd.info", "Show aggregate dockd state"},
-    {"mix dockd.claude_code.install", "Generate Claude Code packages"},
-    {"mix dockd.package.install <source>", "Install packages from a remote source"},
+    {"mix dockd.package.install <source>", "Install packages from a git or local source"},
     {"mix dockd.package.show", "List installed packages"},
     {"mix dockd.tui NAME", "Start the terminal UI for an instance"}
   ]
