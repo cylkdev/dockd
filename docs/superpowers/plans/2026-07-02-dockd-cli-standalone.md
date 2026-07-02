@@ -11,7 +11,7 @@
 ## Scope decisions (lean v1)
 
 - **Existing Mix tasks are left untouched and unused.** Command modules are new code; the binary is the only consumer. `mix dockd.*` keeps working in dev via its current code. Deduplication is a deferred follow-up. *(Reversible; nothing deleted.)*
-- **No global `--socket`/`--host` CLI flags.** Connection options come from env only (`DOCKER_HOST`/`DOCKER_SOCKET`) via a 3-line `DockdCli.Options.resolve/1`. CLI connection flags deferred until a non-default daemon is actually needed. This also keeps the unverified Optimus `global_options` behavior off the critical path.
+- **Connection options are global flags with env fallback.** `--socket`/`--host` flags are the primary interface (discoverable via `--help`); `DOCKER_SOCKET`/`DOCKER_HOST` env vars are honored as fallback. Precedence: **flag > env > default**. This mirrors the Docker CLI's own `--host` + `DOCKER_HOST` convention — non-secret config belongs in explicit flags, not hidden env vars.
 - **No `ssh` subcommands in v1.** The `dockd.ssh.*` tasks are narrow/internal; deferred.
 - Surface mirrored: `instance list|run|stop|start|restart|destroy|logs|inspect`, `package install|show|validate`, `info`.
 
@@ -65,7 +65,7 @@ git commit -m "build: add optimus dependency to dockd_cli"
 
 **Interfaces:**
 - `DockdCli.Output.info(iodata) :: :ok` (stdout line), `error(iodata) :: :ok` (stderr line), `write(iodata) :: :ok` (raw stdout), `table([tuple], tuple) :: :ok` (padded table; header + rows same arity).
-- `DockdCli.Options.resolve(env :: map()) :: keyword()` — `:socket` from `DOCKER_SOCKET`, `:host` from `DOCKER_HOST`; omit blank/absent.
+- `DockdCli.Options.resolve(flags :: map(), env :: map()) :: keyword()` — `:socket` from `--socket` flag else `DOCKER_SOCKET`; `:host` from `--host` flag else `DOCKER_HOST`. Precedence flag > env > absent; omit blank values.
 
 - [ ] **Step 1: Failing tests**
 
@@ -104,17 +104,22 @@ defmodule DockdCli.OptionsTest do
   alias DockdCli.Options
 
   test "empty when nothing set" do
-    assert Options.resolve(%{}) == []
+    assert Options.resolve(%{}, %{}) == []
   end
 
   test "reads socket and host from env" do
-    opts = Options.resolve(%{"DOCKER_SOCKET" => "/run/d.sock", "DOCKER_HOST" => "tcp://x:2375"})
+    opts = Options.resolve(%{}, %{"DOCKER_SOCKET" => "/run/d.sock", "DOCKER_HOST" => "tcp://x:2375"})
     assert opts[:socket] == "/run/d.sock"
     assert opts[:host] == "tcp://x:2375"
   end
 
+  test "flag overrides env" do
+    opts = Options.resolve(%{socket: "/from/flag.sock"}, %{"DOCKER_SOCKET" => "/from/env.sock"})
+    assert opts[:socket] == "/from/flag.sock"
+  end
+
   test "ignores blank values" do
-    assert Options.resolve(%{"DOCKER_SOCKET" => ""}) == []
+    assert Options.resolve(%{socket: nil, host: ""}, %{"DOCKER_SOCKET" => ""}) == []
   end
 end
 ```
@@ -171,17 +176,25 @@ end
 
 ```elixir
 defmodule DockdCli.Options do
-  @moduledoc "Resolves runtime Docker connection options from the environment."
+  @moduledoc """
+  Resolves runtime Docker connection options. Precedence: explicit CLI
+  flag > environment variable > absent. Mirrors the Docker CLI's own
+  `--host` / `DOCKER_HOST` convention.
+  """
 
-  @spec resolve(map()) :: keyword()
-  def resolve(env) do
+  @spec resolve(map(), map()) :: keyword()
+  def resolve(flags, env) do
     []
-    |> put(:socket, env["DOCKER_SOCKET"])
-    |> put(:host, env["DOCKER_HOST"])
+    |> put(:socket, pick(flags[:socket], env["DOCKER_SOCKET"]))
+    |> put(:host, pick(flags[:host], env["DOCKER_HOST"]))
   end
 
-  defp put(opts, key, value) when is_binary(value) and value != "", do: Keyword.put(opts, key, value)
-  defp put(opts, _key, _value), do: opts
+  defp pick(flag, _env) when is_binary(flag) and flag != "", do: flag
+  defp pick(_flag, env) when is_binary(env) and env != "", do: env
+  defp pick(_flag, _env), do: nil
+
+  defp put(opts, _key, nil), do: opts
+  defp put(opts, key, value), do: Keyword.put(opts, key, value)
 end
 ```
 
@@ -191,7 +204,7 @@ end
 ```bash
 git add apps/dockd_cli/lib/dockd_cli/output.ex apps/dockd_cli/lib/dockd_cli/options.ex \
         apps/dockd_cli/test/dockd_cli/output_test.exs apps/dockd_cli/test/dockd_cli/options_test.exs
-git commit -m "feat: add DockdCli.Output and env-based DockdCli.Options"
+git commit -m "feat: add DockdCli.Output and flag/env DockdCli.Options"
 ```
 
 ---
@@ -818,7 +831,11 @@ git commit -m "feat: add info and package command modules"
 
 ### Task 7: `DockdCli.CLI` (Optimus spec + dispatch) and `DockdCli.Main`
 
-**VERIFY FIRST (blocking):** open the installed Optimus docs/source (`deps/optimus`) and confirm the exact return shapes of `Optimus.parse/2` — specifically whether `--help`/`--version` are surfaced by `parse/2` or only by `parse!/2`, and the precise tuples for a subcommand match, a top-level (no-subcommand) match, and errors. Write the `DockdCli.Main.run/1` `case` to match what you find. Do not assume the atoms below are correct.
+**VERIFY FIRST (blocking):** open the installed Optimus docs/source (`deps/optimus`) and confirm:
+1. The exact return shapes of `Optimus.parse/2` — whether `--help`/`--version` are surfaced by `parse/2` or only `parse!/2`, and the precise tuples for a subcommand match, a top-level (no-subcommand) match, and errors. Write the `DockdCli.Main.run/1` `case` to match.
+2. **Where global options land in the parse result** when a subcommand matches — i.e. whether `--socket`/`--host` appear in the subcommand's `parsed.options` (the `dispatch/1` code assumes this) or in a separate top-level result. If they land elsewhere, adjust `dispatch/1`'s `Map.take` source accordingly. Also confirm a global option may appear *before* the subcommand on the command line (`dockd --socket /x instance list`).
+
+Do not assume the shapes below are correct.
 
 **Files:**
 - Create `apps/dockd_cli/lib/dockd_cli/cli.ex`
@@ -827,7 +844,7 @@ git commit -m "feat: add info and package command modules"
 - Test `apps/dockd_cli/test/dockd_cli/main_test.exs`
 
 **Interfaces:**
-- `DockdCli.CLI.spec() :: Optimus.t()` — subcommand tree (no global connection options).
+- `DockdCli.CLI.spec() :: Optimus.t()` — subcommand tree plus global `--socket`/`--host` options.
 - `DockdCli.CLI.dispatch({[atom()], Optimus.ParseResult.t()}) :: :ok | {:error, term()}`.
 - `DockdCli.Main.run([String.t()]) :: :ok | {:error, term()}` (no halt — testable); `DockdCli.Main.main([String.t()]) :: no_return()`.
 
@@ -848,6 +865,15 @@ defmodule DockdCli.CLITest do
              Optimus.parse(DockdCli.CLI.spec(), ["instance", "run", "--image", "busybox", "--name", "w"])
 
     assert parsed.options.image == "busybox" and parsed.options.name == "w"
+  end
+
+  test "global --socket parses before a subcommand" do
+    assert {:ok, [:instance, :list], parsed} =
+             Optimus.parse(DockdCli.CLI.spec(), ["--socket", "/x.sock", "instance", "list"])
+
+    # Adjust access path to wherever the Step-0 verification shows global
+    # options land in the parse result.
+    assert parsed.options.socket == "/x.sock"
   end
 end
 ```
@@ -889,6 +915,10 @@ defmodule DockdCli.CLI do
       version: "0.1.0",
       allow_unknown_args: false,
       parse_double_dash: true,
+      global_options: [
+        socket: [long: "--socket", help: "Docker socket path (overrides DOCKER_SOCKET)", required: false],
+        host: [long: "--host", help: "Docker host (overrides DOCKER_HOST)", required: false]
+      ],
       subcommands: [
         instance: [
           name: "instance",
@@ -937,7 +967,8 @@ defmodule DockdCli.CLI do
 
   @spec dispatch({[atom()], Optimus.ParseResult.t()}) :: :ok | {:error, term()}
   def dispatch({path, parsed}) do
-    opts = DockdCli.Options.resolve(System.get_env())
+    flags = Map.take(Map.new(parsed.options || %{}), [:socket, :host])
+    opts = DockdCli.Options.resolve(flags, System.get_env())
     args = build_args(parsed)
     command_for(path).run(args, opts)
   end
@@ -1126,7 +1157,7 @@ git commit -m "build: add Burrito release for self-contained dockd binary"
 
 ## Self-Review Notes
 
-- **Coverage:** command layer (Tasks 2–6), Optimus dispatch + entrypoint (7), env-based connection opts (2), conditional temp-dir runtime config (8), Burrito local build + smoke test (9). Mix-task rewiring, global connection flags, ssh subcommands, and Mix-vs-binary parity are intentionally **cut** from v1 per the lean scope decisions above.
+- **Coverage:** command layer (Tasks 2–6), Optimus dispatch + entrypoint (7), flag-with-env-fallback connection opts (2, 7), conditional temp-dir runtime config (8), Burrito local build + smoke test (9). Mix-task rewiring, ssh subcommands, and Mix-vs-binary parity are intentionally **cut** from v1 per the lean scope decisions above.
 - **Bug fixed:** `DockdCli.Main.run/1` prints help via `IO.puts(Optimus.help(spec))` and returns `:ok` on bare invocation (the prior `tap(Optimus.help)` emitted nothing).
 - **Type consistency:** every command exposes `run(map(), keyword()) :: :ok | {:error, term()}`; `CLI.command_for/1` maps to those exact modules; `Options.resolve/1` is the sole opts source.
 - **Blocking verifications flagged inline (do not assume):** `Optimus.parse/2` return variants + arg/option key names (Task 7 Step 0), Burrito `releases`/`burrito:` config keys (Task 9 Step 0), and the `Dockd.Packages`/`Dockd.Spec.*` helper signatures the `run`/`package` ports use (Tasks 5, 6 preambles). Uncertainty propagates: these modules are only "done" once checked against installed code.
