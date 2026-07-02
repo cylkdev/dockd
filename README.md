@@ -36,6 +36,62 @@ Open a second terminal, paste that command, and you're inside a Linux shell. Ins
 
 When you're done, go back to the first terminal and press Enter. The container is stopped and deleted automatically.
 
+## Building the standalone CLI
+
+The `dockd_cli` app can be packaged with [Burrito](https://github.com/burrito-elixir/burrito)
+into a single self-contained `dockd` binary that end users can run without
+installing Elixir or Erlang -- only a running Docker daemon is required.
+
+### Prerequisite: Zig
+
+Burrito uses [Zig](https://ziglang.org/) to build the wrapper binary. Install it with:
+
+```sh
+brew install zig
+```
+
+(Verified against Zig 0.15.2, the version Burrito's precompiled ERTS downloads currently target.)
+
+### Build command
+
+From the repo root:
+
+```sh
+MIX_ENV=prod BURRITO_TARGET=macos mix release dockd
+```
+
+- `MIX_ENV=prod` is required -- the release/Burrito wiring in `apps/dockd_cli/mix.exs`
+  only activates the CLI's `Application` entrypoint (`DockdCli.Main.start/2`) for the
+  `prod` environment, so `mix test` and `mix dockd` (dev) are unaffected.
+- `BURRITO_TARGET=macos` restricts the build to the local macOS (Apple Silicon) target
+  defined in the umbrella root `mix.exs` `releases/0`. Omit it to build every configured
+  target (currently `macos` and `linux`), which requires cross-compilation and is slower.
+
+The build downloads a precompiled ERTS for the target platform, assembles the release,
+and produces a self-extracting binary via Zig. This can take several minutes on first run
+(subsequent builds reuse the cached ERTS download).
+
+### Output
+
+The finished binary is written to:
+
+```
+burrito_out/dockd_macos
+```
+
+(or `burrito_out/dockd_linux`, etc., for other targets). This directory is git-ignored --
+build it locally or in CI, don't commit it.
+
+### Running it
+
+```sh
+./burrito_out/dockd_macos --help
+./burrito_out/dockd_macos instance list
+```
+
+The binary has no Elixir/Erlang runtime dependency for the end user -- it embeds its own
+ERTS and BEAM code. The only external requirement is a running Docker daemon.
+
 ## Using a Different Image
 
 Pass any Docker image as an argument:

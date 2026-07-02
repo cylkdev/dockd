@@ -9,6 +9,7 @@
 dialyzer/
 erl_crash.dump
 apps/dockd_tui/dockd_tui
+/burrito_out/
 .DS_Store
 .claude/
 *.env
