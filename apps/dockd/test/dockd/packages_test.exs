@@ -199,6 +199,55 @@ defmodule Dockd.PackagesTest do
     end
   end
 
+  describe "install_from_path/2" do
+    test "installs every packages/<name>/ dir from a local directory" do
+      src = sandbox_dir("dockd-local-src")
+      dest = sandbox_dir("dockd-local-dest")
+
+      add_package(src, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+
+      add_package(src, "beta", ~s({"name": "beta", "image": "busybox:1.37.0"}),
+        dockerfile: "FROM busybox\n"
+      )
+
+      assert {:ok, names} = Packages.install_from_path(src, dest_dir: dest)
+
+      assert Enum.sort(names) === ["alpha", "beta"]
+      assert File.exists?(Path.join([dest, "alpha", "package.json"]))
+      assert File.exists?(Path.join([dest, "beta", "Dockerfile"]))
+    end
+
+    test "errors when the directory has no packages/ subdir" do
+      src = sandbox_dir("dockd-local-empty")
+      File.mkdir_p!(src)
+      dest = sandbox_dir("dockd-local-empty-dest")
+
+      assert {:error, err} = Packages.install_from_path(src, dest_dir: dest)
+      assert err.phase === :fetch
+      assert err.message =~ "no top-level packages/ directory"
+    end
+  end
+
+  describe "shipped claude_code package data" do
+    test "every shipped package installs (i.e. its package.json parses as a Spec)" do
+      # Repo root = four levels up from this test file
+      # (apps/dockd/test/dockd -> apps/dockd/test -> apps/dockd -> apps -> repo root).
+      repo_root = Path.expand(Path.join([__DIR__, "..", "..", "..", ".."]))
+      dest = sandbox_dir("dockd-shipped-dest")
+
+      assert {:ok, names} = Packages.install_from_path(repo_root, dest_dir: dest)
+
+      for name <- [
+            "claude_code",
+            "claude_code_live_workspace",
+            "claude_code_isolated_workspace",
+            "claude_code_repo_workspace"
+          ] do
+        assert name in names, "shipped package #{name} did not install/parse"
+      end
+    end
+  end
+
   defp make_repo do
     dir = sandbox_dir("dockd-install-repo")
     File.mkdir_p!(dir)

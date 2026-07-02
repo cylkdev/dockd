@@ -167,6 +167,27 @@ defmodule Dockd.Packages do
     end
   end
 
+  @doc """
+  Installs every package under a local directory's `packages/` subdir into
+  the configured packages root.
+
+  Identical to `install_from_git/2` without the clone: `dir` must contain a
+  `packages/<name>/` tree where each package dir holds a `package.json` that
+  parses as a `Dockd.Spec`. Returns `{:ok, [name]}` or a `:fetch`-tagged
+  `Dockd.Error`.
+
+  Options:
+
+    - `:packages_path` — override the configured packages root.
+    - `:dest_dir` — override the install root. Primarily used by tests.
+  """
+  @spec install_from_path(binary(), keyword()) ::
+          {:ok, [binary()]} | {:error, Error.t()}
+  def install_from_path(dir, opts \\ []) when is_binary(dir) do
+    dest_dir = Keyword.get(opts, :dest_dir, packages_root(opts))
+    install_from_clone(dir, dest_dir)
+  end
+
   defp install_from_clone(clone_dir, dest_dir) do
     packages_dir = Path.join(clone_dir, "packages")
 
