@@ -10,9 +10,9 @@ defmodule DockdTui.MixProject do
       deps_path: "../../deps",
       lockfile: "../../mix.lock",
       elixir: "~> 1.17",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      deps: deps(),
-      escript: escript()
+      deps: deps()
     ]
   end
 
@@ -22,18 +22,13 @@ defmodule DockdTui.MixProject do
     ]
   end
 
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+
   defp deps do
     [
       {:dockd, in_umbrella: true},
-      {:docker, github: "cylkdev/docker", branch: "main"},
       {:ex_ratatui, "~> 0.10.0"}
-    ]
-  end
-
-  defp escript do
-    [
-      main_module: Dockd.Tui.CLI,
-      name: "dockd_tui"
     ]
   end
 end

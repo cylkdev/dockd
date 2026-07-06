@@ -23,7 +23,8 @@ defmodule Dockd.MixProject do
 
   defp deps do
     [
-      {:docker, github: "cylkdev/docker", branch: "main"}
+      {:docker, github: "cylkdev/docker", branch: "main"},
+      {:elixir_exec, github: "cylkdev/elixir_exec", branch: "main"}
     ]
   end
 end

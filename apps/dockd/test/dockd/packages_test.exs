@@ -48,13 +48,13 @@ defmodule Dockd.PackagesTest do
   describe "resolve_path/1" do
     test "bare name resolves to <packages_root>/<name>/package.json" do
       root = sandbox_dir("dockd-packages-root")
-      path = Packages.resolve_path("claude_code", packages_path: root)
+      path = Packages.resolve_path("webapp", packages_path: root)
 
       assert Path.basename(path) === "package.json"
-      assert Path.basename(Path.dirname(path)) === "claude_code"
+      assert Path.basename(Path.dirname(path)) === "webapp"
 
       assert path ===
-               Path.join([root, "claude_code", "package.json"])
+               Path.join([root, "webapp", "package.json"])
     end
 
     test "directory path appends package.json" do
@@ -196,6 +196,35 @@ defmodule Dockd.PackagesTest do
 
       assert err.phase === :fetch
       assert err.message =~ "failed to clone"
+    end
+  end
+
+  describe "install_from_path/2" do
+    test "installs every packages/<name>/ dir from a local directory" do
+      src = sandbox_dir("dockd-local-src")
+      dest = sandbox_dir("dockd-local-dest")
+
+      add_package(src, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+
+      add_package(src, "beta", ~s({"name": "beta", "image": "busybox:1.37.0"}),
+        dockerfile: "FROM busybox\n"
+      )
+
+      assert {:ok, names} = Packages.install_from_path(src, dest_dir: dest)
+
+      assert Enum.sort(names) === ["alpha", "beta"]
+      assert File.exists?(Path.join([dest, "alpha", "package.json"]))
+      assert File.exists?(Path.join([dest, "beta", "Dockerfile"]))
+    end
+
+    test "errors when the directory has no packages/ subdir" do
+      src = sandbox_dir("dockd-local-empty")
+      File.mkdir_p!(src)
+      dest = sandbox_dir("dockd-local-empty-dest")
+
+      assert {:error, err} = Packages.install_from_path(src, dest_dir: dest)
+      assert err.phase === :fetch
+      assert err.message =~ "no top-level packages/ directory"
     end
   end
 

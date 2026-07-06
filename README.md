@@ -36,6 +36,76 @@ Open a second terminal, paste that command, and you're inside a Linux shell. Ins
 
 When you're done, go back to the first terminal and press Enter. The container is stopped and deleted automatically.
 
+## Building the standalone CLI
+
+The `dockd_cli` app can be packaged with [Burrito](https://github.com/burrito-elixir/burrito)
+into a single self-contained `dockd` binary that end users can run without
+installing Elixir or Erlang -- only a running Docker daemon is required.
+
+### Prerequisite: Zig
+
+Burrito uses [Zig](https://ziglang.org/) to build the wrapper binary. Install it with:
+
+```sh
+brew install zig
+```
+
+(Verified against Zig 0.15.2, the version Burrito's precompiled ERTS downloads currently target.)
+
+### Build command
+
+From the repo root:
+
+```sh
+MIX_ENV=prod BURRITO_TARGET=macos mix release dockd
+```
+
+- `MIX_ENV=prod` is required -- the release/Burrito wiring in `apps/dockd_cli/mix.exs`
+  only activates the CLI's `Application` entrypoint (`DockdCLI.Main.start/2`) for the
+  `prod` environment, so `mix test` and `mix dockd` (dev) are unaffected.
+- `BURRITO_TARGET=macos` restricts the build to the local macOS (Apple Silicon) target
+  defined in the umbrella root `mix.exs` `releases/0`. Omit it to build every configured
+  target (currently `macos` and `linux`), which requires cross-compilation and is slower.
+
+The build downloads a precompiled ERTS for the target platform, assembles the release,
+and produces a self-extracting binary via Zig. This can take several minutes on first run
+(subsequent builds reuse the cached ERTS download).
+
+### Output
+
+The finished binary is written to:
+
+```
+burrito_out/dockd_macos
+```
+
+(or `burrito_out/dockd_linux`, etc., for other targets). This directory is git-ignored --
+build it locally or in CI, don't commit it.
+
+### Running `dockd`
+
+A release build produces a single binary, `burrito_out/dockd_<target>`
+(`dockd_macos` / `dockd_linux`). That binary is all you install — there is no
+separate wrapper. Put it on your PATH as `dockd`:
+
+    MIX_ENV=prod BURRITO_TARGET=macos mix release dockd
+    mkdir -p ~/.local/bin
+    cp burrito_out/dockd_macos ~/.local/bin/dockd
+
+Then (with `~/.local/bin` on PATH):
+
+    dockd instance list
+    dockd instance shell --name my-workspace     # opens a new terminal window in the container
+
+`dockd instance shell --name NAME` opens a new terminal window already inside
+the instance (macOS Terminal.app, or your `$TERMINAL` on Linux) — it invokes the
+bundled `apps/dockd_cli/priv/open-shell` launcher. Pass `--print` to print the
+`docker exec` command instead of opening a window (useful for scripts/CI).
+
+In a source checkout, use `mix dockd instance shell --name NAME` — same command
+surface as the binary; it also opens a new terminal window via the same code
+path, and `--print` works there too.
+
 ## Using a Different Image
 
 Pass any Docker image as an argument:
@@ -106,7 +176,7 @@ Each setup step is a map with a `:label` and a `:cmd` (list of strings):
 A **package** is a JSON file that describes a complete instance - image, shell,
 files to bring in, setup commands - so you can launch a reusable environment with
 one call. Packages are the fastest way to share a "stack" (e.g. "Node 20 with
-claude-code installed and `~/.claude` mounted") with someone else: hand them the
+your toolchain preinstalled and a project directory mounted") with someone else: hand them the
 file, they run `Dockd.prepare_package("./my-stack.json")`, and they get the same
 container you do.
 
@@ -190,7 +260,7 @@ image will receive instead.
 Path inside the container that an interactive `docker exec -it` should launch.
 Use the entrypoint of whatever tool you actually want - for an SSH-style shell,
 `"/bin/bash"`; for a CLI tool that runs as a single binary, point directly at it
-(e.g. `"claude"`).
+(e.g. `"/usr/local/bin/mytool"`).
 
 #### `name` (string, default auto-generated)
 
@@ -215,8 +285,7 @@ Container environment variables. Each entry can be one of three shapes:
 "env": [
   "NODE_ENV=development",
   "API_KEY=${API_KEY}",
-  "GITHUB_TOKEN",
-  "ANTHROPIC_API_KEY"
+  "GITHUB_TOKEN"
 ]
 ```
 
@@ -388,26 +457,21 @@ Two entry points:
 {:ok, instance} = Dockd.apply_package("./packages/python.json")
 
 # A bare name - resolves to <packages_root>/<name>/package.json.
-{:ok, instance} = Dockd.apply_package("claude_code_live_workspace")
+{:ok, instance} = Dockd.apply_package("webapp")
 ```
 
 ### Installed packages
 
 Package names resolve from the configured packages root, which defaults to
-`~/.dockd/packages`. Generate the Claude Code package set explicitly:
+`~/.dockd/packages`. Package sets live in their own repositories; install every
+`packages/<name>/` directory a repo (or local checkout) ships with:
 
 ```sh
-mix dockd.claude_code.install
+# From a remote repository:
+mix dockd package install --type git --source=<url>
+# From a local checkout:
+mix dockd package install --type local --source=<path>
 ```
-
-The generated Claude Code packages:
-
-| Name | What you get |
-|------|--------------|
-| `"claude_code"` | Claude Code CLI with `${PWD}` live-mounted at `/instance` and host Claude credentials shared in. |
-| `"claude_code_live_workspace"` | Live bind of `${PWD}` at `/instance`, shared `~/.claude` for OAuth - claude's edits land back on the host. |
-| `"claude_code_isolated_workspace"` | One-way snapshot of `${PWD}` at `/instance/project`, plus a single `~/dockd-output` bind at `/instance/output`. |
-| `"claude_code_repo_workspace"` | Clones `${DOCKD_REPO_URL}` into `/instance/repo`, plus a single `~/dockd-output` bind at `/instance/output`. |
 
 To add your own installed package, place a directory at
 `<packages_root>/<name>/` containing `package.json` and any referenced support

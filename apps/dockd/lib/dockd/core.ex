@@ -386,9 +386,39 @@ defmodule Dockd.Core do
   def open_shell(instance_or_ref, opts \\ []) do
     {ref, instance_opts} = resolve_ref(instance_or_ref, opts)
 
-    case Docker.Terminal.open(ref, instance_opts) do
+    configured =
+      if Keyword.has_key?(opts, :shell),
+        do: nil,
+        else: configured_shell(instance_or_ref, opts)
+
+    open_opts = instance_opts ++ resolve_shell_arg(opts, configured)
+
+    case Docker.Terminal.open(ref, open_opts) do
       {:ok, _session} -> {:ok, ref}
       {:error, _} = err -> err
+    end
+  end
+
+  @doc false
+  # Precedence: explicit opts[:shell] wins; else default to the instance's
+  # configured program (argv-wrapped); else inject nothing (Docker uses /bin/sh).
+  @spec resolve_shell_arg(keyword(), binary() | nil) :: keyword()
+  def resolve_shell_arg(opts, configured) do
+    cond do
+      Keyword.has_key?(opts, :shell) -> []
+      is_binary(configured) -> [shell: [configured]]
+      true -> []
+    end
+  end
+
+  # Reads the instance's configured program. Avoids I/O when we already hold the
+  # hydrated struct; auto-hydrates a bare ref via get/2 (threading Docker opts).
+  defp configured_shell(%Instance{shell: shell}, _opts), do: shell
+
+  defp configured_shell(ref, opts) when is_binary(ref) do
+    case get(ref, opts) do
+      {:ok, %Instance{shell: shell}} -> shell
+      _ -> nil
     end
   end
 

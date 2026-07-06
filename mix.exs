@@ -7,6 +7,7 @@ defmodule Dockd.Umbrella.MixProject do
       version: "0.1.0",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      releases: releases(),
       test_coverage: [tool: ExCoveralls],
       preferred_cli_env: [
         doctor: :test,
@@ -27,6 +28,21 @@ defmodule Dockd.Umbrella.MixProject do
         list_unused_filters: true,
         ignore_warnings: ".dialyzer-ignore.exs",
         flags: [:unmatched_returns, :no_improper_lists]
+      ]
+    ]
+  end
+
+  defp releases do
+    [
+      dockd: [
+        applications: [dockd_cli: :permanent],
+        steps: [:assemble, &Burrito.wrap/1],
+        burrito: [
+          targets: [
+            macos: [os: :darwin, cpu: :aarch64],
+            linux: [os: :linux, cpu: :x86_64]
+          ]
+        ]
       ]
     ]
   end

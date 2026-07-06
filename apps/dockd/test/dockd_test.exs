@@ -47,6 +47,33 @@ defmodule DockdTest do
       assert String.contains?(out, "/tmp")
       assert :ok = Dockd.close_shell(shell)
     end
+
+    test "defaults the session program to the instance's configured shell" do
+      # "cat" echoes stdin verbatim, so a line sent comes straight back with no
+      # shell evaluation — distinguishing it from a /bin/sh session.
+      assert {:ok, %ApplyResult{instance: instance}} =
+               Dockd.apply(@image, shell: "cat", name: unique_name())
+
+      on_exit(fn -> Dockd.destroy(instance) end)
+
+      assert {:ok, shell} = Dockd.open_shell(instance)
+      assert {:ok, {out, shell}} = Dockd.shell_send(shell, "ping123")
+      assert String.contains?(out, "ping123")
+      assert :ok = Dockd.close_shell(shell)
+    end
+
+    test "explicit shell opt overrides the configured program" do
+      assert {:ok, %ApplyResult{instance: instance}} =
+               Dockd.apply(@image, shell: "cat", name: unique_name())
+
+      on_exit(fn -> Dockd.destroy(instance) end)
+
+      assert {:ok, shell} = Dockd.open_shell(instance, shell: ["/bin/sh"])
+      assert {:ok, {_, shell}} = Dockd.shell_send(shell, "cd /tmp")
+      assert {:ok, {out, shell}} = Dockd.shell_send(shell, "pwd")
+      assert String.contains?(out, "/tmp")
+      assert :ok = Dockd.close_shell(shell)
+    end
   end
 
   describe "apply/2" do
