@@ -127,6 +127,45 @@ defmodule Dockd.Spec do
   end
 
   @doc """
+  Returns a deterministic content fingerprint for a spec.
+
+  The fingerprint is a lowercase SHA-256 hex digest over the spec's declarative
+  fields (image, shell, build, steps, repos, copies, env, mounts, labels, name,
+  description). It is stable across processes and runs: map keys are sorted
+  recursively before hashing, so two specs with the same content — regardless of
+  key insertion order — produce the same digest.
+
+  `Dockd.up/2` stamps this digest onto the container as a label at create time
+  and recomputes it on a later `up` to decide whether the package spec has
+  drifted (destroy + re-provision) or is unchanged (just start).
+  """
+  @spec fingerprint(t()) :: binary()
+  def fingerprint(%__MODULE__{} = spec) do
+    digest =
+      spec
+      |> Map.from_struct()
+      |> canonical()
+      |> :erlang.term_to_binary()
+
+    :sha256
+    |> :crypto.hash(digest)
+    |> Base.encode16(case: :lower)
+  end
+
+  # Recursively rewrite maps into key-sorted lists so the encoding is
+  # independent of map insertion order. Lists (including keyword lists and
+  # env/mount tuples' option lists) are walked element-wise; everything else —
+  # binaries, atoms, integers, tuples — is left as-is.
+  defp canonical(map) when is_map(map) do
+    map
+    |> Enum.map(fn {k, v} -> {to_string(k), canonical(v)} end)
+    |> Enum.sort()
+  end
+
+  defp canonical(list) when is_list(list), do: Enum.map(list, &canonical/1)
+  defp canonical(other), do: other
+
+  @doc """
   Prefixes a instance name with `dockd-` unless it already starts with that
   prefix.
   """

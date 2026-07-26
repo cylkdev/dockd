@@ -89,4 +89,33 @@ defmodule Dockd.SpecTest do
       assert Spec.short_name("foo") === "foo"
     end
   end
+
+  describe "fingerprint/1" do
+    test "is a lowercase sha-256 hex digest" do
+      fp = Spec.fingerprint(Spec.from_opts("busybox:latest", name: "box"))
+      assert fp =~ ~r/\A[0-9a-f]{64}\z/
+    end
+
+    test "is stable for identical specs" do
+      a = Spec.from_opts("busybox:latest", name: "box", env: ["A=1"])
+      b = Spec.from_opts("busybox:latest", name: "box", env: ["A=1"])
+      assert Spec.fingerprint(a) === Spec.fingerprint(b)
+    end
+
+    test "ignores label key insertion order" do
+      a = %{Spec.from_opts("busybox:latest", name: "box") | labels: %{"a" => "1", "b" => "2"}}
+      b = %{Spec.from_opts("busybox:latest", name: "box") | labels: %{"b" => "2", "a" => "1"}}
+      assert Spec.fingerprint(a) === Spec.fingerprint(b)
+    end
+
+    test "changes when a declarative field changes" do
+      base = Spec.from_opts("busybox:latest", name: "box", env: ["A=1"])
+
+      refute Spec.fingerprint(base) ===
+               Spec.fingerprint(Spec.from_opts("busybox:latest", name: "box", env: ["A=2"]))
+
+      refute Spec.fingerprint(base) ===
+               Spec.fingerprint(Spec.from_opts("alpine:latest", name: "box", env: ["A=1"]))
+    end
+  end
 end

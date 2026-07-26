@@ -95,12 +95,60 @@ defmodule Dockd.Core do
   def apply_package(ref, opts \\ []) when is_binary(ref) and is_list(opts) do
     path = resolve_package_path(ref, opts)
 
-    with {:ok, body} <- Source.read_file(path),
-         {:ok, decoded} <- Parser.parse(body),
-         {:ok, substituted} <- Interpolator.substitute(decoded, System.get_env()),
-         {:ok, attrs} <- Normalizer.normalize(substituted, Path.dirname(path)),
-         :ok <- check_attrs_name(attrs) do
-      Provisioner.run(Spec.from_attrs(attrs), opts)
+    with {:ok, spec} <- load_package_spec(path, nil) do
+      Provisioner.run(spec, opts)
+    end
+  end
+
+  @doc """
+  Idempotently brings up an instance from a package, installing the package
+  first if it is not already present.
+
+  This is the one-command "install-if-missing, then ensure-running" flow behind
+  `dockd instance up`. It runs in three moves:
+
+    1. **Ensure the package is installed.** `ref` is resolved to a package path;
+       when that package is absent and a `:source` git URL is supplied, the
+       source is cloned and its packages installed (via
+       `Dockd.Packages.install_from_git/2`). An already-installed package is
+       never re-fetched. Absent with no `:source` is an error.
+    2. **Load the spec and fingerprint it.** The package is loaded into a
+       `Dockd.Spec` (honouring a `:name` override) and hashed with
+       `Dockd.Spec.fingerprint/1`.
+    3. **Reconcile against the running world.** If no container with the
+       instance name exists, it is provisioned. If one exists, its stored
+       fingerprint label is compared with the freshly computed one: an exact
+       match means the spec is unchanged and the container is simply started
+       (idempotent — an already-running container is a no-op); a mismatch (or a
+       missing label, e.g. a container not created by `up`) means the spec has
+       drifted, so the old container is destroyed and a fresh one provisioned.
+
+  Recognised keys beyond the standard per-call options:
+
+    - `:source` — git URL to install the package from when it is not present.
+    - `:name` — instance name override (defaults to the package's own name).
+
+  Returns `{:ok, summary}` where `summary` is a map:
+
+      %{
+        package: :present | :installed,
+        action: :created | :started | :running | :recreated,
+        instance: Dockd.Instance.t(),
+        step_results: [Dockd.StepResult.t()]
+      }
+
+  or `{:error, %Dockd.Error{}}`.
+  """
+  @spec up(binary(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def up(ref, opts \\ []) when is_binary(ref) and is_list(opts) do
+    {up_opts, call_opts} = Keyword.split(opts, [:source, :name])
+    source = Keyword.get(up_opts, :source)
+    name_override = Keyword.get(up_opts, :name)
+
+    with {:ok, pkg_status} <- ensure_package_installed(ref, source, call_opts),
+         {:ok, spec} <- load_package_spec(resolve_package_path(ref, call_opts), name_override) do
+      fingerprint = Spec.fingerprint(spec)
+      reconcile(stamp_fingerprint(spec, fingerprint), fingerprint, pkg_status, call_opts)
     end
   end
 
@@ -544,4 +592,104 @@ defmodule Dockd.Core do
   end
 
   defp resolve_package_path(ref, opts), do: Packages.resolve_path(ref, opts)
+
+  # ---------------------------------------------------------------------------
+  # up/2 helpers
+  # ---------------------------------------------------------------------------
+
+  defp load_package_spec(path, name_override) do
+    with {:ok, body} <- Source.read_file(path),
+         {:ok, decoded} <- Parser.parse(body),
+         {:ok, substituted} <- Interpolator.substitute(decoded, System.get_env()),
+         {:ok, attrs} <- Normalizer.normalize(substituted, Path.dirname(path)),
+         attrs = override_name(attrs, name_override),
+         :ok <- check_attrs_name(attrs) do
+      {:ok, Spec.from_attrs(attrs)}
+    end
+  end
+
+  defp override_name(attrs, name) when is_binary(name) and name !== "",
+    do: Map.put(attrs, :name, name)
+
+  defp override_name(attrs, _name), do: attrs
+
+  defp ensure_package_installed(ref, source, opts) do
+    if File.exists?(resolve_package_path(ref, opts)) do
+      {:ok, :present}
+    else
+      install_missing_package(ref, source, opts)
+    end
+  end
+
+  defp install_missing_package(ref, source, opts)
+       when is_binary(source) and source !== "" do
+    case Packages.install_from_git(source, opts) do
+      {:ok, _names} ->
+        if File.exists?(resolve_package_path(ref, opts)) do
+          {:ok, :installed}
+        else
+          {:error,
+           %Error{
+             phase: :validate,
+             message:
+               "package #{Kernel.inspect(ref)} was not found in source #{Kernel.inspect(source)}"
+           }}
+        end
+
+      {:error, %Error{} = err} ->
+        {:error, err}
+    end
+  end
+
+  defp install_missing_package(ref, _source, _opts) do
+    {:error,
+     %Error{
+       phase: :validate,
+       message:
+         "package #{Kernel.inspect(ref)} is not installed; pass --source=<git-url> to install it"
+     }}
+  end
+
+  defp stamp_fingerprint(%Spec{labels: labels} = spec, fingerprint) do
+    %{spec | labels: Map.put(labels || %{}, Instance.fingerprint_label(), fingerprint)}
+  end
+
+  # No managed container with this name -> provision fresh. A get/2 error here
+  # means the container is absent (the common case) or the daemon is unreachable;
+  # either way the subsequent apply/2 surfaces a real failure if one exists.
+  defp reconcile(spec, fingerprint, pkg_status, opts) do
+    case get(Spec.short_name(spec.name), opts) do
+      {:error, %Error{}} ->
+        provision(spec, pkg_status, :created, opts)
+
+      {:ok, %Instance{} = instance} ->
+        if Map.get(instance.labels || %{}, Instance.fingerprint_label()) == fingerprint do
+          start_existing(instance, pkg_status, opts)
+        else
+          with :ok <- destroy(instance, opts) do
+            provision(spec, pkg_status, :recreated, opts)
+          end
+        end
+    end
+  end
+
+  defp start_existing(%Instance{running?: running?} = instance, pkg_status, opts) do
+    action = if running?, do: :running, else: :started
+
+    with :ok <- start(instance, opts),
+         {:ok, fresh} <- refresh(instance, opts) do
+      {:ok, %{package: pkg_status, action: action, instance: fresh, step_results: []}}
+    end
+  end
+
+  defp provision(spec, pkg_status, action, opts) do
+    case Provisioner.run(spec, opts) do
+      {:ok, %ApplyResult{instance: instance, step_results: step_results}} ->
+        {:ok,
+         %{package: pkg_status, action: action, instance: instance, step_results: step_results}}
+
+      {:error, %Error{} = err} ->
+        {:error, err}
+    end
+  end
 end

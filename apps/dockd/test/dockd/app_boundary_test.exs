@@ -4,6 +4,6 @@ defmodule Dockd.AppBoundaryTest do
   test "core app does not depend on RPC app" do
     applications = Application.spec(:dockd, :applications) || []
 
-    refute :dockd_rpc in applications
+    refute :shared_rpc in applications
   end
 end

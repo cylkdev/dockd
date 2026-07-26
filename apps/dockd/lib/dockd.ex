@@ -240,6 +240,46 @@ defmodule Dockd do
   end
 
   @doc """
+  Idempotently brings up an instance from a package in one call: install the
+  package if it isn't already present, then ensure a matching container is
+  running.
+
+  Resolves `ref` the same way `apply_package/2` does. When the package is not
+  installed and a `:source` git URL is given, it is installed from that source
+  first (an already-installed package is left untouched). The package spec is
+  then fingerprinted and reconciled against any existing container of the same
+  name:
+
+    - no container -> provision it (`action: :created`)
+    - container with a matching fingerprint -> start it, a no-op if already
+      running (`action: :started` or `:running`)
+    - container whose fingerprint differs (the package spec drifted, or it was
+      created outside `up`) -> destroy and re-provision (`action: :recreated`)
+
+  Options beyond the standard per-call keys:
+
+    - `:source` — git URL to install the package from when it is missing.
+    - `:name` — instance name override (defaults to the package's own name).
+
+  Returns `{:ok, summary}` with `summary` a map of `:package` (`:present` |
+  `:installed`), `:action`, `:instance`, and `:step_results`; or
+  `{:error, %Dockd.Error{}}`.
+
+  ## Examples
+
+      # Install from git if needed, then bring the instance up.
+      {:ok, %{action: :created}} =
+        Dockd.up("webapp", source: "github.com/me/recipes")
+
+      # Second call is idempotent — the unchanged instance is just started.
+      {:ok, %{action: :running}} = Dockd.up("webapp")
+  """
+  @spec up(binary(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def up(ref, opts \\ []) do
+    Core.up(ref, opts)
+  end
+
+  @doc """
   Installs packages from a remote git repository into the local
   configured packages root.
 
