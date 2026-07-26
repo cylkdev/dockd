@@ -10,7 +10,7 @@ defmodule Dockd.Spec.Interpolator do
   caller wants to compose.
 
   Knows nothing about `Dockd.Spec` shape. It operates on whatever
-  decoded value `Dockd.Spec.Json` produced.
+  decoded value `Dockd.Spec.Parser` produced.
   """
 
   alias Dockd.Error

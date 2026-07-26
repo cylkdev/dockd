@@ -1,12 +1,5 @@
 import Config
 
-config :dockd,
-  temp_dir: "/tmp/dockd"
-
-config :shared_rpc,
-  rpc_enabled: true
-
-# The `dockd` CLI treats stdout as data: JSON output (`--json`) and the
-# `docker exec` line printed by `instance shell --print`. Keep Logger off stdout
-# so a stray log line can never corrupt that output.
+# Dockd is a library: callers own stdout. Keep Logger on stderr so a stray log
+# line can never corrupt data a caller is writing or reading there.
 config :logger, default_handler: [config: [type: :standard_error]]

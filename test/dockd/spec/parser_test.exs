@@ -84,4 +84,22 @@ defmodule Dockd.Spec.ParserTest do
       assert error.message =~ ~s("image" must be a string)
     end
   end
+
+  describe "parse_file/1" do
+    test "reads and parses a file's contents" do
+      path =
+        Path.join(System.tmp_dir!(), "dockd-source-#{System.unique_integer([:positive])}.json")
+
+      File.write!(path, ~s({"name": "x", "image": "busybox"}))
+      on_exit(fn -> File.rm(path) end)
+
+      assert {:ok, %{"name" => "x", "image" => "busybox"}} = Parser.parse_file(path)
+    end
+
+    test "wraps a missing file into a :validate-phase Dockd.Error" do
+      assert {:error, error} = Parser.parse_file("/no/such/file.json")
+      assert error.phase === :validate
+      assert error.message =~ "could not read file"
+    end
+  end
 end

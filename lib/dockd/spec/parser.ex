@@ -11,13 +11,34 @@ defmodule Dockd.Spec.Parser do
     - have a string `"image"` key
     - have a `"description"` value that is a string when present
 
-  Does no IO, no `${VAR}` substitution, and no attribute normalization.
-  Each of those is a separate responsibility owned by another module.
+  Does no `${VAR}` substitution and no attribute normalization — those belong to
+  `Dockd.Spec.Interpolator` and `Dockd.Spec.Normalizer`.
   """
 
   alias Dockd.Error
 
   @allowed_keys ~w(name description image shell steps build repos copy env mounts labels)
+
+  @doc """
+  Reads the JSON document at `path` and parses it.
+
+  Read errors (missing file, permission denied) and parse errors share the same
+  `:validate`-phase `Dockd.Error` shape, so callers handle one failure type.
+  """
+  @spec parse_file(Path.t()) :: {:ok, map()} | {:error, Error.t()}
+  def parse_file(path) when is_binary(path) do
+    case File.read(path) do
+      {:ok, body} ->
+        parse(body)
+
+      {:error, reason} ->
+        {:error,
+         %Error{
+           phase: :validate,
+           message: "could not read file #{path}: #{:file.format_error(reason)}"
+         }}
+    end
+  end
 
   @doc """
   Decodes `json_string` and runs structural validation.

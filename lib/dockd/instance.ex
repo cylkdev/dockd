@@ -48,7 +48,6 @@ defmodule Dockd.Instance do
 
   @marker_label "org.dockd.instance"
   @name_label "org.dockd.instance.name"
-  @fingerprint_label "org.dockd.instance.fingerprint"
 
   @doc "Returns the discovery marker label key."
   @spec marker_label() :: binary()
@@ -57,15 +56,6 @@ defmodule Dockd.Instance do
   @doc "Returns the instance-name label key."
   @spec name_label() :: binary()
   def name_label, do: @name_label
-
-  @doc """
-  Returns the spec-fingerprint label key.
-
-  `Dockd.up/2` stamps `Dockd.Spec.fingerprint/1` onto the container under this
-  key so a later `up` can detect whether the package spec has drifted.
-  """
-  @spec fingerprint_label() :: binary()
-  def fingerprint_label, do: @fingerprint_label
 
   @doc """
   Builds the dockd-managed label map for a container created from `spec`.

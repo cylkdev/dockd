@@ -238,52 +238,54 @@ defmodule Dockd.Ssh.DockerDialStdio do
   end
 
   defp execute_step({_step, cmd, args, check}) do
-    case ElixirExec.run([cmd | args], sync: true, stdout: true, stderr: :stdout) do
-      {:ok, %ElixirExec.Output{stdout: chunks}} ->
-        verify_check(check, IO.iodata_to_binary(chunks))
+    case ElixirExec.capture([cmd | args]) do
+      # `capture/2` reports a non-zero exit as `{:ok, _}`, so the status must be
+      # checked explicitly or a failed step reads as a success.
+      {:ok, %ElixirExec.Output{exit_status: 0} = output} ->
+        verify_check(check, combined_output(output))
 
-      {:error, proplist} when is_list(proplist) ->
-        {:error, proplist |> Keyword.get(:stdout, []) |> IO.iodata_to_binary()}
+      {:ok, %ElixirExec.Output{} = output} ->
+        {:error, combined_output(output)}
 
       {:error, reason} ->
         {:error, "subprocess failed: #{inspect(reason)}"}
     end
+  end
+
+  # `Output` keeps the two streams apart; the checks search one blob of text.
+  defp combined_output(%ElixirExec.Output{stdout: stdout, stderr: stderr}) do
+    IO.iodata_to_binary([stdout, stderr])
   end
 
   defp run_content_plan([{_step, cmd, args, check}], content) do
-    case ElixirExec.run([cmd | args],
-           monitor: true,
-           stdin: true,
-           stdout: true,
-           stderr: :stdout
-         ) do
-      {:ok, %ElixirExec.Handle{os_pid: os_pid}} ->
-        :ok = ElixirExec.write_stdin(os_pid, content)
-        :ok = ElixirExec.write_stdin(os_pid, :eof)
-        collect_content_output(os_pid, [], check)
+    case ElixirExec.run([cmd | args], stdin: true) do
+      {:ok, conn} ->
+        :ok = ElixirExec.write(conn, content)
+        :ok = ElixirExec.write(conn, :eof)
+        collect_content_output(conn, [], check)
 
       {:error, reason} ->
         {:error, "subprocess failed: #{inspect(reason)}"}
     end
   end
 
-  defp collect_content_output(os_pid, acc, check) do
-    case ElixirExec.receive_output(os_pid, 30_000) do
-      {:stdout, data} ->
-        collect_content_output(os_pid, [acc, data], check)
+  defp collect_content_output(conn, acc, check) do
+    case ElixirExec.read(conn, 30_000) do
+      {:ok, {:stdout, data}} ->
+        collect_content_output(conn, [acc, data], check)
 
-      {:stderr, data} ->
-        collect_content_output(os_pid, [acc, data], check)
+      {:ok, {:stderr, data}} ->
+        collect_content_output(conn, [acc, data], check)
 
-      {:exit, 0} ->
+      {:ok, {:exit, 0}} ->
         verify_check(check, IO.iodata_to_binary(acc))
 
-      {:exit, status} ->
+      {:ok, {:exit, status}} ->
         {:error,
          "ssh exited with status #{inspect(status)}; output: " <>
            inspect(IO.iodata_to_binary(acc))}
 
-      :timeout ->
+      {:error, :timeout} ->
         {:error, "timed out waiting for ssh to finish writing remote script"}
     end
   end

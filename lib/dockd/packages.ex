@@ -26,7 +26,6 @@ defmodule Dockd.Packages do
   alias Dockd.Spec
   alias Dockd.Spec.Normalizer
   alias Dockd.Spec.Parser
-  alias Dockd.Spec.Source
 
   @doc """
   Resolves the reference passed to `apply_package` or the `--preset` flag
@@ -54,11 +53,18 @@ defmodule Dockd.Packages do
 
   @doc """
   Returns the configured package root.
+
+  Resolved from the first source that supplies a value: `opts[:packages_path]`,
+  then `DOCKD_PACKAGES_PATH`, then `config :dockd, packages_path: ...`.
+  Defaults to `~/.dockd/packages`.
   """
   @spec packages_root() :: Path.t()
   @spec packages_root(keyword()) :: Path.t()
   def packages_root(opts \\ []) do
-    Dockd.Config.packages_path(opts)
+    Keyword.get(opts, :packages_path) ||
+      System.get_env("DOCKD_PACKAGES_PATH") ||
+      Application.get_env(:dockd, :packages_path) ||
+      Path.join(System.user_home!(), ".dockd/packages")
   end
 
   @doc """
@@ -115,8 +121,7 @@ defmodule Dockd.Packages do
   end
 
   defp load_metadata_spec(json_path) do
-    with {:ok, body} <- Source.read_file(json_path),
-         {:ok, decoded} <- Parser.parse(body),
+    with {:ok, decoded} <- Parser.parse_file(json_path),
          {:ok, attrs} <- Normalizer.normalize(decoded, Path.dirname(json_path)) do
       {:ok, Spec.from_attrs(attrs)}
     end

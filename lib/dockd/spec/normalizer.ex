@@ -11,7 +11,7 @@ defmodule Dockd.Spec.Normalizer do
       `dockerfile`/`context` paths against `package_dir`
 
   Knows nothing about IO or `${VAR}` substitution. Operates on whatever
-  decoded value `Dockd.Spec.Json` (and optionally `Dockd.Spec.Interpolator`)
+  decoded value `Dockd.Spec.Parser` (and optionally `Dockd.Spec.Interpolator`)
   produced.
   """
 
