@@ -71,6 +71,12 @@ defmodule Dockd do
       destroying it.
     - `destroy/2` — stop and remove an instance.
 
+  ## Packages on disk
+
+    - `install_packages/2` — install a package set from a git repository or a
+      local directory.
+    - `list_packages/1` — enumerate installed packages.
+
   ## Packages
 
   A package is a directory under the configured packages root containing a
@@ -107,10 +113,16 @@ defmodule Dockd do
       # Explicit file path.
       {:ok, result} = Dockd.apply_package("./my-stack/package.json")
 
-  Additional packages can be fetched from a git repository with
-  `install_packages/2`. Every `<repo>/packages/<name>/` directory that contains
-  a `package.json` is copied into `<packages_root>/<name>/`, after which the
-  package can be applied by name.
+  Additional packages are installed with `install_packages/2`, from either a
+  git repository or a local directory. Every `<source>/packages/<name>/`
+  directory that contains a `package.json` is copied into
+  `<packages_root>/<name>/`, after which the package can be applied by name.
+  `list_packages/1` enumerates what is currently installed.
+
+      {:ok, ["webapp"]} = Dockd.install_packages("github.com/me/recipes")
+      {:ok, ["webapp"]} = Dockd.install_packages("./my-recipes")
+
+      [%{name: "webapp"}] = Dockd.list_packages()
 
   ## Visibility
 
@@ -123,8 +135,8 @@ defmodule Dockd do
 
   ## Operating on instances
 
-    - `shell_command/3` — one-shot exec, captures stdout/stderr and exit
-      code.
+    - `shell_command/3` — one-shot exec, captures combined stdout+stderr
+      (as `:output`) and the exit code.
     - `open_shell/2` / `shell_send/3` / `close_shell/2` — persistent
       interactive shell, state preserved between commands.
     - `copy_to/3` — upload host files into an existing instance.
@@ -189,12 +201,15 @@ defmodule Dockd do
   @doc """
   Creates a Docker container from `spec_or_image` and returns the result.
 
-  Three input shapes are accepted:
+  Two input shapes are accepted:
 
     - a `%Dockd.Spec{}` — used as-is
     - an image string plus a keyword list of spec options (the Elixir-native
       shape; equivalent to calling `Dockd.Spec.from_opts/2` first)
-    - an image string alone — equivalent to `Spec.from_opts(image, [])`
+
+  A `:name` is always required — there is no auto-generated container name.
+  Calling `apply/2` with an image string and no `:name` returns a `:validate`
+  error.
 
   Per-call options (Docker connection settings and `:disk_mount_enabled`)
   and spec options share the same flat keyword list as the second
@@ -204,18 +219,17 @@ defmodule Dockd do
 
   ## Examples
 
-      # Image string alone — generates a container name automatically.
-      {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply("busybox:1.37.0")
-
       # Image plus spec options.
       {:ok, %Dockd.ApplyResult{instance: instance}} =
         Dockd.apply("busybox:1.37.0",
           name: "smoke",
           shell: "/bin/sh",
           env: ["FOO=bar"],
-          steps: [%{run: "mkdir -p /work"}]
+          steps: [%{label: "workdir", cmd: ["mkdir", "-p", "/work"]}]
         )
+
+      # :name is required.
+      {:error, %Dockd.Error{phase: :validate}} = Dockd.apply("busybox:1.37.0")
 
       # Spec options and per-call options share one flat keyword list.
       {:ok, result} =
@@ -231,7 +245,9 @@ defmodule Dockd do
 
       # Failure path: the error may carry the partially-created instance so
       # the caller can clean up.
-      case Dockd.apply("busybox:1.37.0", steps: [%{run: "exit 1"}]) do
+      steps = [%{label: "fail", cmd: ["sh", "-c", "exit 1"]}]
+
+      case Dockd.apply("busybox:1.37.0", name: "smoke", steps: steps) do
         {:ok, %Dockd.ApplyResult{instance: instance}} ->
           instance
 
@@ -244,7 +260,9 @@ defmodule Dockd do
   def apply(spec_or_image, opts \\ [])
 
   def apply(%Spec{} = spec, opts) when is_list(opts) do
-    Provisioner.run(spec, opts)
+    with :ok <- check_call_opts(opts) do
+      Provisioner.run(spec, opts)
+    end
   end
 
   def apply(image, opts) when is_binary(image) and is_list(opts) do
@@ -293,35 +311,82 @@ defmodule Dockd do
   end
 
   @doc """
-  Installs packages from a remote git repository into the local
+  Installs packages from a git repository or a local directory into the
   configured packages root.
 
-  Clones the repo with the host `git` binary and copies every
-  `<repo>/packages/<name>/` directory containing a `package.json` into
-  `<packages_root>/<name>/`. An existing target directory is replaced.
+  `ref` selects the source: an existing directory on the host installs from
+  that directory, anything else is treated as a git URL and cloned with the
+  host `git` binary. Either way, every `<source>/packages/<name>/` directory
+  containing a `package.json` is copied into `<packages_root>/<name>/`, and an
+  existing target directory is replaced.
 
-  The URL can be anything `git clone` accepts (HTTPS, SSH, or the
-  `github.com/user/repo` shorthand).
+  A git URL can be anything `git clone` accepts (HTTPS, SSH, or the
+  `github.com/user/repo` shorthand). A source with no top-level `packages/`
+  directory is a `:fetch` error.
 
   Options:
 
-    - `:ref` — git branch or tag to clone (defaults to the remote's
-      default branch).
+    - `:ref` — git branch or tag to clone. Ignored when installing from a
+      local directory, which is used exactly as it is on disk.
+    - `:packages_path` — override the configured packages root.
 
   Returns `{:ok, [name]}` with the installed package names.
 
   ## Examples
 
+      # From a remote repository.
       {:ok, ["foo", "bar"]} =
         Dockd.install_packages("https://github.com/me/recipes")
 
       {:ok, _} =
         Dockd.install_packages("github.com/me/recipes", ref: "v1.2.0")
+
+      # From a local checkout — anything that is an existing directory.
+      {:ok, ["foo", "bar"]} = Dockd.install_packages("./my-recipes")
   """
   @spec install_packages(binary(), keyword()) ::
           {:ok, [binary()]} | {:error, Error.t()}
-  def install_packages(url, opts \\ []) do
-    Packages.install_from_git(url, opts)
+  def install_packages(ref, opts \\ []) when is_binary(ref) and is_list(opts) do
+    if File.dir?(ref) do
+      Packages.install_from_path(ref, opts)
+    else
+      Packages.install_from_git(ref, opts)
+    end
+  end
+
+  @doc """
+  Lists every package installed under the configured packages root.
+
+  A subdirectory counts as an installed package when it contains a readable
+  `package.json`. Each entry is a map with `:name`, `:path`, and `:spec`,
+  sorted by name.
+
+  `:spec` is itself a result tuple — `{:ok, %Dockd.Spec{}}` or
+  `{:error, %Dockd.Error{}}` — so one malformed `package.json` surfaces its own
+  parse error instead of hiding every other installed package.
+
+  Never fails: an unreadable or missing packages root returns `[]`.
+
+  Note that specs are parsed without `${VAR}` interpolation, so this is safe to
+  call for metadata (image, shell, description) even when the host environment
+  does not define the variables a package references.
+
+  ## Examples
+
+      [%{name: "webapp", path: path, spec: {:ok, spec}}] = Dockd.list_packages()
+
+      # Against a specific packages root.
+      [] = Dockd.list_packages(packages_path: "/tmp/empty")
+  """
+  @spec list_packages(keyword()) :: [
+          %{
+            name: binary(),
+            path: Path.t(),
+            spec: {:ok, Spec.t()} | {:error, Error.t()}
+          }
+        ]
+  def list_packages(opts \\ []) when is_list(opts) do
+    Packages.list(opts)
   end
 
   @doc """
@@ -389,14 +454,22 @@ defmodule Dockd do
   @doc """
   Stops and removes an instance.
 
-  Accepts either an `Instance` struct, a Docker container ID, or a
-  instance name (short or prefixed). Already-stopped and already-removed
-  containers are treated as success.
+  Accepts either an `Instance` struct or an instance name (short or
+  prefixed). Already-stopped and already-removed containers are treated as
+  success.
+
+  A bare string is always read as an instance *name* and is prefixed with
+  `dockd-` if it isn't already, so a raw container ID passed as a string will
+  not match anything and — because a missing container counts as success —
+  returns `:ok` without removing it. To destroy by container ID, pass the
+  `%Dockd.Instance{}` struct, whose `:id` is used verbatim.
 
   ## Examples
 
       # By instance struct (typical when you've just created it).
-      {:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply("busybox:1.37.0")
+      {:ok, %Dockd.ApplyResult{instance: instance}} =
+        Dockd.apply("busybox:1.37.0", name: "smoke")
+
       :ok = Dockd.destroy(instance)
 
       # By short name.
@@ -404,9 +477,6 @@ defmodule Dockd do
 
       # By full container name.
       :ok = Dockd.destroy("dockd-smoke")
-
-      # By container ID.
-      :ok = Dockd.destroy("a1b2c3d4e5f6")
 
       # Idempotent — destroying something that's already gone is :ok.
       :ok = Dockd.destroy("smoke")
@@ -598,10 +668,11 @@ defmodule Dockd do
   ## Examples
 
       {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply("busybox:1.37.0", shell: "/bin/sh")
+        Dockd.apply("busybox:1.37.0", name: "smoke", shell: "/bin/sh")
 
       # String form — invoked through the instance's configured shell.
-      {:ok, %{stdout: "hello\\n", exit_code: 0}} =
+      # `:output` is stdout and stderr combined into one binary.
+      {:ok, %{output: "hello\\n", exit_code: 0}} =
         Dockd.shell_command(instance, "echo hello")
 
       # Argv form — exec'd verbatim, no shell parsing.
@@ -664,9 +735,25 @@ defmodule Dockd do
     end
   end
 
-  @doc false
-  # Precedence: explicit opts[:shell] wins; else default to the instance's
-  # configured program (argv-wrapped); else inject nothing (Docker uses /bin/sh).
+  @doc """
+  Decides the `:shell` option to add when opening a shell into an instance.
+
+  Exposed because `open_shell/2`'s shell precedence is worth being able to
+  reason about (and test) on its own. Returns the keyword list to append to the
+  Docker options — either `[shell: [program]]` or `[]`.
+
+  Precedence:
+
+    1. an explicit `opts[:shell]` wins, so nothing is added (`[]`)
+    2. otherwise the instance's `configured` program is used, argv-wrapped
+    3. otherwise nothing is added and Docker falls back to `/bin/sh`
+
+  ## Examples
+
+      [shell: ["claude"]] = Dockd.resolve_shell_arg([], "claude")
+      [] = Dockd.resolve_shell_arg([shell: ["bash", "-l"]], "claude")
+      [] = Dockd.resolve_shell_arg([], nil)
+  """
   @spec resolve_shell_arg(keyword(), binary() | nil) :: keyword()
   def resolve_shell_arg(opts, configured) do
     cond do

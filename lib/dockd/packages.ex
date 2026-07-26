@@ -7,14 +7,20 @@ defmodule Dockd.Packages do
   spec references (typically a `Dockerfile`). The package's identity is its
   directory name.
 
-  This module owns two concerns:
+  This module owns lookup and installation:
 
-    - `resolve_path/1` — turn the user-facing reference passed to
-      `Dockd.apply_package/2` or `mix dockd --preset` into a concrete
-      path to a `package.json`.
+    - `resolve_path/2` — turn the user-facing reference passed to
+      `Dockd.apply_package/2` into a concrete path to a `package.json`.
+    - `list/1` — enumerate the packages already installed under the root.
     - `install_from_git/2` — clone a remote git repository and copy
       every `<repo>/packages/<name>/` directory containing a `package.json`
       into the configured packages root.
+    - `install_from_path/2` — the same copy step against a local directory,
+      with no clone.
+
+  Both installers share one implementation, so they agree on what counts as a
+  package and on the `{:ok, [name]}` / `:fetch`-tagged-error contract.
+  `Dockd.install_packages/2` picks between them for the caller.
 
   Remote installs use the host `git` binary (same approach as
   `Dockd.Git`) so HTTPS/SSH credentials and `~/.gitconfig` are reused
@@ -28,8 +34,8 @@ defmodule Dockd.Packages do
   alias Dockd.Spec.Parser
 
   @doc """
-  Resolves the reference passed to `apply_package` or the `--preset` flag
-  into a path to a `package.json` file.
+  Resolves the reference passed to `Dockd.apply_package/2` into a path to a
+  `package.json` file.
 
     - any string ending in `.json` is treated as a literal file path
     - any other string containing `/` is treated as a package directory

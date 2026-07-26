@@ -1,11 +1,12 @@
 defmodule Dockd.Shell do
   @moduledoc """
   Opens a real interactive shell into an instance by launching `docker exec -it`
-  in a NEW OS terminal window. The new window owns its own TTY, so the running
-  program (CLI binary or dashboard) never surrenders its controlling terminal.
+  in a NEW OS terminal window. The new window owns its own TTY, so the calling
+  program never surrenders its controlling terminal.
 
-  Shared by `dockd instance shell` (CLI) and the TUI dashboard's `s` action, so
-  the launcher glue lives here in the core rather than in a frontend.
+  This is the shell for a *human* to type into. It is distinct from
+  `Dockd.open_shell/2`, which is the programmatic, non-TTY form used to drive a
+  shell from code.
 
   ## Trade-offs
 
@@ -16,8 +17,8 @@ defmodule Dockd.Shell do
     * **Foreground emulators block.** With a *forking* emulator (macOS
       `osascript`, `gnome-terminal`) `System.cmd` returns immediately. With a
       *foreground* emulator (`xterm`, `konsole`) it blocks until the window is
-      closed — so a caller awaiting the result (e.g. the dashboard's status
-      line) stays pending for the shell's lifetime. Set `$TERMINAL` to a
+      closed — so a caller awaiting the result stays pending for the shell's
+      lifetime. Set `$TERMINAL` to a
       forking emulator to avoid this.
   """
   alias Dockd.Instance

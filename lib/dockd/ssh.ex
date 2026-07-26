@@ -1,11 +1,11 @@
 defmodule Dockd.Ssh do
   @moduledoc """
-  Shared, frontend-agnostic entry points for the dial-stdio bridge script.
+  Entry points for the dial-stdio bridge script, used when talking to a Docker
+  daemon on a remote host over SSH.
 
-  Both the CLI (`dockd ssh dial_stdio_script ...`) and the TUI call these
-  functions, so the filesystem/source-resolution glue lives here once rather
-  than in a frontend adapter. The wire-level work stays in
-  `Dockd.Ssh.DockerDialStdio`.
+  The filesystem and source-resolution glue lives here — rendering the bundled
+  template to disk and deciding which script source to use — so callers do not
+  have to repeat it. The wire-level work stays in `Dockd.Ssh.DockerDialStdio`.
   """
   alias Dockd.Ssh.DockerDialStdio
 

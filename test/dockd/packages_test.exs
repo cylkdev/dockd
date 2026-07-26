@@ -228,6 +228,64 @@ defmodule Dockd.PackagesTest do
     end
   end
 
+  describe "Dockd.install_packages/2" do
+    test "installs from a local directory when the ref is an existing dir" do
+      src = sandbox_dir("dockd-dispatch-local")
+      dest = sandbox_dir("dockd-dispatch-local-dest")
+
+      add_package(src, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+
+      assert {:ok, ["alpha"]} = Dockd.install_packages(src, dest_dir: dest)
+      assert File.exists?(Path.join([dest, "alpha", "package.json"]))
+    end
+
+    @tag :integration
+    test "treats a non-directory ref as a git URL" do
+      if System.find_executable("git") do
+        repo = make_repo()
+        dest = sandbox_dir("dockd-dispatch-git-dest")
+
+        add_package(repo, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+        git_commit(repo, "add alpha")
+
+        assert {:ok, ["alpha"]} =
+                 Dockd.install_packages("file://" <> repo, dest_dir: dest)
+
+        assert File.exists?(Path.join([dest, "alpha", "package.json"]))
+      end
+    end
+
+    test "a non-directory ref that is not cloneable fails on the git path" do
+      dest = sandbox_dir("dockd-dispatch-bogus")
+
+      assert {:error, err} =
+               Dockd.install_packages("file:///nonexistent/repo.git", dest_dir: dest)
+
+      assert err.phase === :fetch
+      assert err.message =~ "failed to clone"
+    end
+  end
+
+  describe "Dockd.list_packages/1" do
+    test "lists installed packages after an install" do
+      src = sandbox_dir("dockd-list-src")
+      root = sandbox_dir("dockd-list-root")
+
+      add_package(src, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+      assert {:ok, ["alpha"]} = Dockd.install_packages(src, dest_dir: root)
+
+      assert [%{name: "alpha", path: path, spec: {:ok, spec}}] =
+               Dockd.list_packages(packages_path: root)
+
+      assert path === Path.join(root, "alpha")
+      assert spec.image === "busybox:1.37.0"
+    end
+
+    test "returns [] when the packages root does not exist" do
+      assert Dockd.list_packages(packages_path: sandbox_dir("dockd-list-missing")) === []
+    end
+  end
+
   defp make_repo do
     dir = sandbox_dir("dockd-install-repo")
     File.mkdir_p!(dir)

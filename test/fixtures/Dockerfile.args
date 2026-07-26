@@ -1,0 +1,3 @@
+FROM busybox:1.37.0
+ARG GREETING=unset
+RUN echo "$GREETING" > /tmp/greeting.txt

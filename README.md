@@ -1,7 +1,13 @@
 # Dockd
 
-Dockd gives you a throwaway Linux terminal inside a Docker container with a
-single command. When you're done, it cleans everything up automatically.
+Dockd is an Elixir library for managing local Docker containers as named,
+throwaway Linux workspaces ("instances"). You describe the environment you want
+-- image, files, repos, setup commands -- and dockd builds it, runs it, and
+tears it down on request.
+
+It holds no state of its own: every container it creates is labelled, so Docker
+itself is the source of truth. A fresh BEAM rediscovers every managed instance
+by asking the daemon.
 
 ## Prerequisites
 
@@ -18,112 +24,32 @@ If you see connection errors, start Docker Desktop (Mac/Windows) or the Docker d
 
 ## Quick Start
 
-```sh
-mix dockd
+```elixir
+# Create and start a container. :name is required.
+{:ok, %Dockd.ApplyResult{instance: instance}} =
+  Dockd.apply("debian:trixie", name: "scratch", shell: "/bin/bash")
+
+# Run something in it.
+{:ok, %{output: output, exit_code: 0}} = Dockd.shell_command(instance, "uname -a")
+IO.puts(output)
+
+# Tear it down.
+:ok = Dockd.destroy(instance)
 ```
 
-This pulls a Debian Linux image, starts a container, and prints a command like:
+Any Docker image works -- `ubuntu:24.04`, `alpine:latest`, `node:20-slim`, and so on.
 
-```
-Container is ready!
-
-Connect to it by running this command in another terminal:
-
-    docker exec -it dockd-123 /bin/bash
-```
-
-Open a second terminal, paste that command, and you're inside a Linux shell. Install packages, run scripts, experiment freely -- nothing you do inside the container affects your computer.
-
-When you're done, go back to the first terminal and press Enter. The container is stopped and deleted automatically.
-
-## Building the standalone CLI
-
-The `dockd_cli` app can be packaged with [Burrito](https://github.com/burrito-elixir/burrito)
-into a single self-contained `dockd` binary that end users can run without
-installing Elixir or Erlang -- only a running Docker daemon is required.
-
-### Prerequisite: Zig
-
-Burrito uses [Zig](https://ziglang.org/) to build the wrapper binary. Install it with:
-
-```sh
-brew install zig
-```
-
-(Verified against Zig 0.15.2, the version Burrito's precompiled ERTS downloads currently target.)
-
-### Build command
-
-From the repo root:
-
-```sh
-MIX_ENV=prod BURRITO_TARGET=macos mix release dockd
-```
-
-- `MIX_ENV=prod` is required -- the release/Burrito wiring in `apps/dockd_cli/mix.exs`
-  only activates the CLI's `Application` entrypoint (`DockdCLI.Main.start/2`) for the
-  `prod` environment, so `mix test` and `mix dockd` (dev) are unaffected.
-- `BURRITO_TARGET=macos` restricts the build to the local macOS (Apple Silicon) target
-  defined in the umbrella root `mix.exs` `releases/0`. Omit it to build every configured
-  target (currently `macos` and `linux`), which requires cross-compilation and is slower.
-
-The build downloads a precompiled ERTS for the target platform, assembles the release,
-and produces a self-extracting binary via Zig. This can take several minutes on first run
-(subsequent builds reuse the cached ERTS download).
-
-### Output
-
-The finished binary is written to:
-
-```
-burrito_out/dockd_macos
-```
-
-(or `burrito_out/dockd_linux`, etc., for other targets). This directory is git-ignored --
-build it locally or in CI, don't commit it.
-
-### Running `dockd`
-
-A release build produces a single binary, `burrito_out/dockd_<target>`
-(`dockd_macos` / `dockd_linux`). That binary is all you install — there is no
-separate wrapper. Put it on your PATH as `dockd`:
-
-    MIX_ENV=prod BURRITO_TARGET=macos mix release dockd
-    mkdir -p ~/.local/bin
-    cp burrito_out/dockd_macos ~/.local/bin/dockd
-
-Then (with `~/.local/bin` on PATH):
-
-    dockd instance list
-    dockd instance shell --name my-workspace     # opens a new terminal window in the container
-
-`dockd instance shell --name NAME` opens a new terminal window already inside
-the instance (macOS Terminal.app, or your `$TERMINAL` on Linux) — it invokes the
-bundled `apps/dockd_cli/priv/open-shell` launcher. Pass `--print` to print the
-`docker exec` command instead of opening a window (useful for scripts/CI).
-
-In a source checkout, use `mix dockd instance shell --name NAME` — same command
-surface as the binary; it also opens a new terminal window via the same code
-path, and `--print` works there too.
-
-## Using a Different Image
-
-Pass any Docker image as an argument:
-
-```sh
-mix dockd ubuntu:24.04
-mix dockd alpine:latest
-mix dockd node:20-slim
-```
+To get a real interactive shell in a new terminal window, use
+`Dockd.Shell.open_window/2`; it launches `docker exec -it` in its own window so
+your current terminal stays free.
 
 ## Elixir API
 
-For programmatic use, Dockd exposes three functions:
-
 ```elixir
-# Start a container with setup steps
-{:ok, instance} =
-  Dockd.run("debian:trixie",
+# Create a container, running setup steps before it's considered ready.
+{:ok, %Dockd.ApplyResult{instance: instance, step_results: steps}} =
+  Dockd.apply("debian:trixie",
+    name: "builder",
     shell: "/bin/bash",
     steps: [
       %{label: "update", cmd: ["apt-get", "update"]},
@@ -131,39 +57,51 @@ For programmatic use, Dockd exposes three functions:
     ]
   )
 
-# Run a one-off command inside the instance
+# Run a one-off command inside the instance.
+# :output is stdout and stderr combined.
 {:ok, %{output: "hello\n", exit_code: 0}} =
   Dockd.shell_command(instance, "echo hello")
 
-# Or open a persistent shell that preserves state between commands
+# Or open a persistent shell that preserves state between commands.
 {:ok, shell} = Dockd.open_shell(instance)
-{:ok, _, shell}      = Dockd.shell_send(shell, "cd /tmp")
-{:ok, out, shell}    = Dockd.shell_send(shell, "pwd")  # out =~ "/tmp"
+{:ok, {_, shell}}   = Dockd.shell_send(shell, "cd /tmp")
+{:ok, {out, shell}} = Dockd.shell_send(shell, "pwd")  # out =~ "/tmp"
 :ok = Dockd.close_shell(shell)
 
-# Clean up when done
-Dockd.destroy(instance)
+# Clean up when done.
+:ok = Dockd.destroy(instance)
 ```
 
-Both `shell_command/2` and `open_shell/1` are thin wrappers over
+`Dockd.apply/2` returns a `%Dockd.ApplyResult{}` carrying the live
+`%Dockd.Instance{}` plus the captured output of each setup step. Pass the
+instance (or just its name) to every other function.
+
+Both `shell_command/3` and `open_shell/2` are thin wrappers over
 [`Docker.Terminal`](https://hexdocs.pm/docker/Docker.Terminal.html): use
-`shell_command/2` for stateless one-shot commands (output + exit code),
+`shell_command/3` for stateless one-shot commands (output + exit code),
 and `open_shell` + `shell_send` + `close_shell` when commands must build
 on each other (working directory, shell variables, etc.).
 
-### Options
+Other lifecycle functions: `list/1`, `get/2`, `start/2`, `stop/2`, `restart/2`,
+`running?/2`, `logs/2`, `inspect/2`, `refresh/2`, `copy_to/3`.
+
+### Instance options
+
+These describe the workspace itself. They map one-to-one onto `Dockd.Spec`
+fields (`Dockd.Spec.option_keys/0`).
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `:name` | **required** | Container name. Prefixed with `dockd-` if it isn't already. There is no auto-generated default -- omitting it is a `:validate` error |
 | `:shell` | `"/bin/sh"` | Shell to use inside the container |
-| `:name` | auto-generated | Container name |
+| `:description` | `nil` | Free-text description, stored on the spec |
 | `:steps` | `[]` | Commands to run inside the container before it's ready |
 | `:repos` | `[]` | Git repositories to clone on the host and upload into the container |
 | `:copy` | `[]` | Files or directories to ship from the host into the container as one-way snapshots |
 | `:mounts` | `[]` | Live host↔container shares - strings (`"host:container[:ro]"`) or structured maps (`%{type:, source:, target:, ...}`) |
-| `:env` | `[]` | Container env entries - literal `"K=V"`, bare `"FOO"` (inherits from host), or `{"FOO", default: "x"}` |
+| `:env` | `[]` | Container env entries - see below |
+| `:labels` | `%{}` | Extra container labels, merged with the labels dockd manages |
 | `:build` | `nil` | Build the image locally from a `%{dockerfile:, context:, args:, ...}` map instead of pulling |
-| `:api_version` | daemon default | Docker Engine API version to talk to |
 
 Each setup step is a map with a `:label` and a `:cmd` (list of strings):
 
@@ -171,13 +109,41 @@ Each setup step is a map with a `:label` and a `:cmd` (list of strings):
 %{label: "install git", cmd: ["apt-get", "install", "-y", "git"]}
 ```
 
+In the Elixir API, each `:env` entry is one of:
+
+| Shape | Behavior |
+|-------|----------|
+| `"FOO=bar"` | literal - passed through unchanged |
+| `"FOO"` (no `=`) | inherit from the host environment; **`:validate` error if unset** |
+| `{"FOO", value: "bar"}` | literal, in tuple form |
+| `{"FOO", default: "x"}` | inherit, fall back to `"x"` when unset |
+| `{"FOO", optional: true}` | inherit, silently drop the entry when unset |
+
+The JSON package format uses a different, object-based shape for `env` -- see
+[the `env` field reference](#env-list) below.
+
+### Connection options
+
+These configure the daemon connection and provisioning policy rather than the
+workspace (`Dockd.option_keys/0`). They share the same flat keyword list, are
+never stored on the container, and unknown keys are rejected.
+
+| Option | Description |
+|--------|-------------|
+| `:socket` | Path to the Docker Unix socket |
+| `:host` | Docker daemon host |
+| `:api_version` | Docker Engine API version to talk to |
+| `:platform` | Target platform (e.g. `"linux/amd64"`) |
+| `:networks` / `:network_mode` | Container networking |
+| `:disk_mount_enabled` | Policy flag gating host disk mounts |
+
 ## Packages
 
 A **package** is a JSON file that describes a complete instance - image, shell,
 files to bring in, setup commands - so you can launch a reusable environment with
 one call. Packages are the fastest way to share a "stack" (e.g. "Node 20 with
 your toolchain preinstalled and a project directory mounted") with someone else: hand them the
-file, they run `Dockd.prepare_package("./my-stack.json")`, and they get the same
+file, they run `Dockd.apply_package("./my-stack.json")`, and they get the same
 container you do.
 
 ### A minimal package
@@ -186,23 +152,28 @@ Save this as `hello.json`:
 
 ```json
 {
-  "image": "busybox:1.37.0"
+  "name": "hello",
+  "image": "busybox:1.37.0",
+  "shell": "/bin/sh"
 }
 ```
+
+Setting `"shell"` is what keeps the container alive after it starts - see the
+[`shell` field reference](#shell-string-optional) below.
 
 Run it:
 
 ```elixir
-{:ok, instance} = Dockd.prepare_package("./hello.json")
+{:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("./hello.json")
 {:ok, %{output: out}} = Dockd.shell_command(instance, "uname -a")
 IO.puts(out)
 Dockd.destroy(instance)
 ```
 
-That's the whole contract. The package's keys mirror the options accepted by
-`Dockd.prepare/2`, plus a top-level `"image"` field that becomes the first
-positional argument. You only specify what you need; everything else falls back
-to the same defaults `Dockd.prepare/2` uses.
+That's the whole contract. The package's keys mirror the instance options
+accepted by `Dockd.apply/2`, with `"image"` and `"name"` both required. You only
+specify what you need; everything else falls back to the same defaults
+`Dockd.apply/2` uses.
 
 ### A realistic package
 
@@ -211,9 +182,10 @@ permissions, and runs an install step before handing you a shell:
 
 ```json
 {
+  "name": "python-dev",
   "image": "python:3.12-slim",
   "shell": "/bin/bash",
-  "env": ["GITHUB_TOKEN"],
+  "env": [{"name": "GITHUB_TOKEN"}],
   "mounts": ["${PWD}:/instance"],
   "repos": [
     {
@@ -238,54 +210,86 @@ permissions, and runs an install step before handing you a shell:
 Run it the same way:
 
 ```elixir
-{:ok, instance} = Dockd.prepare_package("./python-instance.json")
+{:ok, %Dockd.ApplyResult{instance: instance}} =
+  Dockd.apply_package("./python-instance.json")
 ```
 
 ### Field reference
 
-Every field is optional except `"image"`. Unknown keys are rejected with a
-`:validate` error so typos are caught early.
+The valid keys are `name`, `description`, `image`, `shell`, `steps`, `build`,
+`repos`, `copy`, `env`, `mounts`, and `labels`. `"name"` and `"image"` are
+required; the rest are optional. Unknown keys are rejected with a `:validate`
+error so typos are caught early.
 
 #### `image` (string, required)
 
-A Docker registry reference. With `"dockerfile"` set, this is the tag the built
+A Docker registry reference. With `"build"` set, this is the tag the built
 image will receive instead.
 
 ```json
 "image": "node:20-slim"
 ```
 
-#### `shell` (string, default `"/bin/sh"`)
+#### `description` (string, optional)
+
+Free-text description of what the package provides. Carried on the spec; useful
+when listing installed packages with `Dockd.list_packages/1`.
+
+#### `labels` (map, optional)
+
+Extra Docker labels to set on the container, merged with the labels dockd
+manages for discovery.
+
+```json
+"labels": {"team": "platform"}
+```
+
+#### `shell` (string, optional)
 
 Path inside the container that an interactive `docker exec -it` should launch.
 Use the entrypoint of whatever tool you actually want - for an SSH-style shell,
 `"/bin/bash"`; for a CLI tool that runs as a single binary, point directly at it
 (e.g. `"/usr/local/bin/mytool"`).
 
-#### `name` (string, default auto-generated)
+Setting it also runs the container with an interactive shell as its command,
+which is what keeps a container alive whose image would otherwise run to
+completion and exit. **Omit it and an image like `busybox` exits immediately**,
+so later `shell_command/3` calls fail with a Docker 409 ("container is not
+running"). Set `"shell"` for any instance you intend to keep around.
 
-Container name. Defaults to `"dockd-<unique>"`. Setting it makes the container
-easier to find with `docker ps`, but two simultaneous prepares of the same
-package will collide on the name.
+#### `name` (string, required)
+
+Container name, prefixed with `dockd-` if it isn't already. There is no
+auto-generated default - a package without a non-empty `"name"` is rejected
+with a `:validate` error. Because the name is fixed by the package, applying the
+same package twice concurrently will collide.
 
 #### `env` (list)
 
-Container environment variables. Each entry can be one of three shapes:
+Container environment variables. **In JSON, every entry must be an object** with
+a non-empty `"name"`, plus at most one of `"value"`, `"default"`, or
+`"optional"` (they are mutually exclusive). Bare strings like `"FOO=bar"` are
+*not* valid here - that shape belongs to the Elixir keyword API described in
+[Instance options](#instance-options).
 
 | Shape | Behavior |
 |-------|----------|
-| `"FOO=bar"` | literal - passed through unchanged |
-| `"FOO"` (no `=`) | inherit from the host environment; **`:validate` error if unset** |
-| `["FOO", {"default": "fallback"}]` (Elixir tuple `{"FOO", default: "fallback"}`) | inherit, fall back to the literal default if unset |
+| `{"name": "FOO"}` | inherit from the host environment; **`:validate` error if unset** |
+| `{"name": "FOO", "value": "bar"}` | literal - passed through unchanged |
+| `{"name": "FOO", "default": "fallback"}` | inherit, fall back to the literal default if unset |
+| `{"name": "FOO", "optional": true}` | inherit, silently drop the entry if unset |
 
+`"value"` and `"default"` must be strings; `"optional"` must be a boolean.
 `${VAR}` substitutions inside values still work - see
 [Environment interpolation](#environment-interpolation).
 
 ```json
 "env": [
-  "NODE_ENV=development",
-  "API_KEY=${API_KEY}",
-  "GITHUB_TOKEN"
+  {"name": "NODE_ENV", "value": "development"},
+  {"name": "API_KEY", "value": "${API_KEY}"},
+  {"name": "GITHUB_TOKEN"},
+  {"name": "LOG_LEVEL", "default": "info"},
+  {"name": "SENTRY_DSN", "optional": true}
 ]
 ```
 
@@ -345,7 +349,7 @@ One-way snapshots from the host into the container. Each entry supports:
 | `mode` | no | Permission bits applied with `chmod -R` after upload (e.g. `"0600"`) |
 | `owner` | no | Ownership applied with `chown -R` after upload (e.g. `"root:root"`) |
 
-Unlike `binds`, the container receives its own copy - writes inside the container
+Unlike `mounts`, the container receives its own copy - writes inside the container
 do **not** propagate to the host. Use this when you want the container to be
 isolated from later host edits, or when you want to copy in something Docker
 volumes can't represent (a single file with tightened permissions, for example).
@@ -402,6 +406,9 @@ triggers the pull path.
 | `args` | no | Map of `--build-arg` values (forwarded to Docker's `buildargs` field) |
 | `nocache`, `pull`, `target`, `platform`, `labels`, ... | no | Any other Docker Engine API build option |
 
+With `"build"` set, the top-level `"image"` is the **tag** the built image
+receives rather than something to pull.
+
 ```json
 "build": {
   "dockerfile": "./Dockerfile",
@@ -410,6 +417,10 @@ triggers the pull path.
   "nocache": true
 }
 ```
+
+Relative `dockerfile` and `context` paths resolve against the **package
+directory**, not the current working directory, so a package that ships its own
+Dockerfile stays self-contained and can be installed anywhere.
 
 #### Connection options
 
@@ -422,8 +433,12 @@ when you need to talk to a non-default daemon.
 Phases run in this order:
 
 ```
-validate -> build|pull -> create -> start -> fetch (repos) -> copy -> setup (steps) -> ready
+validate -> build|pull -> create -> start -> fetch (repos) -> copy -> setup (steps) -> discover
 ```
+
+`validate` covers the whole up-front pass: the disk-mount policy check, `${VAR}`
+expansion, mount normalization, and validation of steps, repos and copies. The
+final `discover` phase hydrates the `%Dockd.Instance{}` from `docker inspect`.
 
 So a `step` can rely on a cloned repo or copied file being present, and a `copy`
 can land on top of a directory that was just created by a `repo` clone.
@@ -442,9 +457,10 @@ substituted from your shell's environment:
 
 ```json
 {
+  "name": "node-app",
   "image": "node:20-slim",
-  "binds": ["${PWD}:/instance"],
-  "env": ["LOG_LEVEL=${LOG_LEVEL:-info}"]
+  "mounts": ["${PWD}:/instance"],
+  "env": [{"name": "LOG_LEVEL", "value": "${LOG_LEVEL:-info}"}]
 }
 ```
 
@@ -454,28 +470,103 @@ Two entry points:
 
 ```elixir
 # A path on disk - typical for project-local packages.
-{:ok, instance} = Dockd.apply_package("./packages/python.json")
+{:ok, %Dockd.ApplyResult{instance: instance}} =
+  Dockd.apply_package("./packages/python.json")
 
 # A bare name - resolves to <packages_root>/<name>/package.json.
-{:ok, instance} = Dockd.apply_package("webapp")
+{:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("webapp")
 ```
 
 ### Installed packages
 
 Package names resolve from the configured packages root, which defaults to
-`~/.dockd/packages`. Package sets live in their own repositories; install every
-`packages/<name>/` directory a repo (or local checkout) ships with:
+`~/.dockd/packages`. It can be overridden per call with `:packages_path`, or
+globally via the `DOCKD_PACKAGES_PATH` environment variable or
+`config :dockd, packages_path: ...`.
 
-```sh
-# From a remote repository:
-mix dockd package install --type git --source=<url>
-# From a local checkout:
-mix dockd package install --type local --source=<path>
+Package sets live in their own directory trees. `Dockd.install_packages/2`
+copies every `packages/<name>/` directory the source ships with into the
+packages root, from either a git repository or a local directory:
+
+```elixir
+# From a remote repository - anything `git clone` accepts, plus the
+# `github.com/user/repo` shorthand.
+{:ok, ["python", "webapp"]} = Dockd.install_packages("github.com/me/recipes")
+
+# Pin a branch or tag.
+{:ok, _} = Dockd.install_packages("github.com/me/recipes", ref: "v1.2.0")
+
+# From a local directory - any existing directory on disk takes this path.
+{:ok, ["python", "webapp"]} = Dockd.install_packages("./my-recipes")
 ```
 
-To add your own installed package, place a directory at
+The source must have a top-level `packages/` directory; otherwise you get a
+`:fetch` error. An existing target directory is replaced.
+
+See what's installed:
+
+```elixir
+Dockd.list_packages()
+#=> [%{name: "webapp", path: "...", spec: {:ok, %Dockd.Spec{}}}]
+```
+
+Each entry's `:spec` is itself a result tuple, so one malformed `package.json`
+reports its own parse error instead of hiding the rest.
+
+To add your own installed package by hand, place a directory at
 `<packages_root>/<name>/` containing `package.json` and any referenced support
 files, then call `Dockd.apply_package("name")`.
+
+### A package that builds its own image
+
+A package is just data, so a package that ships a Dockerfile alongside its
+`package.json` is enough to define, build, and run a custom image - no Elixir
+code involved. Lay the source out as a package set:
+
+```
+my-recipes/
+└── packages/
+    └── greeter/
+        ├── package.json
+        └── Dockerfile
+```
+
+```json
+{
+  "name": "greeter",
+  "description": "busybox with a baked-in greeting",
+  "image": "dockd-greeter:1",
+  "shell": "/bin/sh",
+  "build": {
+    "dockerfile": "./Dockerfile",
+    "args": {"GREETING": "hello"}
+  },
+  "steps": [
+    {"label": "verify", "cmd": ["sh", "-c", "test -f /etc/greeting"]}
+  ]
+}
+```
+
+```dockerfile
+FROM busybox:1.37.0
+ARG GREETING=unset
+RUN echo "$GREETING" > /etc/greeting
+```
+
+Install it and apply it by name. The `Dockerfile` is copied in alongside the
+`package.json`, and `"image"` becomes the tag of the image that gets built:
+
+```elixir
+{:ok, ["greeter"]} = Dockd.install_packages("./my-recipes")
+
+{:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("greeter")
+
+{:ok, %{output: out}} = Dockd.shell_command(instance, "cat /etc/greeting")
+IO.puts(out)  #=> "hello"
+```
+
+The build runs before the container is created, so setup `steps` and `copy`
+entries operate on the freshly built image.
 
 The lookup rule is lexical: a string with no `/` and no `.json` suffix is a
 package name; anything else is a path.
@@ -491,16 +582,19 @@ where things went wrong:
 | `:pull` | Registry pull failed |
 | `:build` | `docker build` failed |
 | `:create`, `:start` | Docker daemon refused the container |
-| `:fetch` | `git clone` failed, or upload to the container failed |
+| `:fetch` | `git clone` failed, package install failed, or upload to the container failed |
 | `:copy` | Source path doesn't exist on the host, or upload failed |
 | `:setup` | A `step` exited non-zero - `error.exit_code` and `error.output` are populated |
+| `:lifecycle` | `start/2` or `stop/2` failed on an existing container |
+| `:destroy` | Stopping or removing a container failed |
+| `:discover` | Looking up or hydrating an instance from the daemon failed |
 
 When a container was created before the failure, `error.instance` is a partial
 instance you should pass to `Dockd.destroy/1` to clean up.
 
 ```elixir
-case Dockd.prepare_package("./mystack.json") do
-  {:ok, instance} ->
+case Dockd.apply_package("./mystack.json") do
+  {:ok, %Dockd.ApplyResult{instance: instance}} ->
     {:ok, %{output: out}} = Dockd.shell_command(instance, "uname -a")
     IO.puts(out)
     instance
@@ -510,7 +604,7 @@ case Dockd.prepare_package("./mystack.json") do
     if instance, do: Dockd.destroy(instance)
 
   {:error, error} ->
-    IO.puts("prepare failed at #{error.phase}: #{error.message}")
+    IO.puts("apply failed at #{error.phase}: #{error.message}")
     if error.instance, do: Dockd.destroy(error.instance)
 end
 ```
@@ -519,9 +613,11 @@ end
 
 - **Keep packages in your repo** so collaborators get the same instance.
   `./packages/<stack>.json` is a good convention.
-- **Prefer bare-name `env` entries over hard-coded literals** for secrets -
-  `"env": ["GITHUB_TOKEN"]` reads from the host without committing the value.
+- **Prefer inherited `env` entries over hard-coded literals** for secrets -
+  `"env": [{"name": "GITHUB_TOKEN"}]` reads from the host without committing
+  the value.
 - **Use `${PWD}` and `${HOME}`** in `mounts`/`copy` so the same package works
   for everyone on the team.
-- **Test a package locally** with `Dockd.Instance.from_json_file("./mystack.json")`
-  before preparing - load runs all validation without touching Docker.
+- **Check an installed package parses** with `Dockd.list_packages/1`, whose
+  per-package `:spec` is `{:ok, spec}` or `{:error, error}` - it validates
+  without touching Docker.

@@ -8,9 +8,8 @@ defmodule Dockd.Ssh.DockerDialStdio do
 
     * **Render** the bundled EEx template to a binary in memory
       (`render_script/1`) so you can inspect or customise it.
-    * **Generate** the rendered template to disk — see the
-      `dockd ssh dial_stdio_script generate` command
-      (`mix dockd ssh dial_stdio_script generate` in dev).
+    * **Generate** the rendered template to disk — see
+      `Dockd.Ssh.generate_script/2`.
     * **Install** any script source to a remote host (`install/3`). The
       source can be an explicit path, a binary held in memory, or `:default`
       (render the bundled template and stream it to the host without ever
@@ -52,17 +51,14 @@ defmodule Dockd.Ssh.DockerDialStdio do
       iex> String.starts_with?(script, "#!/bin/sh")
       true
 
-  Deploy with the bundled CLI command:
-
-      dockd ssh dial_stdio_script install user@host
-
-  Or in dev, via the mix forwarder:
-
-      mix dockd ssh dial_stdio_script install user@host
-
-  Or programmatically with the bundled default (no local disk write):
+  Deploy the bundled default to a host (no local disk write):
 
       Dockd.Ssh.DockerDialStdio.install(:default, "user@host", [])
+
+  Or render it to disk first, then install that file:
+
+      {:ok, %{path: path}} = Dockd.Ssh.generate_script("/tmp", [])
+      Dockd.Ssh.DockerDialStdio.install(path, "user@host", [])
   """
 
   @type script_source :: Path.t() | {:content, binary()} | :default
@@ -105,9 +101,8 @@ defmodule Dockd.Ssh.DockerDialStdio do
   SSH host.
 
   The canonical remote install path is `"/usr/local/bin/docker-stdio-bridge"`.
-  This is the destination used by `dockd ssh dial_stdio_script install`
-  (`mix dockd ssh dial_stdio_script install` in dev) when the caller does not
-  pass `--remote-path`.
+  This is the destination `install/3` uses when the caller does not pass a
+  `:remote_path` option.
 
   ## Examples
 

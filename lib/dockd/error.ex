@@ -5,8 +5,8 @@ defmodule Dockd.Error do
   Every error returned from `Dockd.apply/2`, `Dockd.destroy/1`,
   `Dockd.list/1`, or `Dockd.get/2` is wrapped in this struct. The `phase`
   field identifies which pipeline step failed (`:validate`, `:build`,
-  `:pull`, `:create`, `:start`, `:fetch`, `:copy`, `:setup`, `:destroy`,
-  `:discover`) so callers can route on it. When the failure happened after
+  `:pull`, `:create`, `:start`, `:lifecycle`, `:fetch`, `:copy`, `:setup`,
+  `:destroy`, `:discover`) so callers can route on it. When the failure happened after
   a container was created, `instance` carries a hydrated `Dockd.Instance`
   so the caller can clean up with `Dockd.destroy/1`. When the failure was
   a setup-step exit, `exit_code` and `output` are populated from the
@@ -37,21 +37,6 @@ defmodule Dockd.Error do
       instance: instance,
       step_results: []
     }
-  end
-
-  @spec bad_request(binary(), term(), keyword()) :: t()
-  def bad_request(message, reason, _opts \\ []) do
-    docker_phase_error(:rpc, message, reason, nil)
-  end
-
-  @spec service_unavailable(binary(), term(), keyword()) :: t()
-  def service_unavailable(message, reason, _opts \\ []) do
-    docker_phase_error(:rpc, message, reason, nil)
-  end
-
-  @spec request_timeout(binary(), term(), keyword()) :: t()
-  def request_timeout(message, reason, _opts \\ []) do
-    docker_phase_error(:rpc, message, reason, nil)
   end
 
   defp message_with_reason(message, reason) do

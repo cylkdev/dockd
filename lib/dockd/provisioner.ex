@@ -593,11 +593,29 @@ defmodule Dockd.Provisioner do
     end)
   end
 
+  # Build params travel to the Engine as a URL query string, so the ones the
+  # API defines as JSON documents (maps/lists) must be encoded before they get
+  # there — otherwise URI.encode_query/1 raises on the nested term.
+  @json_encoded_build_params [:buildargs, :labels, :cachefrom]
+
   defp build_params_for_engine(build) do
     build
     |> normalize_build_keys()
     |> Map.drop([:dockerfile, :context])
     |> rename_key(:args, :buildargs)
+    |> json_encode_build_params()
+  end
+
+  defp json_encode_build_params(params) do
+    Enum.reduce(@json_encoded_build_params, params, fn key, acc ->
+      case Map.fetch(acc, key) do
+        {:ok, value} when is_map(value) or is_list(value) ->
+          Map.put(acc, key, JSON.encode!(value))
+
+        _ ->
+          acc
+      end
+    end)
   end
 
   defp normalize_build_keys(map) do

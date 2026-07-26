@@ -45,7 +45,7 @@ The image source is determined by `Spec.build`: when set, the image is built loc
 
 ### Key modules
 
-- `Dockd` — the entire public API in one module. `apply/2`, `apply_package/2`, `install_packages/2`, `list/1`, `get/2`, `destroy/2`, `start/2`, `stop/2`, `restart/2`, `running?/2`, `logs/2`, `inspect/2`, `refresh/2`, `shell_command/3`, `open_shell/2`, `shell_send/3`, `close_shell/2`, `copy_to/3`, `list_temp_files/1`, `delete_temp_files/1`, `info/1`, `option_keys/0`
+- `Dockd` — the entire public API in one module. `apply/2`, `apply_package/2`, `install_packages/2`, `list_packages/1`, `list/1`, `get/2`, `destroy/2`, `start/2`, `stop/2`, `restart/2`, `running?/2`, `logs/2`, `inspect/2`, `refresh/2`, `shell_command/3`, `open_shell/2`, `shell_send/3`, `close_shell/2`, `copy_to/3`, `list_temp_files/1`, `delete_temp_files/1`, `info/1`, `option_keys/0`. `install_packages/2` dispatches on the reference: an existing local directory installs from disk, anything else is cloned as a git URL
 - `Dockd.Spec` — declarative request type; `from_opts/2`, `from_attrs/1`, `option_keys/0`, `prefix_name/1`, `short_name/1`
 - `Dockd.Spec.Parser` / `.Interpolator` / `.Normalizer` — the JSON-package pipeline: read+parse, `${VAR}` substitution, then attribute normalization
 - `Dockd.Instance` — view type; `from_inspect/1`, `managed_labels/1`, `short_name/1`

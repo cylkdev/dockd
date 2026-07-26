@@ -155,6 +155,44 @@ defmodule DockdTest do
       assert Docker.container_running?(instance.id)
     end
 
+    test "passes :args through to the build as --build-arg values" do
+      tag = "dockd-test:args-#{System.unique_integer([:positive])}"
+      args_dockerfile = Path.join(@fixtures_dir, "Dockerfile.args")
+
+      assert {:ok, %ApplyResult{instance: instance}} =
+               Dockd.apply(tag,
+                 shell: "/bin/sh",
+                 build: %{
+                   dockerfile: args_dockerfile,
+                   context: @fixtures_dir,
+                   args: %{"GREETING" => "hi-from-args"}
+                 },
+                 name: unique_name()
+               )
+
+      on_exit(fn -> Dockd.destroy(instance) end)
+
+      assert {:ok, %{output: output, exit_code: 0}} =
+               Dockd.shell_command(instance, "cat /tmp/greeting.txt")
+
+      assert String.trim(output) === "hi-from-args"
+    end
+
+    test "builds with map-valued :labels without raising on query encoding" do
+      tag = "dockd-test:labels-#{System.unique_integer([:positive])}"
+
+      assert {:ok, %ApplyResult{instance: instance}} =
+               Dockd.apply(tag,
+                 shell: "/bin/sh",
+                 build: %{dockerfile: @dockerfile, labels: %{"org.test" => "yes"}},
+                 name: unique_name()
+               )
+
+      on_exit(fn -> Dockd.destroy(instance) end)
+
+      assert instance.image === tag
+    end
+
     test "builds from a directory containing a Dockerfile" do
       tag = "dockd-test:dir-#{System.unique_integer([:positive])}"
 
