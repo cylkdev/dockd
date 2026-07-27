@@ -7,7 +7,7 @@ defmodule Dockd.Spec.Parser do
 
     - be a JSON object
     - contain only keys recognized by `Dockd.Spec`
-    - have a non-empty string `"name"` key
+    - have a non-empty string `"instance_name"` key
     - have a string `"image"` key
     - have a `"description"` value that is a string when present
 
@@ -17,7 +17,7 @@ defmodule Dockd.Spec.Parser do
 
   alias Dockd.Error
 
-  @allowed_keys ~w(name description image shell steps build repos copy env mounts labels)
+  @allowed_keys ~w(instance_name description image shell steps build repos copy env mounts labels)
 
   @doc """
   Reads the JSON document at `path` and parses it.
@@ -51,7 +51,7 @@ defmodule Dockd.Spec.Parser do
     with {:ok, value} <- decode_json(json_string),
          :ok <- ensure_object(value),
          :ok <- check_unknown_keys(value),
-         :ok <- require_name(value),
+         :ok <- require_instance_name(value),
          :ok <- check_description(value),
          :ok <- require_image(value) do
       {:ok, value}
@@ -83,20 +83,29 @@ defmodule Dockd.Spec.Parser do
         :ok
 
       [key | _] ->
-        {:error, %Error{phase: :validate, message: "unknown package key: #{inspect(key)}"}}
+        {:error, %Error{phase: :validate, message: unknown_key_message(key)}}
     end
   end
 
-  defp require_name(map) do
-    case Map.get(map, "name") do
-      name when is_binary(name) and name !== "" ->
+  # The top-level `"name"` was renamed to `"instance_name"` — it names the
+  # container, not the package, and `"name"` still means an env entry's variable
+  # name elsewhere in the document. Point at the replacement rather than
+  # reporting a bare unknown key.
+  defp unknown_key_message("name"),
+    do: ~s(package JSON key "name" was renamed to "instance_name")
+
+  defp unknown_key_message(key), do: "unknown package key: #{inspect(key)}"
+
+  defp require_instance_name(map) do
+    case Map.get(map, "instance_name") do
+      instance_name when is_binary(instance_name) and instance_name !== "" ->
         :ok
 
       _ ->
         {:error,
          %Error{
            phase: :validate,
-           message: ~s(package JSON requires a non-empty string "name")
+           message: ~s(package JSON requires a non-empty string "instance_name")
          }}
     end
   end

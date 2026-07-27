@@ -17,6 +17,8 @@ defmodule Dockd.Packages do
       into the configured packages root.
     - `install_from_path/2` — the same copy step against a local directory,
       with no clone.
+    - `new/2` — scaffold a package's files (`package.json` + `Dockerfile`) from
+      caller options, so nobody has to hand-write them.
 
   Both installers share one implementation, so they agree on what counts as a
   package and on the `{:ok, [name]}` / `:fetch`-tagged-error contract.
@@ -30,8 +32,11 @@ defmodule Dockd.Packages do
 
   alias Dockd.Error
   alias Dockd.Spec
+  alias Dockd.Spec.Encoder
   alias Dockd.Spec.Normalizer
   alias Dockd.Spec.Parser
+
+  @package_filename "package.json"
 
   @doc """
   Resolves the reference passed to `Dockd.apply_package/2` into a path to a
@@ -197,6 +202,120 @@ defmodule Dockd.Packages do
   def install_from_path(dir, opts \\ []) when is_binary(dir) do
     dest_dir = Keyword.get(opts, :dest_dir, packages_root(opts))
     install_from_clone(dir, dest_dir)
+  end
+
+  @doc """
+  Scaffolds a new package into `dir`.
+
+  `dir` **is** the package directory — files are written directly into it, with
+  no path joining — so this works for a packages-root entry, a
+  `packages/<name>/` entry in a shareable set, or anywhere else.
+
+  Writes two files: `package.json` and a `Dockerfile` that the package always
+  references as its build. `:image` is therefore the tag the build produces,
+  and `:from` sets the Dockerfile's base image.
+
+  Only the keys you pass are emitted; omitted keys are absent from the
+  document.
+
+  Options:
+
+    - `:instance_name` — the container name the package creates. Defaults to
+      `dir`'s basename.
+    - `:image` — build tag. Defaults to `"dockd-<instance_name>:latest"`.
+    - `:from` — base image for the Dockerfile. Defaults to `"debian:trixie"`.
+    - `:dockerfile` — a complete Dockerfile body, used instead of `:from`.
+    - `:build` — extra Docker build keys merged over `{"dockerfile": "Dockerfile"}`.
+    - `:force` — replace an existing directory. Defaults to `false`.
+    - `:description`, `:shell`, `:env`, `:mounts`, `:repos`, `:copy`, `:steps`,
+      `:labels` — written through to the document.
+
+  The document is validated with the same parse-and-normalize pass that
+  `Dockd.apply_package/2` uses **before** anything is written, so a rejected
+  call never leaves a half-written package behind.
+
+  ## Examples
+
+      {:ok, %{instance_name: "greeter", files: files}} =
+        Dockd.Packages.new("./my-recipes/packages/greeter",
+          image: "dockd-greeter:1",
+          from: "busybox:1.37.0"
+        )
+  """
+  @spec new(Path.t(), keyword()) ::
+          {:ok,
+           %{
+             instance_name: binary(),
+             path: Path.t(),
+             files: [Path.t()],
+             overwrote?: boolean()
+           }}
+          | {:error, Error.t()}
+  def new(dir, opts \\ []) when is_binary(dir) and is_list(opts) do
+    instance_name = Keyword.get(opts, :instance_name) || Path.basename(Path.expand(dir))
+    opts = Keyword.put(opts, :instance_name, instance_name)
+    existed? = File.exists?(dir)
+
+    package_path = Path.join(dir, @package_filename)
+    dockerfile_path = Path.join(dir, Encoder.dockerfile_name())
+
+    with {:ok, document} <- Encoder.document(opts),
+         json = Encoder.encode(document),
+         :ok <- validate_document(json, dir),
+         :ok <- check_collision(dir, existed?, Keyword.get(opts, :force, false)),
+         :ok <- reset_dir(dir, existed?),
+         :ok <- write_file(package_path, json),
+         :ok <- write_file(dockerfile_path, Encoder.dockerfile(opts)) do
+      {:ok,
+       %{
+         instance_name: instance_name,
+         path: dir,
+         files: [package_path, dockerfile_path],
+         overwrote?: existed?
+       }}
+    end
+  end
+
+  # The generated document goes through the same gate every package passes on
+  # load, so the scaffolder can never emit something apply_package/2 rejects.
+  defp validate_document(json, dir) do
+    with {:ok, decoded} <- Parser.parse(json),
+         {:ok, _attrs} <- Normalizer.normalize(decoded, dir) do
+      :ok
+    end
+  end
+
+  defp check_collision(dir, true, false) do
+    {:error,
+     %Error{
+       phase: :generate,
+       message: "#{dir} already exists; pass force: true to replace it"
+     }}
+  end
+
+  defp check_collision(_dir, _existed?, _force?), do: :ok
+
+  defp reset_dir(dir, existed?) do
+    if existed?, do: File.rm_rf(dir)
+
+    case File.mkdir_p(dir) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        {:error,
+         Error.docker_phase_error(:generate, "could not create package dir #{dir}", reason, nil)}
+    end
+  end
+
+  defp write_file(path, body) do
+    case File.write(path, body) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        {:error, Error.docker_phase_error(:generate, "could not write #{path}", reason, nil)}
+    end
   end
 
   defp install_from_clone(clone_dir, dest_dir) do

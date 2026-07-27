@@ -1,5 +1,5 @@
 {
-  "name": "with_build",
+  "instance_name": "with_build",
   "image": "dockd-test:rel-build",
   "build": { "dockerfile": "../Dockerfile" }
 }

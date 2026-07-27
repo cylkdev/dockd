@@ -25,9 +25,9 @@ If you see connection errors, start Docker Desktop (Mac/Windows) or the Docker d
 ## Quick Start
 
 ```elixir
-# Create and start a container. :name is required.
+# Create and start a container. :instance_name is required.
 {:ok, %Dockd.ApplyResult{instance: instance}} =
-  Dockd.apply("debian:trixie", name: "scratch", shell: "/bin/bash")
+  Dockd.apply("debian:trixie", instance_name: "scratch", shell: "/bin/bash")
 
 # Run something in it.
 {:ok, %{output: output, exit_code: 0}} = Dockd.shell_command(instance, "uname -a")
@@ -49,11 +49,11 @@ your current terminal stays free.
 # Create a container, running setup steps before it's considered ready.
 {:ok, %Dockd.ApplyResult{instance: instance, step_results: steps}} =
   Dockd.apply("debian:trixie",
-    name: "builder",
+    instance_name: "builder",
     shell: "/bin/bash",
     steps: [
-      %{label: "update", cmd: ["apt-get", "update"]},
-      %{label: "install curl", cmd: ["apt-get", "install", "-y", "curl"]}
+      %{step_name: "update", cmd: ["apt-get", "update"]},
+      %{step_name: "install curl", cmd: ["apt-get", "install", "-y", "curl"]}
     ]
   )
 
@@ -92,7 +92,7 @@ fields (`Dockd.Spec.option_keys/0`).
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `:name` | **required** | Container name. Prefixed with `dockd-` if it isn't already. There is no auto-generated default -- omitting it is a `:validate` error |
+| `:instance_name` | **required** | Container name. Prefixed with `dockd-` if it isn't already. There is no auto-generated default -- omitting it is a `:validate` error |
 | `:shell` | `"/bin/sh"` | Shell to use inside the container |
 | `:description` | `nil` | Free-text description, stored on the spec |
 | `:steps` | `[]` | Commands to run inside the container before it's ready |
@@ -103,10 +103,10 @@ fields (`Dockd.Spec.option_keys/0`).
 | `:labels` | `%{}` | Extra container labels, merged with the labels dockd manages |
 | `:build` | `nil` | Build the image locally from a `%{dockerfile:, context:, args:, ...}` map instead of pulling |
 
-Each setup step is a map with a `:label` and a `:cmd` (list of strings):
+Each setup step is a map with a `:step_name` and a `:cmd` (list of strings):
 
 ```elixir
-%{label: "install git", cmd: ["apt-get", "install", "-y", "git"]}
+%{step_name: "install git", cmd: ["apt-get", "install", "-y", "git"]}
 ```
 
 In the Elixir API, each `:env` entry is one of:
@@ -152,7 +152,7 @@ Save this as `hello.json`:
 
 ```json
 {
-  "name": "hello",
+  "instance_name": "hello",
   "image": "busybox:1.37.0",
   "shell": "/bin/sh"
 }
@@ -171,7 +171,7 @@ Dockd.destroy(instance)
 ```
 
 That's the whole contract. The package's keys mirror the instance options
-accepted by `Dockd.apply/2`, with `"image"` and `"name"` both required. You only
+accepted by `Dockd.apply/2`, with `"image"` and `"instance_name"` both required. You only
 specify what you need; everything else falls back to the same defaults
 `Dockd.apply/2` uses.
 
@@ -182,7 +182,7 @@ permissions, and runs an install step before handing you a shell:
 
 ```json
 {
-  "name": "python-dev",
+  "instance_name": "python-dev",
   "image": "python:3.12-slim",
   "shell": "/bin/bash",
   "env": [{"name": "GITHUB_TOKEN"}],
@@ -202,7 +202,7 @@ permissions, and runs an install step before handing you a shell:
     }
   ],
   "steps": [
-    {"label": "install", "cmd": ["pip", "install", "-e", "/instance/requests"]}
+    {"step_name": "install", "cmd": ["pip", "install", "-e", "/instance/requests"]}
   ]
 }
 ```
@@ -216,10 +216,15 @@ Run it the same way:
 
 ### Field reference
 
-The valid keys are `name`, `description`, `image`, `shell`, `steps`, `build`,
-`repos`, `copy`, `env`, `mounts`, and `labels`. `"name"` and `"image"` are
-required; the rest are optional. Unknown keys are rejected with a `:validate`
-error so typos are caught early.
+The valid keys are `instance_name`, `description`, `image`, `shell`, `steps`,
+`build`, `repos`, `copy`, `env`, `mounts`, and `labels`. `"instance_name"` and
+`"image"` are required; the rest are optional. Unknown keys are rejected with a
+`:validate` error so typos are caught early.
+
+Three different things are called a name in a package, so they carry distinct
+keys: `"instance_name"` at the top level names the container, `"step_name"`
+names a setup step, and `"name"` inside an `env` entry is the environment
+variable's own name.
 
 #### `image` (string, required)
 
@@ -257,12 +262,16 @@ completion and exit. **Omit it and an image like `busybox` exits immediately**,
 so later `shell_command/3` calls fail with a Docker 409 ("container is not
 running"). Set `"shell"` for any instance you intend to keep around.
 
-#### `name` (string, required)
+#### `instance_name` (string, required)
 
-Container name, prefixed with `dockd-` if it isn't already. There is no
-auto-generated default - a package without a non-empty `"name"` is rejected
-with a `:validate` error. Because the name is fixed by the package, applying the
-same package twice concurrently will collide.
+The container's name, prefixed with `dockd-` if it isn't already. There is no
+auto-generated default - a package without a non-empty `"instance_name"` is
+rejected with a `:validate` error. Because the name is fixed by the package,
+applying the same package twice concurrently will collide.
+
+This is *not* the package's identity: a package is identified by its directory
+name, which is what `Dockd.apply_package("greeter")` resolves. The two are
+independent, though scaffolding defaults them to the same value.
 
 #### `env` (list)
 
@@ -376,7 +385,7 @@ the instance is considered ready. Each step is a map:
 
 | Key | Required | Description |
 |-----|----------|-------------|
-| `label` | yes | Human-readable name shown in errors and `step_results` |
+| `step_name` | yes | Human-readable name shown in errors and `step_results` |
 | `cmd` | yes | Argv list (e.g. `["npm", "install"]`) - never a single string |
 | `env` | no | Per-step env entries, on top of the container's env |
 | `workdir` | no | Working directory for this step |
@@ -388,8 +397,8 @@ captured output and exit code. Earlier steps' results are preserved in
 
 ```json
 "steps": [
-  {"label": "install deps", "cmd": ["npm", "install"], "workdir": "/instance"},
-  {"label": "run migrations", "cmd": ["npx", "prisma", "migrate", "deploy"]}
+  {"step_name": "install deps", "cmd": ["npm", "install"], "workdir": "/instance"},
+  {"step_name": "run migrations", "cmd": ["npx", "prisma", "migrate", "deploy"]}
 ]
 ```
 
@@ -457,7 +466,7 @@ substituted from your shell's environment:
 
 ```json
 {
-  "name": "node-app",
+  "instance_name": "node-app",
   "image": "node:20-slim",
   "mounts": ["${PWD}:/instance"],
   "env": [{"name": "LOG_LEVEL", "value": "${LOG_LEVEL:-info}"}]
@@ -513,6 +522,74 @@ Dockd.list_packages()
 Each entry's `:spec` is itself a result tuple, so one malformed `package.json`
 reports its own parse error instead of hiding the rest.
 
+### Scaffolding a package
+
+You don't have to write those files by hand. `Dockd.new_package/2` writes them
+for you. The path you pass **is** the package directory:
+
+```elixir
+{:ok, %{instance_name: "greeter", files: files}} =
+  Dockd.new_package("./my-recipes/packages/greeter",
+    image: "dockd-greeter:1",
+    from: "busybox:1.37.0",
+    shell: "/bin/sh",
+    env: [{"API_KEY", optional: true}],
+    steps: [%{step_name: "verify", cmd: ["sh", "-c", "test -f /etc/greeting"]}]
+  )
+```
+
+That writes `package.json` and a `Dockerfile`. Every scaffolded package builds
+its own image, so `image` is the tag the build produces and `from` is the
+Dockerfile's base image. Only the keys you pass are written - there is nothing
+to delete afterwards:
+
+```json
+{
+  "instance_name": "greeter",
+  "image": "dockd-greeter:1",
+  "shell": "/bin/sh",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "env": [
+    {
+      "name": "API_KEY",
+      "optional": true
+    }
+  ],
+  "steps": [
+    {
+      "step_name": "verify",
+      "cmd": ["sh", "-c", "test -f /etc/greeting"]
+    }
+  ]
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `:instance_name` | directory basename | Container name the package creates |
+| `:image` | `dockd-<instance_name>:latest` | Tag the build produces |
+| `:from` | `debian:trixie` | Base image for the generated Dockerfile |
+| `:dockerfile` | - | A complete Dockerfile body, instead of `:from` |
+| `:build` | `{}` | Extra build keys merged over `{"dockerfile": "Dockerfile"}` |
+| `:force` | `false` | Replace an existing directory |
+
+`:description`, `:shell`, `:env`, `:mounts`, `:repos`, `:copy`, `:steps` and
+`:labels` are written straight through. `env` accepts the Elixir shapes and is
+translated into the JSON object form for you.
+
+Scaffolding refuses to touch an existing directory unless you pass
+`force: true`, and validates the document before writing anything - an invalid
+call leaves nothing behind. Relative `build` paths resolve against the package
+directory, so the result keeps working after `install_packages/2` copies it
+elsewhere:
+
+```elixir
+{:ok, ["greeter"]} = Dockd.install_packages("./my-recipes")
+{:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("greeter")
+```
+
 To add your own installed package by hand, place a directory at
 `<packages_root>/<name>/` containing `package.json` and any referenced support
 files, then call `Dockd.apply_package("name")`.
@@ -533,7 +610,7 @@ my-recipes/
 
 ```json
 {
-  "name": "greeter",
+  "instance_name": "greeter",
   "description": "busybox with a baked-in greeting",
   "image": "dockd-greeter:1",
   "shell": "/bin/sh",
@@ -542,7 +619,7 @@ my-recipes/
     "args": {"GREETING": "hello"}
   },
   "steps": [
-    {"label": "verify", "cmd": ["sh", "-c", "test -f /etc/greeting"]}
+    {"step_name": "verify", "cmd": ["sh", "-c", "test -f /etc/greeting"]}
   ]
 }
 ```
@@ -579,6 +656,7 @@ where things went wrong:
 | Phase | Cause |
 |-------|-------|
 | `:validate` | Bad JSON, unknown key, missing `image`, missing env var, malformed step/repo/copy |
+| `:generate` | Scaffolding failed - target directory exists, or a file could not be written |
 | `:pull` | Registry pull failed |
 | `:build` | `docker build` failed |
 | `:create`, `:start` | Docker daemon refused the container |

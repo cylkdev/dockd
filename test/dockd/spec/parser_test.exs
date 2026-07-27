@@ -5,14 +5,14 @@ defmodule Dockd.Spec.ParserTest do
 
   describe "parse/1" do
     test "decodes a valid object" do
-      json = ~s({"name": "demo", "image": "node:20", "shell": "bash"})
+      json = ~s({"instance_name": "demo", "image": "node:20", "shell": "bash"})
 
-      assert {:ok, %{"name" => "demo", "image" => "node:20", "shell" => "bash"}} =
+      assert {:ok, %{"instance_name" => "demo", "image" => "node:20", "shell" => "bash"}} =
                Parser.parse(json)
     end
 
     test "accepts an optional description" do
-      json = ~s({"name": "demo", "description": "a demo", "image": "node:20"})
+      json = ~s({"instance_name": "demo", "description": "a demo", "image": "node:20"})
 
       assert {:ok, decoded} = Parser.parse(json)
       assert decoded["description"] === "a demo"
@@ -20,10 +20,10 @@ defmodule Dockd.Spec.ParserTest do
 
     test "leaves nested values untouched" do
       json =
-        ~s({"name": "demo", "image": "x", "steps": [{"label": "hi", "cmd": ["echo", "hi"]}]})
+        ~s({"instance_name": "demo", "image": "x", "steps": [{"step_name": "hi", "cmd": ["echo", "hi"]}]})
 
       assert {:ok, decoded} = Parser.parse(json)
-      assert decoded["steps"] === [%{"label" => "hi", "cmd" => ["echo", "hi"]}]
+      assert decoded["steps"] === [%{"step_name" => "hi", "cmd" => ["echo", "hi"]}]
     end
 
     test "errors on invalid JSON" do
@@ -39,33 +39,47 @@ defmodule Dockd.Spec.ParserTest do
     end
 
     test "errors on unknown top-level key" do
-      json = ~s({"name": "demo", "image": "x", "bogus": true})
+      json = ~s({"instance_name": "demo", "image": "x", "bogus": true})
 
       assert {:error, error} = Parser.parse(json)
       assert error.phase === :validate
       assert error.message =~ "unknown package key"
     end
 
-    test "errors when name is missing" do
+    test "errors when instance_name is missing" do
       assert {:error, error} = Parser.parse(~s({"image": "x"}))
       assert error.phase === :validate
-      assert error.message =~ ~s(non-empty string "name")
+      assert error.message =~ ~s(non-empty string "instance_name")
     end
 
-    test "errors when name is empty" do
-      assert {:error, error} = Parser.parse(~s({"name": "", "image": "x"}))
+    test "names the replacement when a package still uses the old \"name\" key" do
+      assert {:error, error} = Parser.parse(~s({"name": "demo", "image": "x"}))
       assert error.phase === :validate
-      assert error.message =~ ~s(non-empty string "name")
+      assert error.message =~ ~s(key "name" was renamed to "instance_name")
     end
 
-    test "errors when name is not a string" do
-      assert {:error, error} = Parser.parse(~s({"name": 42, "image": "x"}))
+    test "leaves an env entry's own \"name\" alone" do
+      json =
+        ~s({"instance_name": "demo", "image": "x", "env": [{"name": "FOO", "optional": true}]})
+
+      assert {:ok, decoded} = Parser.parse(json)
+      assert decoded["env"] === [%{"name" => "FOO", "optional" => true}]
+    end
+
+    test "errors when instance_name is empty" do
+      assert {:error, error} = Parser.parse(~s({"instance_name": "", "image": "x"}))
       assert error.phase === :validate
-      assert error.message =~ ~s(non-empty string "name")
+      assert error.message =~ ~s(non-empty string "instance_name")
+    end
+
+    test "errors when instance_name is not a string" do
+      assert {:error, error} = Parser.parse(~s({"instance_name": 42, "image": "x"}))
+      assert error.phase === :validate
+      assert error.message =~ ~s(non-empty string "instance_name")
     end
 
     test "errors when description is not a string" do
-      json = ~s({"name": "demo", "description": 7, "image": "x"})
+      json = ~s({"instance_name": "demo", "description": 7, "image": "x"})
 
       assert {:error, error} = Parser.parse(json)
       assert error.phase === :validate
@@ -73,13 +87,13 @@ defmodule Dockd.Spec.ParserTest do
     end
 
     test "errors when image is missing" do
-      assert {:error, error} = Parser.parse(~s({"name": "demo", "shell": "/bin/sh"}))
+      assert {:error, error} = Parser.parse(~s({"instance_name": "demo", "shell": "/bin/sh"}))
       assert error.phase === :validate
       assert error.message =~ ~s(missing required key: "image")
     end
 
     test "errors when image is not a string" do
-      assert {:error, error} = Parser.parse(~s({"name": "demo", "image": 42}))
+      assert {:error, error} = Parser.parse(~s({"instance_name": "demo", "image": 42}))
       assert error.phase === :validate
       assert error.message =~ ~s("image" must be a string)
     end
@@ -90,10 +104,10 @@ defmodule Dockd.Spec.ParserTest do
       path =
         Path.join(System.tmp_dir!(), "dockd-source-#{System.unique_integer([:positive])}.json")
 
-      File.write!(path, ~s({"name": "x", "image": "busybox"}))
+      File.write!(path, ~s({"instance_name": "x", "image": "busybox"}))
       on_exit(fn -> File.rm(path) end)
 
-      assert {:ok, %{"name" => "x", "image" => "busybox"}} = Parser.parse_file(path)
+      assert {:ok, %{"instance_name" => "x", "image" => "busybox"}} = Parser.parse_file(path)
     end
 
     test "wraps a missing file into a :validate-phase Dockd.Error" do

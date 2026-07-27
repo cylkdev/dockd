@@ -75,6 +75,7 @@ defmodule Dockd do
 
     - `install_packages/2` — install a package set from a git repository or a
       local directory.
+    - `new_package/2` — scaffold a new package's files on disk.
     - `list_packages/1` — enumerate installed packages.
 
   ## Packages
@@ -207,8 +208,8 @@ defmodule Dockd do
     - an image string plus a keyword list of spec options (the Elixir-native
       shape; equivalent to calling `Dockd.Spec.from_opts/2` first)
 
-  A `:name` is always required — there is no auto-generated container name.
-  Calling `apply/2` with an image string and no `:name` returns a `:validate`
+  An `:instance_name` is always required — there is no auto-generated container name.
+  Calling `apply/2` with an image string and no `:instance_name` returns a `:validate`
   error.
 
   Per-call options (Docker connection settings and `:disk_mount_enabled`)
@@ -222,32 +223,32 @@ defmodule Dockd do
       # Image plus spec options.
       {:ok, %Dockd.ApplyResult{instance: instance}} =
         Dockd.apply("busybox:1.37.0",
-          name: "smoke",
+          instance_name: "smoke",
           shell: "/bin/sh",
           env: ["FOO=bar"],
-          steps: [%{label: "workdir", cmd: ["mkdir", "-p", "/work"]}]
+          steps: [%{step_name: "workdir", cmd: ["mkdir", "-p", "/work"]}]
         )
 
-      # :name is required.
+      # :instance_name is required.
       {:error, %Dockd.Error{phase: :validate}} = Dockd.apply("busybox:1.37.0")
 
       # Spec options and per-call options share one flat keyword list.
       {:ok, result} =
         Dockd.apply("busybox:1.37.0",
-          name: "smoke",
+          instance_name: "smoke",
           shell: "/bin/sh",
           socket: "/var/run/docker.sock"
         )
 
       # A pre-built %Dockd.Spec{} struct — opts is the per-call options list.
-      spec = Dockd.Spec.from_opts("busybox:1.37.0", name: "smoke", shell: "/bin/sh")
+      spec = Dockd.Spec.from_opts("busybox:1.37.0", instance_name: "smoke", shell: "/bin/sh")
       {:ok, result} = Dockd.apply(spec, socket: "/var/run/docker.sock")
 
       # Failure path: the error may carry the partially-created instance so
       # the caller can clean up.
-      steps = [%{label: "fail", cmd: ["sh", "-c", "exit 1"]}]
+      steps = [%{step_name: "fail", cmd: ["sh", "-c", "exit 1"]}]
 
-      case Dockd.apply("busybox:1.37.0", name: "smoke", steps: steps) do
+      case Dockd.apply("busybox:1.37.0", instance_name: "smoke", steps: steps) do
         {:ok, %Dockd.ApplyResult{instance: instance}} ->
           instance
 
@@ -269,7 +270,7 @@ defmodule Dockd do
     {spec_opts, call_opts} = Keyword.split(opts, Spec.option_keys())
 
     with :ok <- check_call_opts(call_opts),
-         :ok <- check_spec_name(spec_opts) do
+         :ok <- check_spec_instance_name(spec_opts) do
       spec = Spec.from_opts(image, spec_opts)
       Provisioner.run(spec, call_opts)
     end
@@ -352,6 +353,49 @@ defmodule Dockd do
     else
       Packages.install_from_git(ref, opts)
     end
+  end
+
+  @doc """
+  Scaffolds a new package into `dir`, so you never have to hand-write
+  `package.json` and `Dockerfile`.
+
+  `dir` **is** the package directory. The generated package always builds its
+  own image from the generated `Dockerfile`, so `:image` is the tag that build
+  produces and `:from` is the Dockerfile's base image.
+
+  Only the keys you pass are written. Refuses to touch an existing directory
+  unless `force: true`, and validates before writing anything — a rejected call
+  leaves nothing behind. See `Dockd.Packages.new/2` for the full option list.
+
+  ## Examples
+
+      # Minimal — instance name from the directory, image defaults to
+      # dockd-greeter:latest, Dockerfile defaults to FROM debian:trixie.
+      {:ok, %{files: _}} = Dockd.new_package("./greeter")
+
+      # Into a shareable package set, ready for install_packages/2.
+      {:ok, %{instance_name: "greeter"}} =
+        Dockd.new_package("./my-recipes/packages/greeter",
+          image: "dockd-greeter:1",
+          from: "busybox:1.37.0",
+          shell: "/bin/sh",
+          env: [{"API_KEY", optional: true}],
+          steps: [%{step_name: "verify", cmd: ["sh", "-c", "test -f /etc/greeting"]}]
+        )
+
+      {:ok, ["greeter"]} = Dockd.install_packages("./my-recipes")
+  """
+  @spec new_package(Path.t(), keyword()) ::
+          {:ok,
+           %{
+             instance_name: binary(),
+             path: Path.t(),
+             files: [Path.t()],
+             overwrote?: boolean()
+           }}
+          | {:error, Error.t()}
+  def new_package(dir, opts \\ []) when is_binary(dir) and is_list(opts) do
+    Packages.new(dir, opts)
   end
 
   @doc """
@@ -468,7 +512,7 @@ defmodule Dockd do
 
       # By instance struct (typical when you've just created it).
       {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply("busybox:1.37.0", name: "smoke")
+        Dockd.apply("busybox:1.37.0", instance_name: "smoke")
 
       :ok = Dockd.destroy(instance)
 
@@ -668,7 +712,7 @@ defmodule Dockd do
   ## Examples
 
       {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply("busybox:1.37.0", name: "smoke", shell: "/bin/sh")
+        Dockd.apply("busybox:1.37.0", instance_name: "smoke", shell: "/bin/sh")
 
       # String form — invoked through the instance's configured shell.
       # `:output` is stdout and stderr combined into one binary.
@@ -967,19 +1011,19 @@ defmodule Dockd do
     end
   end
 
-  defp check_spec_name(spec_opts) do
-    case Keyword.get(spec_opts, :name) do
+  defp check_spec_instance_name(spec_opts) do
+    case Keyword.get(spec_opts, :instance_name) do
       name when is_binary(name) and name !== "" ->
         :ok
 
       _ ->
         {:error,
-         %Error{phase: :validate, message: "Dockd.apply/2 requires a non-empty :name option"}}
+         %Error{phase: :validate, message: "Dockd.apply/2 requires a non-empty :instance_name option"}}
     end
   end
 
-  defp check_attrs_name(attrs) do
-    case Map.get(attrs, :name) do
+  defp check_attrs_instance_name(attrs) do
+    case Map.get(attrs, :instance_name) do
       name when is_binary(name) and name !== "" ->
         :ok
 
@@ -987,7 +1031,7 @@ defmodule Dockd do
         {:error,
          %Error{
            phase: :validate,
-           message: ~s(package is missing a non-empty "name" field)
+           message: ~s(package is missing a non-empty "instance_name" field)
          }}
     end
   end
@@ -996,7 +1040,7 @@ defmodule Dockd do
     with {:ok, decoded} <- Parser.parse_file(path),
          {:ok, substituted} <- Interpolator.substitute(decoded, System.get_env()),
          {:ok, attrs} <- Normalizer.normalize(substituted, Path.dirname(path)),
-         :ok <- check_attrs_name(attrs) do
+         :ok <- check_attrs_instance_name(attrs) do
       {:ok, Spec.from_attrs(attrs)}
     end
   end

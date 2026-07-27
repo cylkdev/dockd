@@ -3,13 +3,13 @@ defmodule Dockd.StepResult do
   The captured outcome of a single setup step that ran inside a Dockd container.
 
   Each step from a `Dockd.apply/2` `:steps` list produces one of these in
-  `Dockd.ApplyResult.step_results`, in input order. Together with the step's `:label` and
+  `Dockd.ApplyResult.step_results`, in input order. Together with the step's `:step_name` and
   `:cmd`, the struct preserves the env/workdir/user the step ran with, the captured
   combined stdout+stderr, and the process exit code.
 
   ## Responsibilities
 
-    - Pair a step's input identity (label, cmd, env, workdir, user) with its run-time
+    - Pair a step's input identity (step_name, cmd, env, workdir, user) with its run-time
       outcome (output, exit_code) so callers can correlate a result back to its spec
     - Preserve the original `cmd` argv list as binaries for replay or diagnostic display
     - Distinguish "ran and exited 0" from "ran and exited non-zero" via `exit_code`,
@@ -17,14 +17,14 @@ defmodule Dockd.StepResult do
 
   ## Examples
 
-      iex> %Dockd.StepResult{label: "ok", cmd: ["true"], output: "", exit_code: 0}.exit_code
+      iex> %Dockd.StepResult{step_name: "ok", cmd: ["true"], output: "", exit_code: 0}.exit_code
       0
 
   """
 
   # Abstraction Function:
   #   A %Dockd.StepResult{} represents one completed setup step in a Dockd instance.
-  #     - label: the human-readable name the step was given in the spec.
+  #     - step_name: the human-readable name the step was given in the spec.
   #     - cmd: the argv list that was exec'd inside the container.
   #     - output: the combined stdout+stderr captured from the exec.
   #     - exit_code: the integer status the command exited with, or nil if Docker did
@@ -32,11 +32,11 @@ defmodule Dockd.StepResult do
   #     - env / workdir / user: the per-step exec options the step ran with, copied from
   #       the spec; nil when the spec did not set them.
   #   Base case: %Dockd.StepResult{} with all fields nil/empty has no meaningful
-  #   interpretation - every materialized step result has at least :label, :cmd, and
+  #   interpretation - every materialized step result has at least :step_name, :cmd, and
   #   :output populated.
   #
   # Data Invariant:
-  #   1. :label is a non-empty binary - always populated when the step ran.
+  #   1. :step_name is a non-empty binary - always populated when the step ran.
   #   2. :cmd is a non-empty list of binaries - the argv that was exec'd.
   #   3. :output is a binary (possibly empty), never nil - the capture is always defined.
   #   4. :exit_code is either an integer or nil; never a binary or other type.
@@ -44,7 +44,7 @@ defmodule Dockd.StepResult do
   #      are binaries.
 
   @type t :: %__MODULE__{
-          label: binary(),
+          step_name: binary(),
           cmd: [binary()],
           output: binary(),
           exit_code: integer() | nil,
@@ -53,5 +53,5 @@ defmodule Dockd.StepResult do
           user: binary() | nil
         }
 
-  defstruct [:label, :cmd, :output, :exit_code, :env, :workdir, :user]
+  defstruct [:step_name, :cmd, :output, :exit_code, :env, :workdir, :user]
 end

@@ -71,7 +71,7 @@ defmodule Dockd.PackagesTest do
   describe "list/0" do
     test "lists every installed package with its parsed spec" do
       root = sandbox_dir("dockd-list-root")
-      add_installed_package(root, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+      add_installed_package(root, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
 
       results = Packages.list(packages_path: root)
       assert is_list(results)
@@ -90,7 +90,7 @@ defmodule Dockd.PackagesTest do
       add_installed_package(
         root,
         "env",
-        ~s({"name": "env", "image": "busybox:1.37.0", "mounts": ["${DOCKD_TEST_UNSET}:/x"]})
+        ~s({"instance_name": "env", "image": "busybox:1.37.0", "mounts": ["${DOCKD_TEST_UNSET}:/x"]})
       )
 
       results = Packages.list(packages_path: root)
@@ -123,9 +123,9 @@ defmodule Dockd.PackagesTest do
       repo = make_repo()
       dest = sandbox_dir("dockd-install-dest")
 
-      add_package(repo, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+      add_package(repo, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
 
-      add_package(repo, "beta", ~s({"name": "beta", "image": "busybox:1.37.0"}),
+      add_package(repo, "beta", ~s({"instance_name": "beta", "image": "busybox:1.37.0"}),
         dockerfile: "FROM busybox\n"
       )
 
@@ -150,7 +150,7 @@ defmodule Dockd.PackagesTest do
       File.mkdir_p!(Path.join(dest, "alpha"))
       File.write!(Path.join([dest, "alpha", "stale.txt"]), "leftover")
 
-      add_package(repo, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+      add_package(repo, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
       git_commit(repo, "add alpha")
 
       assert {:ok, ["alpha"]} =
@@ -204,9 +204,9 @@ defmodule Dockd.PackagesTest do
       src = sandbox_dir("dockd-local-src")
       dest = sandbox_dir("dockd-local-dest")
 
-      add_package(src, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+      add_package(src, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
 
-      add_package(src, "beta", ~s({"name": "beta", "image": "busybox:1.37.0"}),
+      add_package(src, "beta", ~s({"instance_name": "beta", "image": "busybox:1.37.0"}),
         dockerfile: "FROM busybox\n"
       )
 
@@ -233,7 +233,7 @@ defmodule Dockd.PackagesTest do
       src = sandbox_dir("dockd-dispatch-local")
       dest = sandbox_dir("dockd-dispatch-local-dest")
 
-      add_package(src, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+      add_package(src, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
 
       assert {:ok, ["alpha"]} = Dockd.install_packages(src, dest_dir: dest)
       assert File.exists?(Path.join([dest, "alpha", "package.json"]))
@@ -245,7 +245,7 @@ defmodule Dockd.PackagesTest do
         repo = make_repo()
         dest = sandbox_dir("dockd-dispatch-git-dest")
 
-        add_package(repo, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+        add_package(repo, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
         git_commit(repo, "add alpha")
 
         assert {:ok, ["alpha"]} =
@@ -271,7 +271,7 @@ defmodule Dockd.PackagesTest do
       src = sandbox_dir("dockd-list-src")
       root = sandbox_dir("dockd-list-root")
 
-      add_package(src, "alpha", ~s({"name": "alpha", "image": "busybox:1.37.0"}))
+      add_package(src, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
       assert {:ok, ["alpha"]} = Dockd.install_packages(src, dest_dir: root)
 
       assert [%{name: "alpha", path: path, spec: {:ok, spec}}] =
@@ -283,6 +283,101 @@ defmodule Dockd.PackagesTest do
 
     test "returns [] when the packages root does not exist" do
       assert Dockd.list_packages(packages_path: sandbox_dir("dockd-list-missing")) === []
+    end
+  end
+
+  describe "Dockd.new_package/2" do
+    test "writes package.json and Dockerfile into the given directory" do
+      dir = Path.join(sandbox_dir("dockd-new-pkg"), "greeter")
+
+      assert {:ok, result} = Dockd.new_package(dir, from: "busybox:1.37.0")
+
+      assert result.instance_name === "greeter"
+      assert result.path === dir
+      refute result.overwrote?
+
+      assert result.files === [
+               Path.join(dir, "package.json"),
+               Path.join(dir, "Dockerfile")
+             ]
+
+      assert File.read!(Path.join(dir, "Dockerfile")) === "FROM busybox:1.37.0\n"
+    end
+
+    test "the generated package parses as a Spec" do
+      dir = Path.join(sandbox_dir("dockd-new-parse"), "greeter")
+      assert {:ok, _} = Dockd.new_package(dir, image: "dockd-greeter:1")
+
+      root = Path.dirname(dir)
+
+      assert [%{name: "greeter", spec: {:ok, spec}}] =
+               Dockd.list_packages(packages_path: root)
+
+      assert spec.image === "dockd-greeter:1"
+      assert spec.instance_name === "dockd-greeter"
+      assert spec.build === %{dockerfile: Path.join(dir, "Dockerfile")}
+    end
+
+    test "defaults the instance name to the directory basename" do
+      dir = Path.join(sandbox_dir("dockd-new-basename"), "webapp")
+      assert {:ok, %{instance_name: "webapp"}} = Dockd.new_package(dir)
+
+      decoded = JSON.decode!(File.read!(Path.join(dir, "package.json")))
+      assert decoded["instance_name"] === "webapp"
+      assert decoded["image"] === "dockd-webapp:latest"
+    end
+
+    test "writes a package.json a human can edit" do
+      dir = Path.join(sandbox_dir("dockd-new-pretty"), "greeter")
+      assert {:ok, _} = Dockd.new_package(dir)
+
+      body = File.read!(Path.join(dir, "package.json"))
+
+      assert body =~ ~s(  "instance_name": "greeter")
+      assert length(String.split(body, "\n")) > 3
+    end
+
+    test "refuses to overwrite an existing directory without :force" do
+      dir = Path.join(sandbox_dir("dockd-new-collide"), "greeter")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "keep.txt"), "mine")
+
+      assert {:error, err} = Dockd.new_package(dir)
+
+      assert err.phase === :generate
+      assert err.message =~ "already exists"
+      assert File.read!(Path.join(dir, "keep.txt")) === "mine"
+      refute File.exists?(Path.join(dir, "package.json"))
+    end
+
+    test "replaces an existing directory with force: true" do
+      dir = Path.join(sandbox_dir("dockd-new-force"), "greeter")
+      File.mkdir_p!(dir)
+      File.write!(Path.join(dir, "stale.txt"), "old")
+
+      assert {:ok, %{overwrote?: true}} = Dockd.new_package(dir, force: true)
+
+      refute File.exists?(Path.join(dir, "stale.txt"))
+      assert File.exists?(Path.join(dir, "package.json"))
+    end
+
+    test "writes nothing when the options are invalid" do
+      dir = Path.join(sandbox_dir("dockd-new-invalid"), "greeter")
+
+      assert {:error, err} =
+               Dockd.new_package(dir, env: [{"FOO", value: "a", optional: true}])
+
+      assert err.phase === :validate
+      refute File.exists?(dir)
+    end
+
+    test "writes nothing when the instance name is unusable" do
+      dir = Path.join(sandbox_dir("dockd-new-badname"), "not a name")
+
+      assert {:error, err} = Dockd.new_package(dir)
+
+      assert err.phase === :validate
+      refute File.exists?(dir)
     end
   end
 

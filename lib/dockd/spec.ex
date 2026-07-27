@@ -30,7 +30,7 @@ defmodule Dockd.Spec do
   @type env_entry :: binary() | {binary(), keyword()}
 
   @type t :: %__MODULE__{
-          name: binary() | nil,
+          instance_name: binary() | nil,
           description: binary() | nil,
           image: binary() | nil,
           shell: binary() | nil,
@@ -44,7 +44,7 @@ defmodule Dockd.Spec do
         }
 
   defstruct [
-    :name,
+    :instance_name,
     :description,
     :image,
     :shell,
@@ -60,7 +60,7 @@ defmodule Dockd.Spec do
   @container_name_prefix "dockd-"
 
   @spec_opts [
-    :name,
+    :instance_name,
     :description,
     :shell,
     :steps,
@@ -79,24 +79,24 @@ defmodule Dockd.Spec do
   @doc """
   Builds a `Spec` from an image string and a keyword list of options.
 
-  `:name` is required. The user-supplied value is prefixed with `dockd-`
-  if it isn't already. Raises `ArgumentError` when `:name` is missing or
-  not a non-empty binary.
+  `:instance_name` is required — it becomes the container's name. The
+  user-supplied value is prefixed with `dockd-` if it isn't already. Raises
+  `ArgumentError` when `:instance_name` is missing or not a non-empty binary.
   """
   @spec from_opts(binary(), keyword()) :: t()
   def from_opts(image, opts \\ []) when is_binary(image) and is_list(opts) do
-    name =
-      case Keyword.get(opts, :name) do
+    instance_name =
+      case Keyword.get(opts, :instance_name) do
         provided when is_binary(provided) and provided !== "" ->
           prefix_name(provided)
 
         other ->
           raise ArgumentError,
-                "Dockd.Spec requires a non-empty binary :name, got: #{inspect(other)}"
+                "Dockd.Spec requires a non-empty binary :instance_name, got: #{inspect(other)}"
       end
 
     %__MODULE__{
-      name: name,
+      instance_name: instance_name,
       description: Keyword.get(opts, :description),
       image: image,
       shell: Keyword.get(opts, :shell),

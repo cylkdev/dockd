@@ -8,7 +8,7 @@ defmodule Dockd.EnvTest do
       System.delete_env("DOCKD_DEFINITELY_UNSET")
 
       assert {:error, %Error{phase: :validate, message: msg}} =
-               Dockd.apply("any-image", env: ["DOCKD_DEFINITELY_UNSET"], name: unique_name())
+               Dockd.apply("any-image", env: ["DOCKD_DEFINITELY_UNSET"], instance_name: unique_name())
 
       assert msg =~ "DOCKD_DEFINITELY_UNSET"
       assert msg =~ "unset host var"
@@ -16,14 +16,14 @@ defmodule Dockd.EnvTest do
 
     test "rejects non-string, non-tuple entries with a clear error" do
       assert {:error, %Error{phase: :validate, message: msg}} =
-               Dockd.apply("any-image", env: [:not_a_string], name: unique_name())
+               Dockd.apply("any-image", env: [:not_a_string], instance_name: unique_name())
 
       assert msg =~ ":env entries must be strings or"
     end
 
     test "rejects a non-list :env" do
       assert {:error, %Error{phase: :validate, message: msg}} =
-               Dockd.apply("any-image", env: "FOO", name: unique_name())
+               Dockd.apply("any-image", env: "FOO", instance_name: unique_name())
 
       assert msg =~ ":env must be a list"
     end
@@ -34,7 +34,7 @@ defmodule Dockd.EnvTest do
       assert {:error, %Error{phase: phase}} =
                Dockd.apply("definitely-not-an-image",
                  env: [{"DOCKD_TEST_FALLBACK", default: "fallback"}],
-                 name: unique_name()
+                 instance_name: unique_name()
                )
 
       refute phase === :validate
@@ -42,7 +42,7 @@ defmodule Dockd.EnvTest do
 
     test "rejects :inherit_env (removed) at the unknown-option check" do
       assert {:error, %Error{phase: :validate, message: msg}} =
-               Dockd.apply("any-image", inherit_env: ["FOO"], name: unique_name())
+               Dockd.apply("any-image", inherit_env: ["FOO"], instance_name: unique_name())
 
       assert msg =~ "unknown option"
       assert msg =~ ":inherit_env"
@@ -54,7 +54,7 @@ defmodule Dockd.EnvTest do
       assert {:error, %Error{phase: phase}} =
                Dockd.apply("definitely-not-an-image",
                  env: [{"DOCKD_TEST_VALUE_SHAPE", value: "literal"}],
-                 name: unique_name()
+                 instance_name: unique_name()
                )
 
       refute phase === :validate
@@ -66,7 +66,7 @@ defmodule Dockd.EnvTest do
       assert {:error, %Error{phase: phase}} =
                Dockd.apply("definitely-not-an-image",
                  env: [{"DOCKD_TEST_OPTIONAL", optional: true}],
-                 name: unique_name()
+                 instance_name: unique_name()
                )
 
       refute phase === :validate
@@ -79,7 +79,7 @@ defmodule Dockd.EnvTest do
       assert {:error, %Error{phase: phase}} =
                Dockd.apply("definitely-not-an-image",
                  env: ["DOCKD_TEST_BARE_OK", "LITERAL=value"],
-                 name: unique_name()
+                 instance_name: unique_name()
                )
 
       refute phase === :validate
@@ -89,7 +89,7 @@ defmodule Dockd.EnvTest do
       System.delete_env("DOCKD_TEST_REQUIRED")
 
       assert {:error, %Error{phase: :validate, message: msg}} =
-               Dockd.apply("any-image", env: [{"DOCKD_TEST_REQUIRED", []}], name: unique_name())
+               Dockd.apply("any-image", env: [{"DOCKD_TEST_REQUIRED", []}], instance_name: unique_name())
 
       assert msg =~ "DOCKD_TEST_REQUIRED"
       assert msg =~ "unset host var"
@@ -99,7 +99,7 @@ defmodule Dockd.EnvTest do
   describe "apply/2 with :mounts" do
     test "rejects :binds (removed) at the unknown-option check" do
       assert {:error, %Error{phase: :validate, message: msg}} =
-               Dockd.apply("any-image", binds: ["/h:/c"], name: unique_name())
+               Dockd.apply("any-image", binds: ["/h:/c"], instance_name: unique_name())
 
       assert msg =~ "unknown option"
       assert msg =~ ":binds"
@@ -107,21 +107,21 @@ defmodule Dockd.EnvTest do
 
     test "rejects malformed string entries" do
       assert {:error, %Error{phase: :validate, message: msg}} =
-               Dockd.apply("any-image", mounts: ["bad-mount-no-colon"], name: unique_name())
+               Dockd.apply("any-image", mounts: ["bad-mount-no-colon"], instance_name: unique_name())
 
       assert msg =~ "invalid :mounts entry"
     end
 
     test "rejects map entries without :target" do
       assert {:error, %Error{phase: :validate, message: msg}} =
-               Dockd.apply("any-image", mounts: [%{type: "tmpfs"}], name: unique_name())
+               Dockd.apply("any-image", mounts: [%{type: "tmpfs"}], instance_name: unique_name())
 
       assert msg =~ ":mounts map entry requires"
     end
 
     test "rejects a non-list :mounts" do
       assert {:error, %Error{phase: :validate, message: msg}} =
-               Dockd.apply("any-image", mounts: "/h:/c", name: unique_name())
+               Dockd.apply("any-image", mounts: "/h:/c", instance_name: unique_name())
 
       assert msg =~ ":mounts must be a list"
     end

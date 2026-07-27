@@ -4,7 +4,7 @@ defmodule Dockd.Error do
 
   Every error returned from `Dockd.apply/2`, `Dockd.destroy/1`,
   `Dockd.list/1`, or `Dockd.get/2` is wrapped in this struct. The `phase`
-  field identifies which pipeline step failed (`:validate`, `:build`,
+  field identifies which pipeline step failed (`:validate`, `:generate`, `:build`,
   `:pull`, `:create`, `:start`, `:lifecycle`, `:fetch`, `:copy`, `:setup`,
   `:destroy`, `:discover`) so callers can route on it. When the failure happened after
   a container was created, `instance` carries a hydrated `Dockd.Instance`

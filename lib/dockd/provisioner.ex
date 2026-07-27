@@ -397,24 +397,38 @@ defmodule Dockd.Provisioner do
   end
 
   defp normalize_step(step_spec, index) when is_map(step_spec) do
-    label = get_value(step_spec, :label)
+    step_name = get_value(step_spec, :step_name)
     cmd = get_value(step_spec, :cmd)
     env = get_value(step_spec, :env)
     workdir = get_value(step_spec, :workdir)
     user = get_value(step_spec, :user)
     prefix = "step #{index + 1}"
 
-    with :ok <- validate_nonempty_binary(label, "#{prefix} must include a non-empty :label"),
+    with :ok <- check_renamed_step_key(step_spec, step_name, prefix),
+         :ok <-
+           validate_nonempty_binary(step_name, "#{prefix} must include a non-empty :step_name"),
          :ok <- validate_cmd_list(cmd, "#{prefix} must include a non-empty :cmd list"),
          :ok <- validate_optional_binary_list(env, "#{prefix} has invalid :env"),
          :ok <- validate_optional_binary(workdir, "#{prefix} has invalid :workdir"),
          :ok <- validate_optional_binary(user, "#{prefix} has invalid :user") do
-      {:ok, %{label: label, cmd: cmd, env: env, workdir: workdir, user: user}}
+      {:ok, %{step_name: step_name, cmd: cmd, env: env, workdir: workdir, user: user}}
     end
   end
 
   defp normalize_step(_step_spec, index),
     do: {:error, "step #{index + 1} must be a map"}
+
+  # `:label` was renamed to `:step_name` — `label` now only ever means a Docker
+  # label. Say so rather than reporting a missing key.
+  defp check_renamed_step_key(step_spec, nil, prefix) do
+    if is_nil(get_value(step_spec, :label)) do
+      :ok
+    else
+      {:error, "#{prefix} uses :label, which was renamed to :step_name"}
+    end
+  end
+
+  defp check_renamed_step_key(_step_spec, _step_name, _prefix), do: :ok
 
   defp validate_nonempty_binary(value, _msg) when is_binary(value) and value !== "", do: :ok
   defp validate_nonempty_binary(_value, msg), do: {:error, msg}
@@ -642,7 +656,7 @@ defmodule Dockd.Provisioner do
   defp create_container(
          %{
            spec:
-             %Spec{name: name, labels: user_labels, image: image, shell: shell, env: env} = spec,
+             %Spec{instance_name: name, labels: user_labels, image: image, shell: shell, env: env} = spec,
            docker_options: docker_options
          } = ctx
        ) do
@@ -715,7 +729,7 @@ defmodule Dockd.Provisioner do
         error =
           Error.docker_phase_error(
             :setup,
-            "failed to run setup step: #{step.label}",
+            "failed to run setup step: #{step.step_name}",
             reason,
             hydrate_or_stub(acc_ctx)
           )
@@ -726,7 +740,7 @@ defmodule Dockd.Provisioner do
 
   defp handle_step_exec(step, acc_ctx, output, exit_code) do
     step_result = %StepResult{
-      label: step.label,
+      step_name: step.step_name,
       cmd: step.cmd,
       output: output,
       exit_code: exit_code,
@@ -742,7 +756,7 @@ defmodule Dockd.Provisioner do
     else
       error = %Error{
         phase: :setup,
-        message: "setup step failed: #{step.label}",
+        message: "setup step failed: #{step.step_name}",
         exit_code: exit_code,
         output: output,
         instance: hydrate_or_stub(updated),
@@ -830,7 +844,7 @@ defmodule Dockd.Provisioner do
         Instance.from_inspect(body)
 
       {:error, _} ->
-        %Instance{id: container_id, name: spec.name}
+        %Instance{id: container_id, name: spec.instance_name}
     end
   end
 

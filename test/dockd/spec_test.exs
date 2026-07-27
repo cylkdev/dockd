@@ -5,59 +5,59 @@ defmodule Dockd.SpecTest do
 
   describe "from_opts/2" do
     test "sets image and uses provided :name, prefixed with dockd-" do
-      spec = Spec.from_opts("busybox:latest", name: "my-box")
+      spec = Spec.from_opts("busybox:latest", instance_name: "my-box")
       assert spec.image === "busybox:latest"
-      assert spec.name === "dockd-my-box"
+      assert spec.instance_name === "dockd-my-box"
     end
 
     test "does not double-prefix a name that already starts with dockd-" do
-      spec = Spec.from_opts("busybox:latest", name: "dockd-my-box")
-      assert spec.name === "dockd-my-box"
+      spec = Spec.from_opts("busybox:latest", instance_name: "dockd-my-box")
+      assert spec.instance_name === "dockd-my-box"
     end
 
-    test "raises when :name is missing" do
-      assert_raise ArgumentError, ~r/non-empty binary :name/, fn ->
+    test "raises when :instance_name is missing" do
+      assert_raise ArgumentError, ~r/non-empty binary :instance_name/, fn ->
         Spec.from_opts("busybox:latest")
       end
     end
 
-    test "raises when :name is empty or not a binary" do
-      assert_raise ArgumentError, ~r/non-empty binary :name/, fn ->
-        Spec.from_opts("busybox:latest", name: "")
+    test "raises when :instance_name is empty or not a binary" do
+      assert_raise ArgumentError, ~r/non-empty binary :instance_name/, fn ->
+        Spec.from_opts("busybox:latest", instance_name: "")
       end
 
-      assert_raise ArgumentError, ~r/non-empty binary :name/, fn ->
-        Spec.from_opts("busybox:latest", name: :atom)
+      assert_raise ArgumentError, ~r/non-empty binary :instance_name/, fn ->
+        Spec.from_opts("busybox:latest", instance_name: :atom)
       end
     end
 
     test "carries :description onto the struct when provided" do
-      spec = Spec.from_opts("busybox:latest", name: "my-box", description: "a demo")
+      spec = Spec.from_opts("busybox:latest", instance_name: "my-box", description: "a demo")
       assert spec.description === "a demo"
     end
 
     test "defaults :description to nil when not provided" do
-      spec = Spec.from_opts("busybox:latest", name: "my-box")
+      spec = Spec.from_opts("busybox:latest", instance_name: "my-box")
       assert spec.description === nil
     end
   end
 
   describe "from_attrs/1" do
-    test "builds a Spec from a normalized attrs map with a name" do
-      spec = Spec.from_attrs(%{image: "node:20", name: "my-box", shell: "mytool"})
+    test "builds a Spec from a normalized attrs map with an instance_name" do
+      spec = Spec.from_attrs(%{image: "node:20", instance_name: "my-box", shell: "mytool"})
       assert spec.image === "node:20"
       assert spec.shell === "mytool"
-      assert spec.name === "dockd-my-box"
+      assert spec.instance_name === "dockd-my-box"
     end
 
-    test "raises when :name is missing from attrs" do
-      assert_raise ArgumentError, ~r/non-empty binary :name/, fn ->
+    test "raises when :instance_name is missing from attrs" do
+      assert_raise ArgumentError, ~r/non-empty binary :instance_name/, fn ->
         Spec.from_attrs(%{image: "x"})
       end
     end
 
     test "defaults list and map fields when absent" do
-      spec = Spec.from_attrs(%{image: "x", name: "my-box"})
+      spec = Spec.from_attrs(%{image: "x", instance_name: "my-box"})
       assert spec.steps === []
       assert spec.repos === []
       assert spec.copy === []
@@ -67,7 +67,7 @@ defmodule Dockd.SpecTest do
     end
 
     test "carries :description through from attrs" do
-      spec = Spec.from_attrs(%{image: "x", name: "my-box", description: "a demo"})
+      spec = Spec.from_attrs(%{image: "x", instance_name: "my-box", description: "a demo"})
       assert spec.description === "a demo"
     end
   end

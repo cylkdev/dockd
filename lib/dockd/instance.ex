@@ -64,7 +64,7 @@ defmodule Dockd.Instance do
   time.
   """
   @spec managed_labels(Spec.t()) :: %{binary() => binary()}
-  def managed_labels(%Spec{name: name}) do
+  def managed_labels(%Spec{instance_name: name}) do
     %{
       @marker_label => "true",
       @name_label => Spec.short_name(name)

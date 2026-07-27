@@ -5,17 +5,17 @@ defmodule Dockd.Spec.NormalizerTest do
 
   describe "normalize/2" do
     test "converts string keys to atoms" do
-      assert {:ok, %{name: "demo", image: "x", shell: "bash"}} =
+      assert {:ok, %{instance_name: "demo", image: "x", shell: "bash"}} =
                Normalizer.normalize(
-                 %{"name" => "demo", "image" => "x", "shell" => "bash"},
+                 %{"instance_name" => "demo", "image" => "x", "shell" => "bash"},
                  "/tmp"
                )
     end
 
     test "carries description through when present" do
-      assert {:ok, %{name: "demo", description: "a demo", image: "x"}} =
+      assert {:ok, %{instance_name: "demo", description: "a demo", image: "x"}} =
                Normalizer.normalize(
-                 %{"name" => "demo", "description" => "a demo", "image" => "x"},
+                 %{"instance_name" => "demo", "description" => "a demo", "image" => "x"},
                  "/tmp"
                )
     end
@@ -23,7 +23,7 @@ defmodule Dockd.Spec.NormalizerTest do
     test "converts env entries into {name, opts} tuples" do
       assert {:ok, %{env: [{"FOO", []}]}} =
                Normalizer.normalize(
-                 %{"name" => "demo", "image" => "x", "env" => [%{"name" => "FOO"}]},
+                 %{"instance_name" => "demo", "image" => "x", "env" => [%{"name" => "FOO"}]},
                  "/tmp"
                )
     end
@@ -32,7 +32,7 @@ defmodule Dockd.Spec.NormalizerTest do
       assert {:ok, %{env: [{"FOO", [optional: true]}]}} =
                Normalizer.normalize(
                  %{
-                   "name" => "demo",
+                   "instance_name" => "demo",
                    "image" => "x",
                    "env" => [%{"name" => "FOO", "optional" => true}]
                  },
@@ -44,7 +44,7 @@ defmodule Dockd.Spec.NormalizerTest do
       assert {:error, error} =
                Normalizer.normalize(
                  %{
-                   "name" => "demo",
+                   "instance_name" => "demo",
                    "image" => "x",
                    "env" => [%{"name" => "FOO", "extra" => "bad"}]
                  },
@@ -59,7 +59,7 @@ defmodule Dockd.Spec.NormalizerTest do
       assert {:error, error} =
                Normalizer.normalize(
                  %{
-                   "name" => "demo",
+                   "instance_name" => "demo",
                    "image" => "x",
                    "env" => [%{"name" => "FOO", "value" => "a", "default" => "b"}]
                  },
@@ -73,7 +73,7 @@ defmodule Dockd.Spec.NormalizerTest do
       assert {:ok, %{build: %{dockerfile: dockerfile}}} =
                Normalizer.normalize(
                  %{
-                   "name" => "demo",
+                   "instance_name" => "demo",
                    "image" => "x",
                    "build" => %{"dockerfile" => "Dockerfile"}
                  },
@@ -87,7 +87,7 @@ defmodule Dockd.Spec.NormalizerTest do
       assert {:ok, %{build: %{dockerfile: "/absolute/path/Foo"}}} =
                Normalizer.normalize(
                  %{
-                   "name" => "demo",
+                   "instance_name" => "demo",
                    "image" => "x",
                    "build" => %{"dockerfile" => "/absolute/path/Foo"}
                  },
@@ -99,7 +99,7 @@ defmodule Dockd.Spec.NormalizerTest do
       assert {:ok, %{build: build}} =
                Normalizer.normalize(
                  %{
-                   "name" => "demo",
+                   "instance_name" => "demo",
                    "image" => "x",
                    "build" => %{"dockerfile" => "Dockerfile", "context" => "./sub"}
                  },
@@ -113,7 +113,7 @@ defmodule Dockd.Spec.NormalizerTest do
     test "rejects an unknown build key" do
       assert {:error, error} =
                Normalizer.normalize(
-                 %{"name" => "demo", "image" => "x", "build" => %{"bogus" => true}},
+                 %{"instance_name" => "demo", "image" => "x", "build" => %{"bogus" => true}},
                  "/tmp"
                )
 
@@ -123,7 +123,7 @@ defmodule Dockd.Spec.NormalizerTest do
     test "rejects a non-list :env" do
       assert {:error, error} =
                Normalizer.normalize(
-                 %{"name" => "demo", "image" => "x", "env" => "FOO"},
+                 %{"instance_name" => "demo", "image" => "x", "env" => "FOO"},
                  "/tmp"
                )
 
@@ -133,7 +133,7 @@ defmodule Dockd.Spec.NormalizerTest do
     test "leaves ${VAR} placeholders untouched" do
       assert {:ok, %{mounts: ["${HOME}/x:/y"]}} =
                Normalizer.normalize(
-                 %{"name" => "demo", "image" => "x", "mounts" => ["${HOME}/x:/y"]},
+                 %{"instance_name" => "demo", "image" => "x", "mounts" => ["${HOME}/x:/y"]},
                  "/tmp"
                )
     end
