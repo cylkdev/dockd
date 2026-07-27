@@ -108,6 +108,59 @@ defmodule Dockd.PackagesTest do
     end
   end
 
+  describe "delete/2" do
+    test "removes an installed package directory" do
+      root = sandbox_dir("dockd-delete-root")
+      add_installed_package(root, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
+
+      assert :ok = Packages.delete("alpha", packages_path: root)
+      refute File.exists?(Path.join(root, "alpha"))
+    end
+
+    test "is idempotent — deleting a missing package returns :ok" do
+      root = sandbox_dir("dockd-delete-missing")
+
+      assert :ok = Packages.delete("nope", packages_path: root)
+      assert :ok = Packages.delete("nope", packages_path: root)
+    end
+
+    test "only removes the named package" do
+      root = sandbox_dir("dockd-delete-others")
+      add_installed_package(root, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
+      add_installed_package(root, "beta", ~s({"instance_name": "beta", "image": "busybox:1.37.0"}))
+
+      assert :ok = Packages.delete("alpha", packages_path: root)
+      assert File.exists?(Path.join([root, "beta", "package.json"]))
+    end
+
+    test "rejects a reference that is not a bare package name" do
+      assert {:error, %Dockd.Error{phase: :validate}} = Packages.delete("../etc")
+      assert {:error, %Dockd.Error{phase: :validate}} = Packages.delete("a/b")
+      assert {:error, %Dockd.Error{phase: :validate}} = Packages.delete("pkg.json")
+      assert {:error, %Dockd.Error{phase: :validate}} = Packages.delete("")
+    end
+
+    test "refuses to delete a directory that is not a package" do
+      root = sandbox_dir("dockd-delete-notpkg")
+      File.mkdir_p!(Path.join(root, "plain"))
+
+      assert {:error, %Dockd.Error{phase: :destroy}} =
+               Packages.delete("plain", packages_path: root)
+
+      assert File.exists?(Path.join(root, "plain"))
+    end
+  end
+
+  describe "Dockd.delete_package/2" do
+    test "removes an installed package by name" do
+      root = sandbox_dir("dockd-api-delete-root")
+      add_installed_package(root, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
+
+      assert :ok = Dockd.delete_package("alpha", packages_path: root)
+      assert Dockd.list_packages(packages_path: root) === []
+    end
+  end
+
   describe "install_from_git/2" do
     @describetag :integration
 

@@ -77,6 +77,7 @@ defmodule Dockd do
       local directory.
     - `new_package/2` — scaffold a new package's files on disk.
     - `list_packages/1` — enumerate installed packages.
+    - `delete_package/2` — remove an installed package from the packages root.
 
   ## Packages
 
@@ -118,7 +119,8 @@ defmodule Dockd do
   git repository or a local directory. Every `<source>/packages/<name>/`
   directory that contains a `package.json` is copied into
   `<packages_root>/<name>/`, after which the package can be applied by name.
-  `list_packages/1` enumerates what is currently installed.
+  `list_packages/1` enumerates what is currently installed, and
+  `delete_package/2` removes a package by name.
 
       {:ok, ["webapp"]} = Dockd.install_packages("github.com/me/recipes")
       {:ok, ["webapp"]} = Dockd.install_packages("./my-recipes")
@@ -431,6 +433,34 @@ defmodule Dockd do
         ]
   def list_packages(opts \\ []) when is_list(opts) do
     Packages.list(opts)
+  end
+
+  @doc """
+  Deletes an installed package from the configured packages root.
+
+  Takes a bare package name — the same name `apply_package/2` resolves and
+  `list_packages/1` reports. Paths and `.json` references are rejected with a
+  `:validate` error, so nothing outside the packages root can be removed.
+
+  Idempotent — deleting a package that is not installed returns `:ok`. Running
+  instances created from the package are not touched; a package is only the
+  recipe on disk.
+
+  Options:
+
+    - `:packages_path` — override the configured packages root.
+
+  ## Examples
+
+      {:ok, ["webapp"]} = Dockd.install_packages("./my-recipes")
+      :ok = Dockd.delete_package("webapp")
+
+      # Already gone — still :ok.
+      :ok = Dockd.delete_package("webapp")
+  """
+  @spec delete_package(binary(), keyword()) :: :ok | {:error, Error.t()}
+  def delete_package(name, opts \\ []) when is_binary(name) and is_list(opts) do
+    Packages.delete(name, opts)
   end
 
   @doc """

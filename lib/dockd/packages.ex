@@ -19,6 +19,7 @@ defmodule Dockd.Packages do
       with no clone.
     - `new/2` — scaffold a package's files (`package.json` + `Dockerfile`) from
       caller options, so nobody has to hand-write them.
+    - `delete/2` — remove an installed package from the packages root.
 
   Both installers share one implementation, so they agree on what counts as a
   package and on the `{:ok, [name]}` / `:fetch`-tagged-error contract.
@@ -202,6 +203,67 @@ defmodule Dockd.Packages do
   def install_from_path(dir, opts \\ []) when is_binary(dir) do
     dest_dir = Keyword.get(opts, :dest_dir, packages_root(opts))
     install_from_clone(dir, dest_dir)
+  end
+
+  @doc """
+  Deletes an installed package from the configured packages root.
+
+  `name` must be a bare package name — the directory name under the packages
+  root. Paths (`a/b`), `.json` references, and empty strings are rejected with
+  a `:validate` error so this can never remove anything outside the root.
+
+  Idempotent: a package that is not installed returns `:ok`. A directory that
+  exists but holds no `package.json` is not a package and is refused with a
+  `:destroy` error rather than removed.
+
+  Options:
+
+    - `:packages_path` — override the configured packages root.
+  """
+  @spec delete(binary(), keyword()) :: :ok | {:error, Error.t()}
+  def delete(name, opts \\ []) when is_binary(name) and is_list(opts) do
+    with :ok <- check_bare_name(name) do
+      dir = Path.join(packages_root(opts), name)
+
+      cond do
+        not File.exists?(dir) ->
+          :ok
+
+        not File.exists?(Path.join(dir, @package_filename)) ->
+          {:error,
+           %Error{
+             phase: :destroy,
+             message: "#{dir} has no package.json; refusing to delete a non-package directory"
+           }}
+
+        true ->
+          case File.rm_rf(dir) do
+            {:ok, _files} ->
+              :ok
+
+            {:error, reason, file} ->
+              {:error,
+               Error.docker_phase_error(
+                 :destroy,
+                 "could not delete package #{name}",
+                 %{reason: reason, file: file},
+                 nil
+               )}
+          end
+      end
+    end
+  end
+
+  defp check_bare_name(name) do
+    if name === "" or String.contains?(name, "/") or String.ends_with?(name, ".json") do
+      {:error,
+       %Error{
+         phase: :validate,
+         message: "delete takes a bare package name, got: #{inspect(name)}"
+       }}
+    else
+      :ok
+    end
   end
 
   @doc """
