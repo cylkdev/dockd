@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# Install the dockd CLI built by scripts/release_burrito_app.sh.
+# Install the dockd CLI built by scripts/build_release.sh.
 #
 # Detects the host OS, picks the matching Burrito binary from ./burrito_out/
 # (dockd_macos on Darwin, dockd_linux on Linux), and installs it as `dockd`
 # into a bin directory on PATH.
 #
-# Usage: scripts/install_burrito_release.sh [install_dir]
+# Usage: scripts/install.sh [install_dir]
 #   install_dir defaults to /usr/local/bin (falls back to ~/.local/bin when
 #   that is not writable). Override DESTDIR by passing it as the first arg.
 set -euo pipefail
@@ -28,7 +28,7 @@ binary="burrito_out/dockd_${target}"
 
 if [ ! -f "$binary" ]; then
   echo "error: release binary '$binary' not found." >&2
-  echo "       Build it first with: scripts/release_burrito_app.sh" >&2
+  echo "       Build it first with: scripts/build_release.sh" >&2
   exit 1
 fi
 

@@ -33,65 +33,69 @@ defmodule Dockd.NoAmbientInputTest do
       end
     end)
 
-    root = Path.join(System.tmp_dir!(), "dockd-ambient-#{System.unique_integer([:positive])}")
-    on_exit(fn -> File.rm_rf!(root) end)
-
-    {:ok, root: root}
+    :ok
   end
 
-  test "the package lifecycle works entirely from arguments", %{root: root} do
-    pkg = Path.join(root, "greeter")
+  test "a spec map is applied exactly as written, with nothing filled in" do
+    map = %{
+      instance_name: "greeter",
+      image: "busybox:1.37.0",
+      shell: "/bin/sh",
+      build: %{dockerfile: "/abs/pkg/Dockerfile"}
+    }
 
-    assert {:ok, %{instance_name: "greeter"}} =
-             Dockd.new_package(pkg, "greeter", from: "busybox:1.37.0", shell: "/bin/sh")
+    assert {:ok, spec} = Dockd.Spec.from_map(map)
 
-    # Found under the root we named, not under DOCKD_PACKAGES_PATH or ~/.dockd.
-    assert [%{name: "greeter", spec: {:ok, spec}}] = Dockd.list_packages(root)
     assert spec.instance_name === "greeter"
-
-    assert {:ok, loaded} = Dockd.load_package_spec(root, "greeter", %{})
-    assert loaded.instance_name === "greeter"
-    # Path resolved against the package dir, not the process CWD.
-    assert loaded.build === %{dockerfile: Path.join(pkg, "Dockerfile")}
-
-    assert :ok = Dockd.delete_package(root, "greeter")
-    assert Dockd.list_packages(root) === []
+    assert spec.image === "busybox:1.37.0"
+    # Carried through verbatim: no packages root, no CWD, no home directory took
+    # part in resolving this path.
+    assert spec.build === %{dockerfile: "/abs/pkg/Dockerfile"}
   end
 
-  test "the env vars that used to name the packages root now name nothing", %{root: root} do
-    assert {:ok, _} = Dockd.new_package(Path.join(root, "alpha"), "alpha")
+  # There is no package loader left to consult a root, which is the strongest
+  # form this guarantee can take: the read cannot happen because the code that
+  # would do it does not exist.
+  test "dockd exposes no function that reads a spec from disk" do
+    exports = Dockd.__info__(:functions) ++ Dockd.Spec.__info__(:functions)
 
-    # Both ambient sources point somewhere that does not exist. If either were
-    # still consulted, one of these would find alpha or blow up.
-    assert Dockd.list_packages("/nonexistent/packages") === []
-    assert Dockd.list_packages("/also/nonexistent") === []
-    assert [%{name: "alpha"}] = Dockd.list_packages(root)
+    for {name, _arity} <- exports do
+      refute to_string(name) =~ ~r/package|from_file|load/,
+             "#{name} looks like it reads a spec from disk"
+    end
   end
 
-  test "${VAR} resolves only from the host_env argument", %{root: root} do
-    pkg = Path.join(root, "envpkg")
-    File.mkdir_p!(pkg)
-
-    File.write!(
-      Path.join(pkg, "package.json"),
-      ~s({"instance_name":"envpkg","image":"busybox","mounts":["${DOCKD_AMBIENT_PROBE}:/x"]})
-    )
-
-    # Defined in the real process environment...
+  test "${VAR} is not substituted, so nothing can leak in through a spec map" do
     System.put_env("DOCKD_AMBIENT_PROBE", "/leaked/from/host")
     on_exit(fn -> System.delete_env("DOCKD_AMBIENT_PROBE") end)
 
-    # ...and still invisible to the package, because host_env is empty.
-    assert {:error, error} = Dockd.load_package_spec(root, "envpkg", %{})
-    assert error.phase === :validate
+    assert {:ok, spec} =
+             Dockd.Spec.from_map(%{
+               instance_name: "envpkg",
+               image: "busybox:1.37.0",
+               mounts: ["${DOCKD_AMBIENT_PROBE}:/x"]
+             })
+
+    # Left exactly as written. The caller interpolates, so the host value is
+    # never reachable by accident.
+    assert spec.mounts === ["${DOCKD_AMBIENT_PROBE}:/x"]
+  end
+
+  test ":env resolves only from the host_env argument" do
+    System.put_env("DOCKD_AMBIENT_PROBE", "/leaked/from/host")
+    on_exit(fn -> System.delete_env("DOCKD_AMBIENT_PROBE") end)
+
+    {:ok, spec} = Dockd.Spec.new("busybox:1.37.0", "smoke", env: ["DOCKD_AMBIENT_PROBE"])
+
+    # Defined in the real process environment, and still invisible: host_env is
+    # empty, so there is nothing to resolve against.
+    assert {:error, error} = Dockd.Provisioner.resolve_env(spec, %{})
+    assert error.details.phase === :validate
+    assert error.message =~ "absent from host_env"
 
     # Visible only when handed over deliberately, and only the value handed over.
-    assert {:ok, spec} =
-             Dockd.load_package_spec(root, "envpkg", %{"DOCKD_AMBIENT_PROBE" => "/passed/in"})
-
-    # Still in string form here — Provisioner normalizes mounts later. What
-    # matters is which value the interpolation picked up.
-    assert spec.mounts === ["/passed/in:/x"]
+    assert {:ok, ["DOCKD_AMBIENT_PROBE=/passed/in"]} =
+             Dockd.Provisioner.resolve_env(spec, %{"DOCKD_AMBIENT_PROBE" => "/passed/in"})
   end
 
   test "DOCKER_HOST does not decide the daemon" do
@@ -101,14 +105,14 @@ defmodule Dockd.NoAmbientInputTest do
     # must be a :validate error, not a silent fallback to it.
     for bad <- [nil, ""] do
       assert {:error, error} = Dockd.apply(spec, bad, false, %{}, System.tmp_dir!())
-      assert error.phase === :validate
+      assert error.details.phase === :validate
       assert error.message =~ "a Docker endpoint is required"
     end
   end
 
   test "delete_temp_files refuses a root it was not given properly" do
     for bad <- ["/", "", "relative/dir"] do
-      assert {:error, %Dockd.Error{}} = Dockd.delete_temp_files(bad)
+      assert {:error, %ErrorMessage{}} = Dockd.delete_temp_files(bad)
     end
   end
 

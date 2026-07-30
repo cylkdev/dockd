@@ -1,4 +1,4 @@
-defmodule Dockd.FileCopy do
+defmodule Dockd.Files do
   @moduledoc """
   Copies files and directories from the host into a running container.
 
@@ -7,7 +7,7 @@ defmodule Dockd.FileCopy do
   of `src` are tar-streamed to the container via `Docker.put_archive/4`, so the host files
   are never modified - unlike a bind mount, the container has its own copy.
 
-  All specs in a single `copy_files/7` call are bundled into **one** tar archive and
+  All specs in a single `copy_files/5` call are bundled into **one** tar archive and
   uploaded with a single `Docker.put_archive/4` call. The tar contains:
 
     - `entries/<index>` - the staged source for `specs[index]`
@@ -20,18 +20,27 @@ defmodule Dockd.FileCopy do
   `chmod` / `chown`, then cleans up the staging directory. Net Docker traffic per call is
   fixed at one `put_archive` plus two `exec` calls regardless of how many specs are passed.
 
-  Errors are tagged with phase `:copy`. The caller (the provisioner) attaches a
-  hydrated `Dockd.Instance` to the returned error so it can be cleaned up with
-  `Dockd.destroy/3`.
+  Failures during the copy itself carry `details.phase` of `:copy`; the preflight
+  check on `temp_root` carries `:validate`, because that is a bad argument rather
+  than a failed copy. The caller (the provisioner) attaches a hydrated
+  `Dockd.Instance` to `details` so it can be cleaned up with `Dockd.destroy/3`.
 
   ## Required inputs
 
-  Nothing here is discovered from the environment. `temp_root` is the host directory
-  to stage under, and `tar_path` / `tar_env` are the `tar` executable and the exact
-  environment to run it in. `tar_path` is preflighted before any side effects, so a
-  missing `tar` is a tagged `:copy` error rather than an `ErlangError` escaping
-  `System.cmd/3`. Archive flags come from `:tar_extra_args`, not from `:os.type()` —
-  see `tar_batch/4`.
+  Nothing here is discovered from the environment, and there is only one input to
+  supply: `temp_root`, the host directory to stage under.
+
+  ## The archive is built in-process
+
+  `build_archive/1` uses OTP's `:erl_tar`, so **dockd runs no external program**.
+  There is no `tar` executable to locate, no environment to hand it, and no
+  archive flags to choose: `:erl_tar` writes no xattrs, ACLs or macOS metadata to
+  begin with, which is the entire reason the retired `:tar_extra_args` option
+  existed. It also preserves what a copy needs — recursive directories, empty
+  directories, symlinks, permission bits, and names past the 100-byte ustar limit
+  — and reports an unreadable source as `{:error, {path, reason}}` rather than as
+  a warning on a stderr stream that would otherwise have to be kept away from the
+  archive bytes.
 
   ## Responsibilities
 
@@ -39,8 +48,8 @@ defmodule Dockd.FileCopy do
       no `dest` contains a tab or newline, before any side effects
     - Stage each `src` under `entries/<index>` in a single per-call host tempdir
     - Generate `manifest.tsv` and `run.sh` alongside the staged entries
-    - Build one tar of the whole tempdir and `PUT` it into the container at a
-      `<container_staging_root>/dockd-copy-<unique>` staging directory
+    - Build one tar of the staged entries with `:erl_tar` and `PUT` it into the
+      container at a `<container_staging_root>/dockd-copy-<unique>` staging directory
     - Exec `sh <staging>/run.sh` inside the container to move each entry to its final
       location and apply optional `mode` / `owner`
     - Tear down the host tempdir whether the copy succeeds or fails
@@ -50,12 +59,14 @@ defmodule Dockd.FileCopy do
   Per-call staging lives under `<temp_root>/dockd-copy-<unique>/`. On clean runs the
   `after` block tears it down. To sweep orphans left behind by hard kills or crashes,
   this module exposes `list_temp_files/1` and `delete_temp_files/1`. They operate on
-  whichever root the caller names, so they also cover `dockd-fetch-*` dirs created by
-  `Dockd.Git` under the same root.
+  whichever root the caller names.
   """
 
-  alias Dockd.Error
   alias Dockd.HostTool
+
+  # Written inside the staging dir, and never added to itself: `build_archive/1`
+  # adds the three entries it wants by name rather than globbing the directory.
+  @archive_name "archive.tar"
 
   @doc """
   Copies the given host files/directories into a running container in one batch.
@@ -71,26 +82,16 @@ defmodule Dockd.FileCopy do
   the host — a relative one would resolve against the calling process's working
   directory. `docker_options` carries the Docker connection options. Returns `:ok`
   (also for an empty `specs` list, with no side effects) or
-  `{:error, %Dockd.Error{}}` tagged `:copy`.
+  `{:error, %ErrorMessage{}}`.
   """
-  @spec copy_files(
-          [map()],
-          binary(),
-          Path.t(),
-          Path.t(),
-          %{optional(binary()) => binary()},
-          keyword(),
-          keyword()
-        ) :: :ok | {:error, Error.t()}
-  def copy_files(specs, container_id, temp_root, tar_path, tar_env, docker_options, opts \\ [])
+  @spec copy_files([map()], binary(), Path.t(), keyword(), keyword()) ::
+          :ok | {:error, ErrorMessage.t()}
+  def copy_files(specs, container_id, temp_root, docker_options, opts \\ [])
 
-  def copy_files([], _container_id, _temp_root, _tar_path, _tar_env, _docker_options, _opts),
-    do: :ok
+  def copy_files([], _container_id, _temp_root, _docker_options, _opts), do: :ok
 
-  def copy_files(specs, container_id, temp_root, tar_path, tar_env, docker_options, opts) do
-    with :ok <- copy_check(HostTool.executable(tar_path, "tar", "copying host files")),
-         :ok <- copy_check(HostTool.env(tar_env, "tar")),
-         :ok <- copy_check(HostTool.staging_root(temp_root, "temp_root")),
+  def copy_files(specs, container_id, temp_root, docker_options, opts) do
+    with :ok <- HostTool.staging_root(temp_root, "temp_root"),
          :ok <- validate_paths(specs) do
       unique = "dockd-copy-#{System.unique_integer([:positive])}"
       host_tmp = Path.join(temp_root, unique)
@@ -98,14 +99,12 @@ defmodule Dockd.FileCopy do
       container_staging =
         Path.join(Keyword.get(opts, :container_staging_root, "/tmp"), unique)
 
-      extra_args = Keyword.get(opts, :tar_extra_args, [])
-
       try do
         with :ok <- make_entries_dir(host_tmp),
              {:ok, rows} <- stage_all(specs, host_tmp),
              :ok <- write_manifest(rows, host_tmp),
              :ok <- write_runner(host_tmp, container_staging),
-             {:ok, tar} <- tar_batch(host_tmp, tar_path, tar_env, extra_args) do
+             {:ok, tar} <- build_archive(host_tmp) do
           upload_and_run(container_id, container_staging, tar, docker_options)
         end
       after
@@ -114,29 +113,43 @@ defmodule Dockd.FileCopy do
     end
   end
 
-  # tar is preflighted rather than discovered: a missing tar used to raise
-  # ErlangError out of System.cmd instead of returning a tagged error.
-  defp copy_check(:ok), do: :ok
-  defp copy_check({:error, message}), do: {:error, %Error{phase: :copy, message: message}}
-
   defp validate_paths(specs) do
     Enum.reduce_while(specs, :ok, fn %{dest: dest} = spec, :ok ->
       src = Map.get(spec, :src)
 
       cond do
         String.contains?(dest, "\t") ->
-          {:halt, error("dest contains a tab character: #{inspect(dest)}", nil)}
+          {:halt,
+           {:error,
+            ErrorMessage.unprocessable_entity(
+              "dest contains a tab character: #{inspect(dest)}",
+              %{phase: :copy}
+            )}}
 
         String.contains?(dest, "\n") ->
-          {:halt, error("dest contains a newline character: #{inspect(dest)}", nil)}
+          {:halt,
+           {:error,
+            ErrorMessage.unprocessable_entity(
+              "dest contains a newline character: #{inspect(dest)}",
+              %{phase: :copy}
+            )}}
 
         not is_binary(src) ->
-          {:halt, error("copy src must be a string path, got: #{inspect(src)}", nil)}
+          {:halt,
+           {:error,
+            ErrorMessage.unprocessable_entity(
+              "copy src must be a string path, got: #{inspect(src)}",
+              %{phase: :copy}
+            )}}
 
         # Relative sources would resolve against the calling process's CWD.
-        # Package-sourced paths are absolutized by Dockd.Spec.Normalizer.
         Path.type(src) !== :absolute ->
-          {:halt, error("copy src must be an absolute path, got: #{inspect(src)}", nil)}
+          {:halt,
+           {:error,
+            ErrorMessage.unprocessable_entity(
+              "copy src must be an absolute path, got: #{inspect(src)}",
+              %{phase: :copy}
+            )}}
 
         true ->
           {:cont, :ok}
@@ -179,18 +192,33 @@ defmodule Dockd.FileCopy do
     cond do
       File.regular?(src) ->
         case File.cp(src, staged) do
-          :ok -> :ok
-          {:error, reason} -> error("could not stage file #{src}", reason)
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            {:error,
+             ErrorMessage.unprocessable_entity("could not stage file #{src}", %{
+               phase: :copy,
+               reason: reason
+             })}
         end
 
       File.dir?(src) ->
         case File.cp_r(src, staged) do
-          {:ok, _} -> :ok
-          {:error, reason, path} -> error("could not stage dir #{path}", reason)
+          {:ok, _} ->
+            :ok
+
+          {:error, reason, path} ->
+            {:error,
+             ErrorMessage.unprocessable_entity("could not stage dir #{path}", %{
+               phase: :copy,
+               reason: reason
+             })}
         end
 
       true ->
-        {:error, %Error{phase: :copy, message: "copy source does not exist: #{src}"}}
+        {:error,
+         ErrorMessage.unprocessable_entity("copy source does not exist: #{src}", %{phase: :copy})}
     end
   end
 
@@ -201,8 +229,15 @@ defmodule Dockd.FileCopy do
       |> Enum.join("\n")
 
     case File.write(Path.join(host_tmp, "manifest.tsv"), body <> "\n") do
-      :ok -> :ok
-      {:error, reason} -> error("could not write manifest", reason)
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        {:error,
+         ErrorMessage.unprocessable_entity("could not write manifest", %{
+           phase: :copy,
+           reason: reason
+         })}
     end
   end
 
@@ -229,29 +264,82 @@ defmodule Dockd.FileCopy do
     """
 
     case File.write(Path.join(host_tmp, "run.sh"), script) do
-      :ok -> :ok
-      {:error, reason} -> error("could not write runner script", reason)
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        {:error,
+         ErrorMessage.unprocessable_entity("could not write runner script", %{
+           phase: :copy,
+           reason: reason
+         })}
     end
   end
 
   defp shell_quote(s), do: "'" <> String.replace(s, "'", "'\\''") <> "'"
 
-  # Flags are not derived from :os.type(). The BSD-only trio
-  # (--no-xattrs --no-acls --no-mac-metadata) is wrong for a GNU tar that happens
-  # to be installed on macOS, so the caller who chose `tar_path` also chooses its
-  # flags via `:tar_extra_args`.
-  defp tar_batch(host_tmp, tar_path, tar_env, extra_args) do
-    args = extra_args ++ ["-C", host_tmp, "-cf", "-", "manifest.tsv", "run.sh", "entries"]
+  # `:erl_tar`, not an external `tar`: nothing to locate on PATH, no environment
+  # to hand a child process, and no archive flags to pick. The three members are
+  # added by name (relative to `host_tmp`) so the archive being written inside
+  # `host_tmp` is never swept into itself.
+  defp build_archive(host_tmp) do
+    archive = Path.join(host_tmp, @archive_name)
 
-    cmd_opts = [
-      stderr_to_stdout: true,
-      cd: host_tmp,
-      env: Enum.map(tar_env, fn {name, value} -> {to_string(name), to_string(value)} end)
-    ]
+    case :erl_tar.open(to_charlist(archive), [:write]) do
+      {:ok, tar} ->
+        # Closed before the read, not after it: the archive is not complete on
+        # disk until `close/1` has written the trailer.
+        added =
+          try do
+            add_members(tar, host_tmp)
+          after
+            :erl_tar.close(tar)
+          end
 
-    case System.cmd(tar_path, args, cmd_opts) do
-      {output, 0} -> {:ok, output}
-      {output, code} -> error("failed to tar batch", %{status: code, body: output})
+        with :ok <- added, do: read_archive(archive)
+
+      {:error, reason} ->
+        {:error,
+         ErrorMessage.unprocessable_entity("could not open archive", %{
+           phase: :copy,
+           reason: reason
+         })}
+    end
+  end
+
+  defp add_members(tar, host_tmp) do
+    Enum.reduce_while(["manifest.tsv", "run.sh", "entries"], :ok, fn member, :ok ->
+      path = to_charlist(Path.join(host_tmp, member))
+
+      case :erl_tar.add(tar, path, to_charlist(member), []) do
+        :ok ->
+          {:cont, :ok}
+
+        {:error, reason} ->
+          {:halt,
+           {:error,
+            ErrorMessage.unprocessable_entity("could not add #{member} to the archive", %{
+              phase: :copy,
+              reason: reason
+            })}}
+      end
+    end)
+  end
+
+  # `:erl_tar` has no in-memory sink, so the archive is written alongside the
+  # staged entries and read back. It lives in the tempdir the `after` block
+  # already removes, so this adds no cleanup path of its own.
+  defp read_archive(archive) do
+    case File.read(archive) do
+      {:ok, bytes} ->
+        {:ok, bytes}
+
+      {:error, reason} ->
+        {:error,
+         ErrorMessage.unprocessable_entity("could not read archive", %{
+           phase: :copy,
+           reason: reason
+         })}
     end
   end
 
@@ -272,17 +360,32 @@ defmodule Dockd.FileCopy do
         :ok
 
       {:ok, %{exit_code: code, output: output}} ->
-        error("failed to mkdir staging dir #{container_staging}", %{status: code, body: output})
+        {:error,
+         ErrorMessage.unprocessable_entity("failed to mkdir staging dir #{container_staging}", %{
+           phase: :copy,
+           reason: %{status: code, body: output}
+         })}
 
       {:error, reason} ->
-        error("failed to mkdir staging dir #{container_staging}", reason)
+        {:error,
+         ErrorMessage.unprocessable_entity("failed to mkdir staging dir #{container_staging}", %{
+           phase: :copy,
+           reason: reason
+         })}
     end
   end
 
   defp upload(container_id, container_staging, tar, docker_options) do
     case Docker.put_archive(container_id, container_staging, tar, docker_options) do
-      {:ok, _} -> :ok
-      {:error, reason} -> error("failed to upload archive to #{container_staging}", reason)
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        {:error,
+         ErrorMessage.unprocessable_entity("failed to upload archive to #{container_staging}", %{
+           phase: :copy,
+           reason: reason
+         })}
     end
   end
 
@@ -294,28 +397,40 @@ defmodule Dockd.FileCopy do
         :ok
 
       {:ok, %{exit_code: code, output: output}} ->
-        error("failed to apply file copies", %{status: code, body: output})
+        {:error,
+         ErrorMessage.unprocessable_entity("failed to apply file copies", %{
+           phase: :copy,
+           reason: %{status: code, body: output}
+         })}
 
       {:error, reason} ->
-        error("failed to apply file copies", reason)
+        {:error,
+         ErrorMessage.unprocessable_entity("failed to apply file copies", %{
+           phase: :copy,
+           reason: reason
+         })}
     end
   end
 
   defp make_entries_dir(host_tmp) do
     case File.mkdir_p(Path.join(host_tmp, "entries")) do
-      :ok -> :ok
-      {:error, reason} -> error("could not create staging dir", reason)
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        {:error,
+         ErrorMessage.unprocessable_entity("could not create staging dir", %{
+           phase: :copy,
+           reason: reason
+         })}
     end
   end
-
-  defp error(msg, reason),
-    do: {:error, Error.docker_phase_error(:copy, msg, reason, nil)}
 
   @doc """
   Lists absolute paths of every direct child of `temp_root`.
 
-  Covers both `dockd-copy-*` staging dirs created by this module and `dockd-fetch-*`
-  staging dirs created by `Dockd.Git`. Returns `[]` if the root does not yet exist.
+  Covers the `dockd-copy-*` staging dirs created by this module. Returns `[]` if
+  the root does not yet exist.
   """
   @spec list_temp_files(Path.t()) :: [Path.t()]
   def list_temp_files(temp_root) when is_binary(temp_root) do
@@ -332,19 +447,12 @@ defmodule Dockd.FileCopy do
   path other than `"/"` — this function recursively deletes, so it refuses to
   accept a root that would sweep the filesystem.
   """
-  @spec delete_temp_files(Path.t()) :: :ok | {:error, Error.t()}
+  @spec delete_temp_files(Path.t()) :: :ok | {:error, ErrorMessage.t()}
   def delete_temp_files(temp_root) do
-    with :ok <- safe_to_sweep(temp_root) do
+    with :ok <- HostTool.sweepable_root(temp_root, "temp_root") do
       temp_root
       |> list_temp_files()
       |> Enum.each(&File.rm_rf!/1)
-    end
-  end
-
-  defp safe_to_sweep(root) do
-    case HostTool.sweepable_root(root, "temp_root") do
-      :ok -> :ok
-      {:error, message} -> {:error, %Error{phase: :destroy, message: message}}
     end
   end
 end

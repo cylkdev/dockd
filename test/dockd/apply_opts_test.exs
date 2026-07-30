@@ -15,7 +15,7 @@ defmodule Dockd.ApplyOptsTest do
       {:ok, spec} = Spec.new("busybox:1.37.0", "smoke")
 
       assert {:error, err} = Dockd.apply(spec, @endpoint, false, %{}, @tmp, scoket: "/x")
-      refute err.phase === :validate
+      refute err.details.phase === :validate
     end
   end
 
@@ -24,7 +24,7 @@ defmodule Dockd.ApplyOptsTest do
       spec = %Spec{image: "busybox:1.37.0", instance_name: nil}
 
       assert {:error, err} = Dockd.apply(spec, @endpoint, false, %{}, @tmp)
-      assert err.phase === :validate
+      assert err.details.phase === :validate
       assert err.message =~ "non-empty binary :instance_name"
     end
 
@@ -33,7 +33,7 @@ defmodule Dockd.ApplyOptsTest do
 
       for bad <- [nil, "", :atom] do
         assert {:error, err} = Dockd.apply(spec, bad, false, %{}, @tmp)
-        assert err.phase === :validate
+        assert err.details.phase === :validate
         assert err.message =~ "a Docker endpoint is required"
       end
     end
@@ -44,7 +44,7 @@ defmodule Dockd.ApplyOptsTest do
       {:ok, spec} = Spec.new("busybox:1.37.0", "smoke")
 
       assert {:error, err} = Dockd.apply(spec, @endpoint, nil, %{}, @tmp)
-      assert err.phase === :validate
+      assert err.details.phase === :validate
       assert err.message =~ "disk_mount_enabled must be a boolean"
     end
 
@@ -59,44 +59,24 @@ defmodule Dockd.ApplyOptsTest do
     end
   end
 
-  describe "conditionally required host tooling" do
-    test "a spec with :repos needs git_path and git_env" do
-      {:ok, spec} =
-        Spec.new("busybox:1.37.0", "smoke",
-          repos: [%{url: "https://example.com/r.git", dest: "/work"}]
-        )
-
-      assert {:error, err} = Dockd.apply(spec, @endpoint, true, %{}, @tmp)
-      assert err.phase === :validate
-      assert err.message =~ "needs git"
-      assert err.message =~ ":git_path"
-    end
-
-    test "a spec with :copy needs tar_path and tar_env" do
+  # A spec with :copy used to need :tar_path and :tar_env, and was rejected at
+  # :validate without them. The archive is built in-process now, so there is no
+  # host tooling to require and no option to forget.
+  describe "no host tooling is required" do
+    test "a spec with :copy validates and gets as far as the daemon" do
       {:ok, spec} =
         Spec.new("busybox:1.37.0", "smoke", copy: [%{src: "/etc/hosts", dest: "/tmp/hosts"}])
-
-      assert {:error, err} = Dockd.apply(spec, @endpoint, true, %{}, @tmp)
-      assert err.phase === :validate
-      assert err.message =~ "needs tar"
-      assert err.message =~ ":tar_path"
-    end
-
-    test "a spec that copies nothing needs no tooling and gets as far as the daemon" do
-      {:ok, spec} = Spec.new("busybox:1.37.0", "smoke")
 
       # Fails on the unreachable endpoint, not on validation — which is the point.
-      assert {:error, err} = Dockd.apply(spec, @endpoint, false, %{}, @tmp)
-      refute err.phase === :validate
+      assert {:error, err} = Dockd.apply(spec, @endpoint, true, %{}, @tmp)
+      refute err.details.phase === :validate
     end
 
-    # disk_mount_enabled: false strips :copy, so the tar requirement goes with it.
-    test "disk_mount_enabled false strips the copy that would have needed tar" do
-      {:ok, spec} =
-        Spec.new("busybox:1.37.0", "smoke", copy: [%{src: "/etc/hosts", dest: "/tmp/hosts"}])
+    test "a spec that copies nothing gets as far as the daemon too" do
+      {:ok, spec} = Spec.new("busybox:1.37.0", "smoke")
 
       assert {:error, err} = Dockd.apply(spec, @endpoint, false, %{}, @tmp)
-      refute err.message =~ "needs tar"
+      refute err.details.phase === :validate
     end
   end
 end

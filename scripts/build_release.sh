@@ -6,7 +6,7 @@
 # MIX_ENV=prod and wraps it into standalone binaries via Burrito. The wrapped
 # binaries land in ./burrito_out/ (one per Burrito target: macos, linux).
 #
-# Usage: scripts/release_burrito_app.sh
+# Usage: scripts/build_release.sh
 set -euo pipefail
 
 # Run from the umbrella root regardless of where the script is invoked.

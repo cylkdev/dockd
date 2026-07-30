@@ -1,6 +1,6 @@
 defmodule Dockd.ApplyResult do
   @moduledoc """
-  The outcome of a single `Dockd.apply/2` call.
+  The outcome of a single `Dockd.apply/6` call.
 
   Carries the resulting `Dockd.Instance` (the view of the just-created
   container) plus the ordered list of `Dockd.StepResult`s captured from
@@ -14,7 +14,8 @@ defmodule Dockd.ApplyResult do
 
   # :instance is enforced, not merely typed non-nil: an ApplyResult without one
   # describes nothing. A failed apply carries its partial instance on the
-  # `%Dockd.Error{}` instead, so there is no case that needs a nil here.
+  # `%ErrorMessage{}`'s `details.instance` instead, so there is no case that
+  # needs a nil here.
   @enforce_keys [:instance]
 
   @type t :: %__MODULE__{

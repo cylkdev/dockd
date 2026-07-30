@@ -41,7 +41,7 @@ defmodule Dockd.MixProject do
   defp deps do
     [
       {:docker, github: "cylkdev/docker", branch: "main"},
-      {:elixir_exec, github: "cylkdev/elixir_exec", branch: "main"},
+      {:error_message, "~> 0.3"},
       {:credo, "~> 1.4", only: [:dev, :test], runtime: false},
       {:blitz_credo_checks, "~> 0.1.5", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},

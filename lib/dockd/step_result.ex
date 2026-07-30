@@ -2,7 +2,7 @@ defmodule Dockd.StepResult do
   @moduledoc """
   The captured outcome of a single setup step that ran inside a Dockd container.
 
-  Each step from a `Dockd.apply/2` `:steps` list produces one of these in
+  Each step from a `Dockd.apply/6` `:steps` list produces one of these in
   `Dockd.ApplyResult.step_results`, in input order. Together with the step's `:step_name` and
   `:cmd`, the struct preserves the env/workdir/user the step ran with, the captured
   combined stdout+stderr, and the process exit code.

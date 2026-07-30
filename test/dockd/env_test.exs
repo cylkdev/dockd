@@ -3,7 +3,6 @@ defmodule Dockd.EnvTest do
   # process environment to set up a case.
   use ExUnit.Case, async: true
 
-  alias Dockd.Error
 
   # Validation runs before anything is dialled, so this endpoint is never used.
   @endpoint "unix:///nonexistent/docker.sock"
@@ -11,7 +10,7 @@ defmodule Dockd.EnvTest do
 
   describe ":env resolution against host_env" do
     test "fails before any Docker call when a bare name is absent from host_env" do
-      assert {:error, %Error{phase: :validate, message: msg}} =
+      assert {:error, %ErrorMessage{message: msg, details: %{phase: :validate}}} =
                apply_env(["DOCKD_DEFINITELY_UNSET"], %{})
 
       assert msg =~ "DOCKD_DEFINITELY_UNSET"
@@ -19,14 +18,14 @@ defmodule Dockd.EnvTest do
     end
 
     test "resolves a bare name that host_env supplies" do
-      assert {:error, %Error{phase: phase}} =
+      assert {:error, %ErrorMessage{details: %{phase: phase}}} =
                apply_env(["DOCKD_TEST_BARE_OK"], %{"DOCKD_TEST_BARE_OK" => "host_val"})
 
       refute phase === :validate
     end
 
     test "passes a literal NAME=value entry through without any lookup" do
-      assert {:error, %Error{phase: phase}} = apply_env(["LITERAL=value"], %{})
+      assert {:error, %ErrorMessage{details: %{phase: phase}}} = apply_env(["LITERAL=value"], %{})
       refute phase === :validate
     end
 
@@ -34,106 +33,77 @@ defmodule Dockd.EnvTest do
     # reach nothing from the host, no matter what the real process environment
     # holds.
     test "an empty host_env resolves nothing, even for names the process defines" do
-      assert {:error, %Error{phase: :validate, message: msg}} = apply_env(["PATH"], %{})
+      assert {:error, %ErrorMessage{message: msg, details: %{phase: :validate}}} = apply_env(["PATH"], %{})
       assert msg =~ "absent from host_env"
     end
 
-    test "rejects non-string, non-tuple entries with a clear error" do
-      assert {:error, %Error{phase: :validate, message: msg}} = apply_env([:not_a_string], %{})
-      assert msg =~ ":env entries must be strings or"
+    test "rejects non-string entries with a clear error" do
+      for bad <- [:not_a_string, {"NAME", value: "v"}, %{"name" => "NAME"}] do
+        assert {:error, %ErrorMessage{message: msg, details: %{phase: :validate}}} = apply_env([bad], %{})
+        assert msg =~ ":env entries must be strings"
+      end
     end
 
     test "rejects a non-list :env" do
-      assert {:error, %Error{phase: :validate, message: msg}} = apply_env("FOO", %{})
+      assert {:error, %ErrorMessage{message: msg, details: %{phase: :validate}}} = apply_env("FOO", %{})
       assert msg =~ ":env must be a list"
     end
 
-    test "{name, value: literal} resolves without a host lookup" do
-      assert {:error, %Error{phase: phase}} =
-               apply_env([{"DOCKD_TEST_VALUE_SHAPE", value: "literal"}], %{})
-
-      refute phase === :validate
-    end
-
-    test "{name, default: ...} succeeds at validate when host_env lacks the name" do
-      assert {:error, %Error{phase: phase}} =
-               apply_env([{"DOCKD_TEST_FALLBACK", default: "fallback"}], %{})
-
-      refute phase === :validate
-    end
-
-    test "{name, optional: true} resolves at validate when host_env lacks the name" do
-      assert {:error, %Error{phase: phase}} =
-               apply_env([{"DOCKD_TEST_OPTIONAL", optional: true}], %{})
-
-      refute phase === :validate
-    end
-
-    test "required passthrough (bare-name tuple) errors when host_env lacks the name" do
-      assert {:error, %Error{phase: :validate, message: msg}} =
-               apply_env([{"DOCKD_TEST_REQUIRED", []}], %{})
-
-      assert msg =~ "DOCKD_TEST_REQUIRED"
-      assert msg =~ "absent from host_env"
-    end
   end
 
-  describe ":default precedence" do
-    # This is the inversion. Previously host_env was consulted first and won, so
-    # a value the caller wrote down could be silently overridden by ambient
-    # state. An explicit argument now outranks the environment.
-    test "an explicit :default beats a value present in host_env" do
-      {:ok, spec} =
-        Dockd.Spec.new("busybox:1.37.0", "smoke",
-          env: [{"DOCKD_TEST_PRECEDENCE", default: "from-default"}]
-        )
+  # Two shapes, no precedence rule: a literal, or a name read from host_env.
+  describe ":env resolution has exactly two shapes" do
+    test "a literal is passed through verbatim" do
+      {:ok, spec} = Dockd.Spec.new("busybox:1.37.0", "smoke", env: ["FOO=bar"])
 
-      host_env = %{"DOCKD_TEST_PRECEDENCE" => "from-host-env"}
-
-      assert {:ok, resolved} = expand_env(spec, host_env)
-      assert resolved === ["DOCKD_TEST_PRECEDENCE=from-default"]
+      assert {:ok, ["FOO=bar"]} = expand_env(spec, %{})
     end
 
-    test "host_env supplies the value when no :default is given" do
-      {:ok, spec} =
-        Dockd.Spec.new("busybox:1.37.0", "smoke", env: [{"DOCKD_TEST_PRECEDENCE", []}])
+    test "a bare name is read from host_env" do
+      {:ok, spec} = Dockd.Spec.new("busybox:1.37.0", "smoke", env: ["FOO"])
 
-      host_env = %{"DOCKD_TEST_PRECEDENCE" => "from-host-env"}
-
-      assert {:ok, resolved} = expand_env(spec, host_env)
-      assert resolved === ["DOCKD_TEST_PRECEDENCE=from-host-env"]
+      assert {:ok, ["FOO=from-host-env"]} = expand_env(spec, %{"FOO" => "from-host-env"})
     end
 
-    test ":value still beats both" do
-      {:ok, spec} =
-        Dockd.Spec.new("busybox:1.37.0", "smoke",
-          env: [{"DOCKD_TEST_PRECEDENCE", value: "literal", default: "from-default"}]
-        )
+    # host_env is the only source. There is no :default to outrank it and no
+    # :optional to excuse its absence, so a missing name is always an error.
+    test "a bare name absent from host_env is a :validate error" do
+      {:ok, spec} = Dockd.Spec.new("busybox:1.37.0", "smoke", env: ["FOO"])
 
-      host_env = %{"DOCKD_TEST_PRECEDENCE" => "from-host-env"}
+      assert {:error, %ErrorMessage{message: msg, details: %{phase: :validate}}} = expand_env(spec, %{})
+      assert msg =~ "absent from host_env"
+    end
 
-      assert {:ok, resolved} = expand_env(spec, host_env)
-      assert resolved === ["DOCKD_TEST_PRECEDENCE=literal"]
+    test "only the first = splits a literal, so values may contain =" do
+      {:ok, spec} = Dockd.Spec.new("busybox:1.37.0", "smoke", env: ["FOO=a=b"])
+
+      assert {:ok, ["FOO=a=b"]} = expand_env(spec, %{})
+    end
+
+    test "resolves entries in order, keeping duplicates as written" do
+      {:ok, spec} = Dockd.Spec.new("busybox:1.37.0", "smoke", env: ["A=1", "B", "A=2"])
+
+      assert {:ok, ["A=1", "B=host", "A=2"]} = expand_env(spec, %{"B" => "host"})
     end
   end
 
   describe ":mounts validation" do
     test "rejects malformed string entries" do
-      assert {:error, %Error{phase: :validate, message: msg}} =
+      assert {:error, %ErrorMessage{message: msg, details: %{phase: :validate}}} =
                apply_spec_opts(mounts: ["bad-mount-no-colon"])
 
       assert msg =~ "invalid :mounts entry"
     end
 
     test "rejects map entries without :target" do
-      assert {:error, %Error{phase: :validate, message: msg}} =
+      assert {:error, %ErrorMessage{message: msg, details: %{phase: :validate}}} =
                apply_spec_opts(mounts: [%{type: "tmpfs"}])
 
       assert msg =~ ":mounts map entry requires"
     end
 
     test "rejects a non-list :mounts" do
-      assert {:error, %Error{phase: :validate, message: msg}} = apply_spec_opts(mounts: "/h:/c")
+      assert {:error, %ErrorMessage{message: msg, details: %{phase: :validate}}} = apply_spec_opts(mounts: "/h:/c")
       assert msg =~ ":mounts must be a list"
     end
   end
@@ -145,8 +115,6 @@ defmodule Dockd.EnvTest do
   end
 
   defp apply_spec_opts(spec_opts), do: apply_image_with(%{}, spec_opts)
-
-  defp apply_opts(opts), do: apply_image_with(%{}, opts)
 
   defp apply_image_with(host_env, opts) do
     Dockd.apply_image(

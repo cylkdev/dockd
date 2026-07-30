@@ -5,18 +5,17 @@ defmodule Dockd.Instance do
   An `Instance` is derived state: it is hydrated on demand from the Docker
   daemon (via `find_container/2` or `list_containers/2`) and is never
   long-lived. After a dockd process crashes or restarts, the world still
-  looks the same — every `Dockd.apply/2`-created container carries the
+  looks the same — every `Dockd.apply/6`-created container carries the
   marker label `org.dockd.instance=true` and the instance name as
-  `org.dockd.instance.name`, so `Dockd.list/1` can rebuild the full set of
+  `org.dockd.instance.name`, so `Dockd.list/2` can rebuild the full set of
   instances by querying Docker alone.
 
   The struct is intentionally minimal: it carries identity, the parts of
   the container's runtime configuration that callers commonly need, and a
   pre-computed `running?` flag. It does *not* carry the original `Spec`.
   After creation the container's filesystem is the source of truth for the
-  effects of provisioning (cloned repos, copied host files, executed setup
-  steps); reconstructing that intent post-hoc is neither necessary nor
-  meaningful.
+  effects of provisioning (copied host files, executed setup steps);
+  reconstructing that intent post-hoc is neither necessary nor meaningful.
 
   Use `from_inspect/1` to build an `Instance` from a Docker inspect
   payload.

@@ -14,15 +14,15 @@ defmodule Dockd.Provisioner do
 
   All caller-runtime state lives in the arguments and the internal pipeline
   context; nothing about this module's state survives a single call. Errors are
-  tagged with the phase that produced them; when a container was created before
-  the failure, the error carries a hydrated `Dockd.Instance` so callers can clean
-  up with `Dockd.destroy/3`.
+  `%ErrorMessage{}` structs tagged with the phase that produced them in
+  `details.phase`; when a container was created before the failure,
+  `details.instance` carries a hydrated `Dockd.Instance` so callers can clean up
+  with `Dockd.destroy/3`.
   """
 
   require Logger
 
   alias Dockd.ApplyResult
-  alias Dockd.Error
   alias Dockd.HostTool
   alias Dockd.Instance
   alias Dockd.Spec
@@ -32,7 +32,7 @@ defmodule Dockd.Provisioner do
   # `endpoint` argument, so it cannot be forgotten and silently defaulted.
   @docker_option_keys [:api_version, :platform, :networks, :network_mode]
 
-  @host_path_keys [:mounts, :repos, :copy]
+  @host_path_keys [:mounts, :copy]
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -43,34 +43,34 @@ defmodule Dockd.Provisioner do
 
   Builds a per-call context from the arguments, then executes the pipeline in
   order: validate the spec, enforce disk-mount policy, expand env, normalize
-  mounts, validate the image source, normalize step/repo/copy specs, resolve the
-  image (build or pull), create and start the container, fetch repos, copy host
-  files, run setup steps, and hydrate the resulting `Dockd.Instance`.
+  mounts, validate the image source, normalize step/copy specs, resolve the
+  image (build or pull), create and start the container, copy host files, run
+  setup steps, and hydrate the resulting `Dockd.Instance`.
 
   Arguments:
 
     - `spec` — the `Dockd.Spec` to realize
     - `endpoint` — the Docker daemon to talk to, e.g.
       `"unix:///var/run/docker.sock"` or `"tcp://10.0.0.1:2376"`
-    - `disk_mount_enabled` — `true` permits host mounts, repo clones, file copies
-      and host-derived env; `false` strips them. No default: an absent policy must
+    - `disk_mount_enabled` — `true` permits host mounts, file copies and
+      host-derived env; `false` strips them. No default: an absent policy must
       never mean "expose the host"
     - `host_env` — the environment `:env` entries resolve against. Pass `%{}` to
       resolve nothing from the host
-    - `temp_root` — host directory for repo-clone and file-copy staging
+    - `temp_root` — host directory for file-copy staging
 
   `validate_spec/1` runs first so a hand-built `%Dockd.Spec{}` with a `nil`
   `:image` or `:instance_name` produces a `:validate` error rather than crashing
   further down.
 
   Returns `{:ok, %Dockd.ApplyResult{}}` on success. On failure returns
-  `{:error, %Dockd.Error{}}` tagged with the phase that failed; when a container
-  was already created, the error carries a hydrated (or stub) `Dockd.Instance`
-  and any captured `step_results` so the caller can clean up with
-  `Dockd.destroy/3`.
+  `{:error, %ErrorMessage{}}` with `details.phase` naming the phase that failed;
+  when a container was already created, `details.instance` carries a hydrated (or
+  stub) `Dockd.Instance` and `details.step_results` whatever was captured, so the
+  caller can clean up with `Dockd.destroy/3`.
   """
   @spec run(Spec.t(), binary(), boolean(), %{optional(binary()) => binary()}, Path.t(), keyword()) ::
-          {:ok, ApplyResult.t()} | {:error, Error.t()}
+          {:ok, ApplyResult.t()} | {:error, ErrorMessage.t()}
   def run(%Spec{} = spec, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ [])
       when is_map(host_env) and is_list(opts) do
     with {:ok, docker_options} <- docker_options_from(endpoint, opts),
@@ -81,10 +81,9 @@ defmodule Dockd.Provisioner do
         docker_options: docker_options,
         host_env: host_env,
         temp_root: temp_root,
-        tools: tools_from(opts),
+        container_staging_root: Keyword.get(opts, :container_staging_root, "/tmp"),
         container_id: nil,
         steps: [],
-        repos: [],
         copies: [],
         step_results: []
       }
@@ -99,13 +98,10 @@ defmodule Dockd.Provisioner do
          {:ok, ctx} <- normalize_mounts(ctx),
          {:ok, ctx} <- validate_source(ctx),
          {:ok, ctx} <- normalize_step_specs(ctx),
-         {:ok, ctx} <- normalize_repo_specs(ctx),
          {:ok, ctx} <- normalize_copy_specs(ctx),
-         {:ok, ctx} <- validate_tools(ctx),
          {:ok, ctx} <- resolve_image(ctx),
          {:ok, ctx} <- create_container(ctx),
          {:ok, ctx} <- start_container(ctx),
-         {:ok, ctx} <- download_repos_to_host(ctx),
          {:ok, ctx} <- copy_files(ctx),
          {:ok, ctx} <- run_steps(ctx),
          {:ok, instance} <- hydrate(ctx) do
@@ -119,7 +115,7 @@ defmodule Dockd.Provisioner do
   Tolerates 304 (already stopped) and 404 (not found) responses so that
   destroying an already-gone container is a no-op.
   """
-  @spec destroy(binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  @spec destroy(binary(), binary(), keyword()) :: :ok | {:error, ErrorMessage.t()}
   def destroy(container_ref, endpoint, opts \\ [])
       when is_binary(container_ref) and is_list(opts) do
     with {:ok, docker_options} <- docker_options_from(endpoint, opts),
@@ -140,9 +136,9 @@ defmodule Dockd.Provisioner do
   else becomes `:host`. The caller-facing `:api_version` option is renamed to
   `:version` to match the keyword the `Docker` client expects.
   """
-  @spec docker_options_from(binary(), keyword()) :: {:ok, keyword()} | {:error, Error.t()}
+  @spec docker_options_from(binary(), keyword()) :: {:ok, keyword()} | {:error, ErrorMessage.t()}
   def docker_options_from(endpoint, opts \\ []) when is_list(opts) do
-    with {:ok, connection} <- endpoint_option(endpoint) do
+    with {:ok, connection} <- validate_endpoint(endpoint) do
       extra =
         opts
         |> Keyword.take(@docker_option_keys)
@@ -152,7 +148,7 @@ defmodule Dockd.Provisioner do
     end
   end
 
-  defp endpoint_option(endpoint) when is_binary(endpoint) and endpoint !== "" do
+  defp validate_endpoint(endpoint) when is_binary(endpoint) and endpoint !== "" do
     cond do
       String.starts_with?(endpoint, "unix://") ->
         {:ok, {:socket, String.replace_prefix(endpoint, "unix://", "")}}
@@ -165,23 +161,13 @@ defmodule Dockd.Provisioner do
     end
   end
 
-  defp endpoint_option(other) do
+  defp validate_endpoint(other) do
     {:error,
-     validate_error(
+     ErrorMessage.bad_request(
        "a Docker endpoint is required, got: #{inspect(other)}. " <>
-         ~s(Pass a socket path like "unix:///var/run/docker.sock" or a host like "tcp://10.0.0.1:2376".)
+         ~s(Pass a socket path like "unix:///var/run/docker.sock" or a host like "tcp://10.0.0.1:2376".),
+       %{phase: :validate}
      )}
-  end
-
-  defp tools_from(opts) do
-    %{
-      git_path: Keyword.get(opts, :git_path),
-      git_env: Keyword.get(opts, :git_env),
-      tar_path: Keyword.get(opts, :tar_path),
-      tar_env: Keyword.get(opts, :tar_env),
-      tar_extra_args: Keyword.get(opts, :tar_extra_args, []),
-      container_staging_root: Keyword.get(opts, :container_staging_root, "/tmp")
-    }
   end
 
   # ---------------------------------------------------------------------------
@@ -192,51 +178,7 @@ defmodule Dockd.Provisioner do
   # incomplete %Spec{} literal, but not one built with an explicit nil.
   defp validate_spec(spec), do: Spec.validate(spec)
 
-  defp validate_temp_root(root) do
-    case HostTool.staging_root(root, "temp_root") do
-      :ok -> :ok
-      {:error, message} -> validate_error_tuple(message)
-    end
-  end
-
-  defp validate_error_tuple(message), do: {:error, validate_error(message)}
-
-  # `git` and `tar` are only needed when the spec actually clones a repo or
-  # copies a host file, so they are options rather than positional arguments on
-  # `run/6`. What matters is that a missing one is a hard `:validate` error at the
-  # point of need — there is no PATH lookup to fall back on.
-  defp validate_tools(%{repos: repos, copies: copies} = ctx) do
-    needs_git? = repos !== []
-    needs_tar? = repos !== [] or copies !== []
-
-    with :ok <- require_tool(ctx, needs_git?, :git_path, :git_env, ":repos"),
-         :ok <- require_tool(ctx, needs_tar?, :tar_path, :tar_env, ":copy or :repos") do
-      {:ok, ctx}
-    end
-  end
-
-  defp require_tool(_ctx, false, _path_key, _env_key, _because), do: :ok
-
-  defp require_tool(ctx, true, path_key, env_key, because) do
-    tool = String.replace_suffix(Atom.to_string(path_key), "_path", "")
-
-    cond do
-      not is_binary(Map.get(ctx.tools, path_key)) ->
-        validate_error_tuple(
-          "this spec uses #{because}, which needs #{tool}. " <>
-            "Pass #{inspect(path_key)} with the absolute path to the #{tool} executable."
-        )
-
-      not is_map(Map.get(ctx.tools, env_key)) ->
-        validate_error_tuple(
-          "this spec uses #{because}, which needs #{tool}. " <>
-            "Pass #{inspect(env_key)} with the environment to run #{tool} in (%{} for none)."
-        )
-
-      true ->
-        :ok
-    end
-  end
+  defp validate_temp_root(root), do: HostTool.staging_root(root, "temp_root")
 
   # ---------------------------------------------------------------------------
   # Pipeline — disk-mount policy
@@ -250,7 +192,11 @@ defmodule Dockd.Provisioner do
     do: {:ok, %{ctx | spec: strip_host_exposure(ctx.spec)}}
 
   defp enforce_disk_mount_policy(_ctx, other),
-    do: validate_error_tuple("disk_mount_enabled must be a boolean, got: #{inspect(other)}")
+    do:
+      {:error,
+       ErrorMessage.bad_request("disk_mount_enabled must be a boolean, got: #{inspect(other)}", %{
+         phase: :validate
+       })}
 
   defp strip_host_exposure(%Spec{} = spec) do
     spec
@@ -309,22 +255,19 @@ defmodule Dockd.Provisioner do
   Pure, and the same code the pipeline runs, so the resolution rules can be
   checked without a daemon. Each entry resolves as:
 
-    - `"NAME=value"` — passed through verbatim
-    - `"NAME"` — looked up in `host_env`; absent is a `:validate` error
-    - `{"NAME", value: v}` — `v` verbatim, no lookup
-    - `{"NAME", default: d}` — `d`, **even when `host_env` has the name**. An
-      explicitly-passed default outranks the environment; the reverse would let
-      ambient state silently override a value the caller wrote down.
-    - `{"NAME", optional: true}` — dropped when `host_env` lacks the name
-    - `{"NAME", []}` — required; absent from `host_env` is a `:validate` error
+    - `"NAME=value"` — a literal, passed through verbatim
+    - `"NAME"` — read from `host_env`; absent from it is a `:validate` error
+
+  Two shapes and no precedence rule to remember. "Inherit" always means *from
+  the `host_env` map the caller passed*, never from the calling process.
   """
   @spec resolve_env(Spec.t(), %{optional(binary()) => binary()}) ::
-          {:ok, [binary()]} | {:error, Error.t()}
+          {:ok, [binary()]} | {:error, ErrorMessage.t()}
   def resolve_env(%Spec{env: entries}, host_env) when is_list(entries),
     do: resolve_env_entries(entries, host_env)
 
   def resolve_env(%Spec{}, _host_env),
-    do: {:error, validate_error(":env must be a list")}
+    do: {:error, ErrorMessage.bad_request(":env must be a list", %{phase: :validate})}
 
   # Not merely a fast path. Without it, `expand_env/1`'s only return narrows
   # `spec.env` to the resolved `[binary()]`, and dialyzer then reads
@@ -343,7 +286,6 @@ defmodule Dockd.Provisioner do
   defp resolve_env_entries(entries, host_env) do
     Enum.reduce_while(entries, {:ok, []}, fn entry, {:ok, acc} ->
       case resolve_env_entry(entry, host_env) do
-        {:ok, :drop} -> {:cont, {:ok, acc}}
         {:ok, str} -> {:cont, {:ok, acc ++ [str]}}
         {:error, _} = err -> {:halt, err}
       end
@@ -359,51 +301,20 @@ defmodule Dockd.Provisioner do
           {:ok, "#{entry}=#{val}"}
 
         :error ->
-          {:error, validate_error(":env references a name absent from host_env: #{entry}")}
+          {:error,
+           ErrorMessage.bad_request(":env references a name absent from host_env: #{entry}", %{
+             phase: :validate
+           })}
       end
-    end
-  end
-
-  defp resolve_env_entry({name, opts}, host_env) when is_binary(name) and is_list(opts) do
-    if Keyword.has_key?(opts, :value) do
-      {:ok, "#{name}=#{Keyword.fetch!(opts, :value)}"}
-    else
-      resolve_host_env(name, opts, host_env)
     end
   end
 
   defp resolve_env_entry(other, _host_env),
     do:
       {:error,
-       validate_error(
-         ":env entries must be strings or {name, opts} tuples, got: #{inspect(other)}"
-       )}
-
-  # An explicitly-supplied :default outranks host_env. The reverse would let
-  # ambient state silently override a value the caller wrote down.
-  defp resolve_host_env(name, opts, host_env) do
-    case Keyword.fetch(opts, :default) do
-      {:ok, default} when is_binary(default) ->
-        {:ok, "#{name}=#{default}"}
-
-      _ ->
-        resolve_from_host_env(name, opts, host_env)
-    end
-  end
-
-  defp resolve_from_host_env(name, opts, host_env) do
-    case Map.fetch(host_env, name) do
-      {:ok, val} ->
-        {:ok, "#{name}=#{val}"}
-
-      :error ->
-        if Keyword.get(opts, :optional) === true do
-          {:ok, :drop}
-        else
-          {:error, validate_error(":env references a name absent from host_env: #{name}")}
-        end
-    end
-  end
+       ErrorMessage.bad_request(":env entries must be strings, got: #{inspect(other)}", %{
+         phase: :validate
+       })}
 
   # ---------------------------------------------------------------------------
   # Pipeline — mounts
@@ -424,7 +335,7 @@ defmodule Dockd.Provisioner do
   end
 
   defp normalize_mounts(_ctx),
-    do: {:error, validate_error(":mounts must be a list")}
+    do: {:error, ErrorMessage.bad_request(":mounts must be a list", %{phase: :validate})}
 
   defp classify_mounts(entries) do
     Enum.reduce_while(entries, {:ok, {[], []}}, fn entry, {:ok, {binds, mounts}} ->
@@ -438,31 +349,40 @@ defmodule Dockd.Provisioner do
 
   defp classify_mount_entry(s) when is_binary(s) do
     case String.split(s, ":", parts: 3) do
-      [_h, _c] -> {:bind, s}
-      [_h, _c, _o] -> {:bind, s}
-      _ -> {:error, validate_error("invalid :mounts entry: #{inspect(s)}")}
+      [_h, _c] ->
+        {:bind, s}
+
+      [_h, _c, _o] ->
+        {:bind, s}
+
+      _ ->
+        {:error,
+         ErrorMessage.bad_request("invalid :mounts entry: #{inspect(s)}", %{phase: :validate})}
     end
   end
 
   defp classify_mount_entry(m) when is_map(m) do
-    case Spec.fetch_either(m, :target) do
+    case Map.get(m, :target) do
       target when is_binary(target) and target !== "" ->
-        {:mount, atomize_mount_keys(m)}
+        {:mount, m}
 
-      _ ->
-        {:error, validate_error(":mounts map entry requires a non-empty :target")}
+      nil ->
+        {:error,
+         ErrorMessage.bad_request(":mounts map entry requires a :target", %{phase: :validate})}
+
+      other ->
+        {:error,
+         ErrorMessage.bad_request(
+           ":mounts map entry :target must be a non-empty string, got: #{inspect(other)}",
+           %{phase: :validate}
+         )}
     end
   end
 
   defp classify_mount_entry(other),
-    do: {:error, validate_error("invalid :mounts entry: #{inspect(other)}")}
-
-  defp atomize_mount_keys(m) do
-    for {k, v} <- m, into: %{} do
-      key = if is_binary(k), do: String.to_atom(k), else: k
-      {key, v}
-    end
-  end
+    do:
+      {:error,
+       ErrorMessage.bad_request("invalid :mounts entry: #{inspect(other)}", %{phase: :validate})}
 
   defp put_unless_empty(opts, _key, []), do: opts
   defp put_unless_empty(opts, key, val), do: Keyword.put(opts, key, val)
@@ -478,17 +398,20 @@ defmodule Dockd.Provisioner do
   defp validate_source(%{spec: %Spec{image: image, build: build}} = ctx) do
     case do_validate_source(image, build) do
       :ok -> {:ok, ctx}
-      {:error, msg} -> {:error, validate_error(msg)}
+      {:error, msg} -> {:error, ErrorMessage.bad_request(msg, %{phase: :validate})}
     end
   end
 
   defp do_validate_source(_image, %{} = build) do
-    case Spec.fetch_either(build, :dockerfile) do
+    case Map.get(build, :dockerfile) do
       df when is_binary(df) ->
         validate_dockerfile_path(df)
 
-      _ ->
+      nil ->
         {:error, ":build map must include a :dockerfile path"}
+
+      other ->
+        {:error, ":build :dockerfile must be a string path, got: #{inspect(other)}"}
     end
   end
 
@@ -528,18 +451,18 @@ defmodule Dockd.Provisioner do
   end
 
   # ---------------------------------------------------------------------------
-  # Pipeline — normalize steps / repos / copies
+  # Pipeline — normalize steps / copies
   # ---------------------------------------------------------------------------
 
   defp normalize_step_specs(%{spec: %Spec{steps: specs}} = ctx) when is_list(specs) do
     case do_normalize_steps(specs) do
       {:ok, steps} -> {:ok, %{ctx | steps: steps}}
-      {:error, msg} -> {:error, validate_error(msg)}
+      {:error, msg} -> {:error, ErrorMessage.bad_request(msg, %{phase: :validate})}
     end
   end
 
   defp normalize_step_specs(_ctx),
-    do: {:error, validate_error(":steps must be a list")}
+    do: {:error, ErrorMessage.bad_request(":steps must be a list", %{phase: :validate})}
 
   defp do_normalize_steps(step_specs) do
     step_specs
@@ -553,11 +476,11 @@ defmodule Dockd.Provisioner do
   end
 
   defp normalize_step(step_spec, index) when is_map(step_spec) do
-    step_name = get_value(step_spec, :step_name)
-    cmd = get_value(step_spec, :cmd)
-    env = get_value(step_spec, :env)
-    workdir = get_value(step_spec, :workdir)
-    user = get_value(step_spec, :user)
+    step_name = Map.get(step_spec, :step_name)
+    cmd = Map.get(step_spec, :cmd)
+    env = Map.get(step_spec, :env)
+    workdir = Map.get(step_spec, :workdir)
+    user = Map.get(step_spec, :user)
     prefix = "step #{index + 1}"
 
     with :ok <- check_renamed_step_key(step_spec, step_name, prefix),
@@ -577,7 +500,7 @@ defmodule Dockd.Provisioner do
   # `:label` was renamed to `:step_name` — `label` now only ever means a Docker
   # label. Say so rather than reporting a missing key.
   defp check_renamed_step_key(step_spec, nil, prefix) do
-    if is_nil(get_value(step_spec, :label)) do
+    if is_nil(Map.get(step_spec, :label)) do
       :ok
     else
       {:error, "#{prefix} uses :label, which was renamed to :step_name"}
@@ -607,48 +530,6 @@ defmodule Dockd.Provisioner do
   defp validate_optional_binary(value, _msg) when is_binary(value), do: :ok
   defp validate_optional_binary(_value, msg), do: {:error, msg}
 
-  defp normalize_repo_specs(%{spec: %Spec{repos: specs}} = ctx) when is_list(specs) do
-    case do_normalize_repos(specs) do
-      {:ok, repos} -> {:ok, %{ctx | repos: repos}}
-      {:error, msg} -> {:error, validate_error(msg)}
-    end
-  end
-
-  defp normalize_repo_specs(_ctx),
-    do: {:error, validate_error(":repos must be a list")}
-
-  defp do_normalize_repos(specs) do
-    specs
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {spec, index}, {:ok, acc} ->
-      case normalize_repo(spec, index) do
-        {:ok, normalized} -> {:cont, {:ok, acc ++ [normalized]}}
-        {:error, msg} -> {:halt, {:error, msg}}
-      end
-    end)
-  end
-
-  defp normalize_repo(spec, index) when is_map(spec) do
-    url = get_value(spec, :url)
-    dest = get_value(spec, :dest)
-    ref = get_value(spec, :ref)
-    depth = get_value(spec, :depth)
-    history = get_value(spec, :history)
-    prefix = "repo #{index + 1}"
-
-    with :ok <- validate_nonempty_binary(url, "#{prefix} must include a non-empty :url"),
-         :ok <- validate_nonempty_binary(dest, "#{prefix} must include a non-empty :dest"),
-         :ok <- validate_absolute_path(dest, prefix),
-         :ok <- validate_optional_binary(ref, "#{prefix} has invalid :ref"),
-         :ok <- validate_optional_positive_integer(depth, prefix),
-         :ok <- validate_optional_boolean(history, prefix) do
-      {:ok, drop_nil(%{url: url, dest: dest, ref: ref, depth: depth, history: history})}
-    end
-  end
-
-  defp normalize_repo(_spec, index),
-    do: {:error, "repo #{index + 1} must be a map"}
-
   defp validate_absolute_path(dest, prefix) do
     if String.starts_with?(dest, "/") do
       :ok
@@ -657,29 +538,15 @@ defmodule Dockd.Provisioner do
     end
   end
 
-  defp validate_optional_positive_integer(nil, _prefix), do: :ok
-
-  defp validate_optional_positive_integer(value, _prefix) when is_integer(value) and value > 0,
-    do: :ok
-
-  defp validate_optional_positive_integer(_value, prefix),
-    do: {:error, "#{prefix} :depth must be a positive integer"}
-
-  defp validate_optional_boolean(nil, _prefix), do: :ok
-  defp validate_optional_boolean(value, _prefix) when is_boolean(value), do: :ok
-
-  defp validate_optional_boolean(_value, prefix),
-    do: {:error, "#{prefix} :history must be a boolean"}
-
   defp normalize_copy_specs(%{spec: %Spec{copy: specs}} = ctx) when is_list(specs) do
     case do_normalize_copies(specs) do
       {:ok, copies} -> {:ok, %{ctx | copies: copies}}
-      {:error, msg} -> {:error, validate_error(msg)}
+      {:error, msg} -> {:error, ErrorMessage.bad_request(msg, %{phase: :validate})}
     end
   end
 
   defp normalize_copy_specs(_ctx),
-    do: {:error, validate_error(":copy must be a list")}
+    do: {:error, ErrorMessage.bad_request(":copy must be a list", %{phase: :validate})}
 
   defp do_normalize_copies(specs) do
     specs
@@ -693,10 +560,10 @@ defmodule Dockd.Provisioner do
   end
 
   defp normalize_copy(spec, index) when is_map(spec) do
-    src = get_value(spec, :src)
-    dest = get_value(spec, :dest)
-    mode = get_value(spec, :mode)
-    owner = get_value(spec, :owner)
+    src = Map.get(spec, :src)
+    dest = Map.get(spec, :dest)
+    mode = Map.get(spec, :mode)
+    owner = Map.get(spec, :owner)
     prefix = "copy #{index + 1}"
 
     with :ok <- validate_nonempty_binary(src, "#{prefix} must include a non-empty :src"),
@@ -716,9 +583,6 @@ defmodule Dockd.Provisioner do
   defp normalize_copy(_spec, index),
     do: {:error, "copy #{index + 1} must be a map"}
 
-  # One helper, not two: `get_value/2` and `atomize_key/2` had identical bodies.
-  defp get_value(map, key), do: Spec.fetch_either(map, key)
-
   defp drop_nil(map),
     do: for({k, v} <- map, not is_nil(v), into: %{}, do: {k, v})
 
@@ -730,19 +594,21 @@ defmodule Dockd.Provisioner do
   defp resolve_image(%{spec: %Spec{build: %{} = build}} = ctx), do: build_image(ctx, build)
 
   defp pull_image(%{spec: %Spec{image: image}, docker_options: docker_options} = ctx) do
-    docker_call(ctx, :pull, "failed to pull Docker image", fn ->
-      with {:ok, stream} <- Docker.pull_image(image, %{}, docker_options),
-           :ok <- consume_image_stream(stream, :pull) do
-        {:ok, image}
-      end
-    end)
+    with {:ok, stream} <- Docker.pull_image(image, %{}, docker_options),
+         :ok <- consume_image_stream(stream, :pull) do
+      {:ok, Map.put(ctx, :last_docker_result, image)}
+    else
+      {:error, reason} ->
+        {:error,
+         ErrorMessage.bad_gateway("failed to pull Docker image", %{phase: :pull, reason: reason})}
+    end
   end
 
   defp build_image(%{spec: %Spec{image: tag}, docker_options: docker_options} = ctx, build) do
     # Both paths are absolute — `Spec.validate/1` rejects anything else, so there
     # is no Path.expand here and no dependency on the caller's CWD.
-    dockerfile = get_value(build, :dockerfile)
-    context = get_value(build, :context)
+    dockerfile = Map.get(build, :dockerfile)
+    context = Map.get(build, :context)
 
     {context_path, dockerfile_path} =
       if File.dir?(dockerfile) do
@@ -755,13 +621,18 @@ defmodule Dockd.Provisioner do
 
     build_params = build_params_for_engine(build)
 
-    docker_call(ctx, :build, "failed to build Docker image", fn ->
-      with {:ok, stream} <-
-             Docker.build_image(context_path, dockerfile_path, tag, build_params, docker_options),
-           :ok <- consume_image_stream(stream, :build) do
-        {:ok, tag}
-      end
-    end)
+    with {:ok, stream} <-
+           Docker.build_image(context_path, dockerfile_path, tag, build_params, docker_options),
+         :ok <- consume_image_stream(stream, :build) do
+      {:ok, Map.put(ctx, :last_docker_result, tag)}
+    else
+      {:error, reason} ->
+        {:error,
+         ErrorMessage.unprocessable_entity("failed to build Docker image", %{
+           phase: :build,
+           reason: reason
+         })}
+    end
   end
 
   # Build params travel to the Engine as a URL query string, so the ones the
@@ -803,7 +674,6 @@ defmodule Dockd.Provisioner do
     end
   end
 
-
   # ---------------------------------------------------------------------------
   # Pipeline — container lifecycle
   # ---------------------------------------------------------------------------
@@ -811,7 +681,8 @@ defmodule Dockd.Provisioner do
   defp create_container(
          %{
            spec:
-             %Spec{instance_name: name, labels: user_labels, image: image, shell: shell, env: env} = spec,
+             %Spec{instance_name: name, labels: user_labels, image: image, shell: shell, env: env} =
+               spec,
            docker_options: docker_options
          } = ctx
        ) do
@@ -831,7 +702,10 @@ defmodule Dockd.Provisioner do
 
       {:error, reason} ->
         {:error,
-         Error.docker_phase_error(:create, "failed to create Docker container", reason, nil)}
+         ErrorMessage.bad_gateway("failed to create Docker container", %{
+           phase: :create,
+           reason: reason
+         })}
     end
   end
 
@@ -841,27 +715,12 @@ defmodule Dockd.Provisioner do
         {:ok, ctx}
 
       {:error, reason} ->
-        {:error, attach_partial_instance(ctx, :start, "failed to start Docker container", reason)}
-    end
-  end
-
-  defp download_repos_to_host(%{repos: []} = ctx), do: {:ok, ctx}
-
-  defp download_repos_to_host(ctx) do
-    result =
-      Dockd.Git.download_repos_to_host(
-        ctx.repos,
-        ctx.container_id,
-        ctx.temp_root,
-        ctx.tools.git_path,
-        ctx.tools.git_env,
-        ctx.docker_options,
-        copy_opts(ctx)
-      )
-
-    case result do
-      :ok -> {:ok, ctx}
-      {:error, error} -> {:error, attach_existing_instance(ctx, error)}
+        {:error,
+         ErrorMessage.bad_gateway("failed to start Docker container", %{
+           phase: :start,
+           reason: reason,
+           instance: hydrate_or_stub(ctx)
+         })}
     end
   end
 
@@ -869,29 +728,21 @@ defmodule Dockd.Provisioner do
 
   defp copy_files(ctx) do
     result =
-      Dockd.FileCopy.copy_files(
+      Dockd.Files.copy_files(
         ctx.copies,
         ctx.container_id,
         ctx.temp_root,
-        ctx.tools.tar_path,
-        ctx.tools.tar_env,
         ctx.docker_options,
-        copy_opts(ctx)
+        container_staging_root: ctx.container_staging_root
       )
 
     case result do
-      :ok -> {:ok, ctx}
-      {:error, error} -> {:error, attach_existing_instance(ctx, error)}
-    end
-  end
+      :ok ->
+        {:ok, ctx}
 
-  defp copy_opts(ctx) do
-    [
-      tar_path: ctx.tools.tar_path,
-      tar_env: ctx.tools.tar_env,
-      tar_extra_args: ctx.tools.tar_extra_args,
-      container_staging_root: ctx.tools.container_staging_root
-    ]
+      {:error, %ErrorMessage{details: details} = error} ->
+        {:error, %{error | details: Map.put(details, :instance, hydrate_or_stub(ctx))}}
+    end
   end
 
   defp run_steps(
@@ -912,15 +763,14 @@ defmodule Dockd.Provisioner do
         handle_step_exec(step, acc_ctx, output, exit_code)
 
       {:error, reason} ->
-        error =
-          Error.docker_phase_error(
-            :setup,
-            "failed to run setup step: #{step.step_name}",
-            reason,
-            hydrate_or_stub(acc_ctx)
-          )
-
-        {:halt, {:error, %{error | step_results: acc_ctx.step_results}}}
+        {:halt,
+         {:error,
+          ErrorMessage.unprocessable_entity("failed to run setup step: #{step.step_name}", %{
+            phase: :setup,
+            reason: reason,
+            instance: hydrate_or_stub(acc_ctx),
+            step_results: acc_ctx.step_results
+          })}}
     end
   end
 
@@ -940,16 +790,15 @@ defmodule Dockd.Provisioner do
     if exit_code in [0, nil] do
       {:cont, {:ok, updated}}
     else
-      error = %Error{
-        phase: :setup,
-        message: "setup step failed: #{step.step_name}",
-        exit_code: exit_code,
-        output: output,
-        instance: hydrate_or_stub(updated),
-        step_results: updated.step_results
-      }
-
-      {:halt, {:error, error}}
+      {:halt,
+       {:error,
+        ErrorMessage.unprocessable_entity("setup step failed: #{step.step_name}", %{
+          phase: :setup,
+          exit_code: exit_code,
+          output: output,
+          instance: hydrate_or_stub(updated),
+          step_results: updated.step_results
+        })}}
     end
   end
 
@@ -960,7 +809,10 @@ defmodule Dockd.Provisioner do
 
       {:error, reason} ->
         {:error,
-         Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
+         ErrorMessage.not_found("failed to inspect Docker container", %{
+           phase: :discover,
+           reason: reason
+         })}
     end
   end
 
@@ -978,7 +830,10 @@ defmodule Dockd.Provisioner do
 
       {:error, reason} ->
         {:error,
-         Error.docker_phase_error(:destroy, "failed to stop Docker container", reason, nil)}
+         ErrorMessage.bad_gateway("failed to stop Docker container", %{
+           phase: :destroy,
+           reason: reason
+         })}
     end
   end
 
@@ -992,32 +847,16 @@ defmodule Dockd.Provisioner do
 
       {:error, reason} ->
         {:error,
-         Error.docker_phase_error(:destroy, "failed to delete Docker container", reason, nil)}
+         ErrorMessage.bad_gateway("failed to delete Docker container", %{
+           phase: :destroy,
+           reason: reason
+         })}
     end
   end
 
   # ---------------------------------------------------------------------------
   # Helpers
   # ---------------------------------------------------------------------------
-
-  defp docker_call(ctx, phase, message, fun) do
-    case fun.() do
-      {:ok, result} ->
-        {:ok, Map.put(ctx, :last_docker_result, result)}
-
-      {:error, reason} ->
-        {:error, attach_partial_instance(ctx, phase, message, reason)}
-    end
-  end
-
-  defp attach_partial_instance(ctx, phase, message, reason) do
-    error = Error.docker_phase_error(phase, message, reason, nil)
-    %{error | instance: hydrate_or_stub(ctx)}
-  end
-
-  defp attach_existing_instance(ctx, %Error{} = error) do
-    %{error | instance: hydrate_or_stub(ctx)}
-  end
 
   # Best-effort instance hydration for the failure path: try a real inspect
   # first; fall back to a stub carrying just id + prefixed name so the caller
@@ -1035,11 +874,9 @@ defmodule Dockd.Provisioner do
     end
   end
 
-  defp validate_error(message), do: %Error{phase: :validate, message: message}
-
   # Consumes a pull/build NDJSON stream; logs progress events in real time
-  # via Dockd.Log and surfaces a stream-level error event as
-  # {:error, %{body: ...}} so docker_call can normalize it.
+  # via Logger and surfaces a stream-level error event as {:error, %{body: ...}},
+  # which the pull/build caller puts on the error's `details.reason`.
   defp consume_image_stream(stream, phase) do
     result =
       Enum.reduce_while(stream, %{seen: MapSet.new()}, fn event, acc ->
@@ -1068,7 +905,7 @@ defmodule Dockd.Provisioner do
     if MapSet.member?(acc.seen, key) do
       acc
     else
-      Dockd.Log.info("pull", format_pull(status, id))
+      Logger.info("[dockd] pull: #{format_pull(status, id)}")
       %{acc | seen: MapSet.put(acc.seen, key)}
     end
   end
@@ -1079,13 +916,13 @@ defmodule Dockd.Provisioner do
     if trimmed == "" do
       acc
     else
-      Dockd.Log.info("build", trimmed)
+      Logger.info("[dockd] build: #{trimmed}")
       acc
     end
   end
 
   defp log_event(%{"aux" => %{"ID" => id}}, :build, acc) when is_binary(id) do
-    Dockd.Log.info("build", "built image #{id}")
+    Logger.info("[dockd] build: built image #{id}")
     acc
   end
 

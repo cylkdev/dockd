@@ -3,8 +3,8 @@ defmodule Dockd.Spec do
   Declarative request for a `Dockd.Instance`.
 
   A `Spec` describes the desired state of a container that dockd should produce:
-  which image, which shell, which env, mounts, setup steps, repos to clone, and
-  host files to copy. It is pure input — `Dockd.apply/6` consumes a `Spec` and
+  which image, which shell, which env, mounts, setup steps, and host files to
+  copy. It is pure input — `Dockd.apply/6` consumes a `Spec` and
   produces a `Dockd.Instance` (a view of the resulting Docker container) plus a
   `Dockd.ApplyResult` (the one-shot provisioning outcome). The `Spec` itself is
   not persisted; after a container is created, Docker's own state (visible via
@@ -17,10 +17,14 @@ defmodule Dockd.Spec do
 
   ## Construction
 
-  `new/3` is the only constructor. `from_attrs/1` adapts a normalized attrs map
-  (the output of `Dockd.Spec.Parser` -> `Dockd.Spec.Interpolator` ->
-  `Dockd.Spec.Normalizer`) onto it, so every `Spec` that dockd builds passes
-  through the same validation in `validate/1`.
+  Two entry points, one validation body:
+
+    - `new/3` — from an image, an instance name, and a keyword list.
+    - `from_map/1` — from a plain, atom-keyed map, which is how a *package*
+      reaches dockd. A package is just data: you load it, dockd applies it.
+
+  Both land on `validate/1`, so a map-sourced and an Elixir-native `Spec` are
+  held to identical rules.
 
   `:image` and `:instance_name` are `@enforce_keys`, so a struct literal cannot
   omit them. It *can* still supply `nil`, which is why `validate/1` runs again as
@@ -37,9 +41,16 @@ defmodule Dockd.Spec do
   would name the same container.
   """
 
-  alias Dockd.Error
+  @typedoc """
+  One container environment entry.
 
-  @type env_entry :: binary() | {binary(), keyword()}
+  Two shapes, and only two:
+
+    - `"NAME=value"` — a literal, passed through verbatim.
+    - `"NAME"` — inherited from the `host_env` map passed to `Dockd.apply/6`;
+      absent from it is a `:validate` error.
+  """
+  @type env_entry :: binary()
 
   @type t :: %__MODULE__{
           instance_name: binary(),
@@ -48,7 +59,6 @@ defmodule Dockd.Spec do
           shell: binary() | nil,
           build: map() | nil,
           steps: [map()],
-          repos: [map()],
           copy: [map()],
           env: [env_entry()],
           mounts: [term()],
@@ -64,7 +74,6 @@ defmodule Dockd.Spec do
     :shell,
     :build,
     steps: [],
-    repos: [],
     copy: [],
     env: [],
     mounts: [],
@@ -81,12 +90,16 @@ defmodule Dockd.Spec do
     :shell,
     :steps,
     :build,
-    :repos,
     :copy,
     :env,
     :mounts,
     :labels
   ]
+
+  # Every key a spec map may carry. `:instance_name` is included here and not in
+  # @spec_opts because `from_map/1` reads it from the map, while `new/3` takes it
+  # as a positional argument.
+  @map_keys [:instance_name, :image | @spec_opts]
 
   @doc """
   Returns the keyword keys accepted by `new/3`.
@@ -100,14 +113,14 @@ defmodule Dockd.Spec do
   Builds a `Spec` from an image, an instance name, and a keyword list.
 
   The only constructor. Both required inputs are positional; everything else is
-  optional and defaults to an empty collection. Returns `{:error, %Dockd.Error{}}`
+  optional and defaults to an empty collection. Returns `{:error, %ErrorMessage{}}`
   tagged `:validate` rather than raising — see `validate/1` for the rules.
 
       {:ok, spec} = Dockd.Spec.new("busybox:1.37.0", "smoke", shell: "/bin/sh")
       spec.instance_name
       #=> "smoke"
   """
-  @spec new(binary(), binary(), keyword()) :: {:ok, t()} | {:error, Error.t()}
+  @spec new(binary(), binary(), keyword()) :: {:ok, t()} | {:error, ErrorMessage.t()}
   def new(image, instance_name, opts \\ []) do
     spec = %__MODULE__{
       image: image,
@@ -116,7 +129,6 @@ defmodule Dockd.Spec do
       shell: Keyword.get(opts, :shell),
       build: Keyword.get(opts, :build),
       steps: Keyword.get(opts, :steps, []),
-      repos: Keyword.get(opts, :repos, []),
       copy: Keyword.get(opts, :copy, []),
       env: Keyword.get(opts, :env, []),
       mounts: Keyword.get(opts, :mounts, []),
@@ -130,21 +142,87 @@ defmodule Dockd.Spec do
   end
 
   @doc """
-  Builds a `Spec` from a normalized attrs map.
+  Builds a `Spec` from a plain map — the whole of dockd's "package" support.
 
-  Expects the output of `Dockd.Spec.Normalizer.normalize/2`: atom-keyed, with
-  `:image` and `:instance_name` present and `:env` already in `{name, opts}`
-  tuple form. Extracts the two required values and delegates to `new/3`, so
-  package-sourced and Elixir-native specs share one validation body.
+  A package is a declarative map, **atom-keyed** — here and in every nested
+  `:build`, `:steps`, `:copy` and `:mounts` entry:
+
+      {:ok, spec} =
+        Dockd.Spec.from_map(%{
+          instance_name: "greeter",
+          image: "busybox:1.37.0",
+          shell: "/bin/sh",
+          env: ["GREETING=hello"]
+        })
+
+  A string key is not accepted for any of them: it would be a second spelling of
+  every field, and it is the caller — who chose the map's source — who knows how
+  to convert one.
+
+  Dockd deliberately does none of the work around that map:
+
+    - **No file I/O.** To keep a package on disk, load it yourself. Nothing is
+      resolved against a packages root, a working directory, or a home
+      directory.
+    - **No `${VAR}` substitution.** You build the map, so you interpolate it.
+      A value in the map is the value that reaches Docker.
+    - **No relative paths.** With no package directory to resolve against, a
+      relative `:build` `dockerfile` or `context` would fall back to the calling
+      process's CWD, so `validate/1` rejects one. Pass absolute paths.
+
+  Unknown keys are rejected rather than ignored, so a typo fails at the boundary
+  instead of silently doing nothing. Everything else — the required values, the
+  name grammar, the build paths — is checked by the same `validate/1` that
+  `new/3` uses.
+
+  Returns `{:ok, spec}`, or `{:error, %ErrorMessage{code: :bad_request}}` with
+  `details.phase` set to `:validate`.
   """
-  @spec from_attrs(map()) :: {:ok, t()} | {:error, Error.t()}
-  def from_attrs(attrs) do
-    opts =
-      attrs
-      |> Map.drop([:image, :instance_name])
-      |> Map.to_list()
+  @spec from_map(map()) :: {:ok, t()} | {:error, ErrorMessage.t()}
+  def from_map(map) when is_map(map) do
+    with :ok <- validate_map_keys(map) do
+      opts = Enum.map(@spec_opts, fn key -> {key, Map.get(map, key)} end)
 
-    new(Map.get(attrs, :image), Map.get(attrs, :instance_name), opts)
+      new(
+        Map.get(map, :image),
+        Map.get(map, :instance_name),
+        Enum.reject(opts, fn {_key, value} -> is_nil(value) end)
+      )
+    end
+  end
+
+  def from_map(other),
+    do:
+      {:error,
+       ErrorMessage.bad_request(
+         "Dockd.Spec.from_map/1 requires a map, got: #{inspect(other)}",
+         %{phase: :validate}
+       )}
+
+  # `Map.keys/1` can hand back anything, so membership is tested with `in` and
+  # rendered with `inspect/1`: a key that is not an atom at all must be
+  # *reported*, not raise out of a function whose contract is a tagged error.
+  defp validate_map_keys(map) do
+    case Enum.reject(Map.keys(map), &(&1 in @map_keys)) do
+      [] ->
+        :ok
+
+      unknown ->
+        {:error,
+         ErrorMessage.bad_request(
+           "unknown spec key(s): #{Enum.map_join(Enum.sort_by(unknown, &inspect/1), ", ", &inspect/1)}. " <>
+             "Valid keys: #{Enum.map_join(@map_keys, ", ", &inspect/1)}" <> atom_key_hint(unknown),
+           %{phase: :validate}
+         )}
+    end
+  end
+
+  # A string-keyed map fails every key at once, which reads as a pile of typos
+  # unless the actual cause is named.
+  defp atom_key_hint(unknown) do
+    if Enum.any?(unknown, &is_binary/1),
+      do: ". Spec map keys must be atoms, not strings",
+      else: ""
   end
 
   @doc """
@@ -153,17 +231,17 @@ defmodule Dockd.Spec do
   The single validation point. `new/3` calls it, and `Dockd.Provisioner.run/6`
   calls it again on the way in so a hand-built struct literal cannot bypass it.
 
-  Rejects, all as `%Dockd.Error{phase: :validate}`:
+  Rejects, all as `%ErrorMessage{code: :bad_request}` with `details.phase` of
+  `:validate`:
 
     - an `:image` that is not a non-empty binary
     - an `:instance_name` that is not a non-empty binary, does not match
       Docker's name grammar, or already starts with `dockd-`
-    - a relative `:build` `dockerfile` or `context` path. Package-sourced paths
-      are absolutized against the package directory by
-      `Dockd.Spec.Normalizer.normalize/2`; a relative path here would otherwise
-      be resolved against the calling process's CWD.
+    - a relative `:build` `dockerfile` or `context` path. There is no package
+      directory to resolve one against, so a relative path would fall back to
+      the calling process's CWD. Pass absolute paths.
   """
-  @spec validate(t()) :: :ok | {:error, Error.t()}
+  @spec validate(t()) :: :ok | {:error, ErrorMessage.t()}
   def validate(%__MODULE__{} = spec) do
     with :ok <- validate_image(spec.image),
          :ok <- validate_instance_name(spec.instance_name),
@@ -195,54 +273,49 @@ defmodule Dockd.Spec do
   def short_name(@container_name_prefix <> rest), do: rest
   def short_name(other) when is_binary(other), do: other
 
-  @doc false
-  # Reads `key` from a map that may be atom- or string-keyed. Package documents
-  # arrive string-keyed and only their *top-level* keys are atomized by
-  # `Dockd.Spec.Normalizer`, so nested `:build` / step / repo / copy entries
-  # genuinely show up either way. `Map.fetch/2` first rather than `||`, so a
-  # legitimate `false` is not mistaken for an absent key.
-  @spec fetch_either(map(), atom()) :: term()
-  def fetch_either(map, key) when is_atom(key) do
-    case Map.fetch(map, key) do
-      {:ok, value} -> value
-      :error -> Map.get(map, Atom.to_string(key))
-    end
-  end
-
   # ---------------------------------------------------------------------------
 
   defp validate_image(image) when is_binary(image) and image !== "", do: :ok
 
   defp validate_image(other),
-    do: error("Dockd.Spec requires a non-empty binary :image, got: #{inspect(other)}")
+    do:
+      {:error,
+       ErrorMessage.bad_request(
+         "Dockd.Spec requires a non-empty binary :image, got: #{inspect(other)}",
+         %{phase: :validate}
+       )}
 
-  @doc false
-  # Public so `Dockd.Spec.Encoder` can gate a scaffolded package on the *same*
-  # rules a loaded one is held to. It used to keep its own copy of the pattern
-  # and its own message, and that copy omitted the `dockd-` prefix rejection —
-  # so the scaffolder happily wrote a package that failed when applied.
-  @spec validate_instance_name(term()) :: :ok | {:error, Error.t()}
-  def validate_instance_name(name) when is_binary(name) and name !== "" do
+  @spec validate_instance_name(term()) :: :ok | {:error, ErrorMessage.t()}
+  defp validate_instance_name(name) when is_binary(name) and name !== "" do
     cond do
       String.starts_with?(name, @container_name_prefix) ->
-        error(
-          ":instance_name must not include the #{@container_name_prefix} prefix " <>
-            "(dockd adds it), got: #{inspect(name)}"
-        )
+        {:error,
+         ErrorMessage.bad_request(
+           ":instance_name must not include the #{@container_name_prefix} prefix " <>
+             "(dockd adds it), got: #{inspect(name)}",
+           %{phase: :validate}
+         )}
 
       not Regex.match?(@name_pattern, name) ->
-        error(
-          ":instance_name must match #{inspect(Regex.source(@name_pattern))}, " <>
-            "got: #{inspect(name)}"
-        )
+        {:error,
+         ErrorMessage.bad_request(
+           ":instance_name must match #{inspect(Regex.source(@name_pattern))}, " <>
+             "got: #{inspect(name)}",
+           %{phase: :validate}
+         )}
 
       true ->
         :ok
     end
   end
 
-  def validate_instance_name(other),
-    do: error("Dockd.Spec requires a non-empty binary :instance_name, got: #{inspect(other)}")
+  defp validate_instance_name(other),
+    do:
+      {:error,
+       ErrorMessage.bad_request(
+         "Dockd.Spec requires a non-empty binary :instance_name, got: #{inspect(other)}",
+         %{phase: :validate}
+       )}
 
   # Checked here so `Dockd.Provisioner` can merge the map straight into the
   # managed labels. It used to hedge with `user_labels || %{}` instead, which
@@ -250,7 +323,11 @@ defmodule Dockd.Spec do
   defp validate_labels(labels) when is_map(labels), do: :ok
 
   defp validate_labels(other),
-    do: error(":labels must be a map, got: #{inspect(other)}")
+    do:
+      {:error,
+       ErrorMessage.bad_request(":labels must be a map, got: #{inspect(other)}", %{
+         phase: :validate
+       })}
 
   defp validate_build(nil), do: :ok
 
@@ -261,22 +338,35 @@ defmodule Dockd.Spec do
   end
 
   defp validate_build(other),
-    do: error(":build must be a map or nil, got: #{inspect(other)}")
+    do:
+      {:error,
+       ErrorMessage.bad_request(":build must be a map or nil, got: #{inspect(other)}", %{
+         phase: :validate
+       })}
 
   defp validate_absolute(build, key) do
-    case fetch_either(build, key) do
+    case Map.get(build, key) do
       nil ->
         :ok
 
       path when is_binary(path) ->
         if Path.type(path) === :absolute,
           do: :ok,
-          else: error(":build #{key} must be an absolute path, got: #{inspect(path)}")
+          else:
+            {:error,
+             ErrorMessage.bad_request(
+               ":build #{key} must be an absolute path, got: #{inspect(path)}",
+               %{phase: :validate}
+             )}
 
       other ->
-        error(":build #{key} must be a string path, got: #{inspect(other)}")
+        {:error,
+         ErrorMessage.bad_request(
+           ":build #{key} must be a string path, got: #{inspect(other)}",
+           %{
+             phase: :validate
+           }
+         )}
     end
   end
-
-  defp error(message), do: {:error, %Error{phase: :validate, message: message}}
 end

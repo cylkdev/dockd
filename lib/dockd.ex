@@ -9,39 +9,131 @@ defmodule Dockd do
   instance name as `org.dockd.instance.name`, so a fresh BEAM can rediscover the
   full set of managed instances by querying Docker alone.
 
-  ## Every required input is an argument
-
-  Dockd reads no environment variable, no application config, no home directory,
-  no current working directory, and no system temp directory. There is nothing to
-  configure, because there is no configuration: anything a function needs, it
-  takes as an argument.
-
-  Four runtime inputs recur across the API and none of them has a default:
-
-    - `endpoint` — the Docker daemon, e.g. `"unix:///var/run/docker.sock"` or
-      `"tcp://10.0.0.1:2376"`. Without it the underlying client would fall back to
-      `DOCKER_HOST`, which would make *which daemon your containers land on*
-      depend on ambient process state.
-    - `disk_mount_enabled` — whether host mounts, repo clones, file copies, and
-      host-derived env are permitted. It fails **closed**: there is no clause that
-      reads an absent value as permission to expose the host.
-    - `host_env` — the map that `:env` entries and `${VAR}` interpolation resolve
-      against. Pass `%{}` and a package can reach nothing from the host; pass the
-      specific names it should see, and nothing more.
-    - `temp_root` — the host directory used to stage repo clones and file copies.
-
-  Host tooling (`:git_path`, `:git_env`, `:tar_path`, `:tar_env`) stays in `opts`
-  because only some specs need it — but a spec that clones a repo or copies a file
-  without it is a `:validate` error, never a `PATH` lookup.
-
   ## Getting Started
 
-  With a Docker daemon running locally, apply an installed package by name and
-  you have a live instance:
+  You have a Docker daemon running and you want a Linux box you can run
+  commands in. Here is the whole lifecycle — create it, work in it, put it
+  aside, pick it back up, throw it away.
 
-      > endpoint = "unix:///var/run/docker.sock"
+  ### Decide the four inputs once
+
+  Every call needs the daemon; anything that touches your disk also needs the
+  policy, the env slice, and the staging directory. Name them once at the top of
+  your code and pass them down:
+
+      endpoint  = "unix:///var/run/docker.sock"
+      temp_root = System.tmp_dir!()
+
+      # false: this instance gets no host mounts, no file copies, no host env.
+      # Start here and open it up only when you need to.
+      allow_disk = false
+
+  ### Create the instance
+
+  Name an image and a name for the box. You get back a running container:
+
       > {:ok, %Dockd.ApplyResult{instance: instance}} =
-      ...>   Dockd.apply_package(root, "webapp", endpoint, false, %{}, System.tmp_dir!())
+      ...>   Dockd.apply_image("debian:trixie", "scratch", endpoint, allow_disk,
+      ...>     %{}, temp_root, shell: "/bin/bash")
+
+      > instance.name
+      "dockd-scratch"
+
+  You passed `"scratch"`; the container is called `dockd-scratch`. The prefix is
+  how dockd knows which containers are its own, and you can use either form
+  anywhere an instance is expected.
+
+  **Set `:shell`.** It is what keeps the box alive. Without it an image like
+  `debian` runs its command, exits, and your next call fails with "container is
+  not running".
+
+  Need setup work done before you call it ready? Add steps. Each one runs in
+  order, and you get its output back:
+
+      > {:ok, %Dockd.ApplyResult{step_results: [update, curl]}} =
+      ...>   Dockd.apply_image("debian:trixie", "builder", endpoint, allow_disk,
+      ...>     %{}, temp_root,
+      ...>     shell: "/bin/bash",
+      ...>     steps: [
+      ...>       %{step_name: "update", cmd: ["apt-get", "update"]},
+      ...>       %{step_name: "curl", cmd: ["apt-get", "install", "-y", "curl"]}
+      ...>     ])
+
+      > curl.exit_code
+      0
+
+  If a step fails, the whole call fails — but the container it already created
+  comes back on the error at `details.instance`, so you can read its logs and
+  then destroy it rather than leak it.
+
+  ### Run commands in it
+
+  See "One-shot commands" and "Longer-term interactive shells" just below. The
+  short version:
+
+      > {:ok, %{output: "hello\\n", exit_code: 0}} =
+      ...>   Dockd.shell_command(instance, "echo hello", endpoint)
+
+  ### Put files in it
+
+  `src` must be an absolute path on your machine; `dest` is where it lands
+  inside the box:
+
+      > :ok =
+      ...>   Dockd.copy_to(instance, [%{src: "/srv/app.env", dest: "/etc/app.env"}],
+      ...>     temp_root, endpoint)
+
+  The container gets its own copy — editing the file inside it does not change
+  yours. Use `:mounts` on a spec instead when you want the two to stay in sync.
+
+  ### Find it again later
+
+  Dockd keeps no memory of what it created; Docker does. So a fresh BEAM — a new
+  `iex` session, a restarted app — finds everything by asking the daemon:
+
+      > {:ok, instances} = Dockd.list(endpoint)
+      > Enum.map(instances, & &1.name)
+      ["dockd-scratch", "dockd-builder"]
+
+      > {:ok, instance} = Dockd.get("scratch", endpoint)
+
+  Nothing needs to have been saved between sessions, and there is no registry to
+  get out of sync.
+
+  ### Stop it, start it, check on it
+
+  Stopping frees the memory and CPU without losing anything inside the box:
+
+      > :ok = Dockd.stop(instance, endpoint)
+      > {:ok, false} = Dockd.running?(instance, endpoint)
+      > :ok = Dockd.start(instance, endpoint)
+
+  A `%Dockd.Instance{}` you are holding is a snapshot from when you fetched it,
+  so after a change like that, ask for a fresh one:
+
+      > {:ok, instance} = Dockd.refresh(instance, endpoint)
+      > instance.running?
+      true
+
+  When something is wrong, read the output or the raw Docker record:
+
+      > {:ok, output} = Dockd.logs(instance, endpoint, tail: 50)
+      > {:ok, raw} = Dockd.inspect(instance, endpoint)
+      > raw["State"]["ExitCode"]
+      0
+
+  ### Throw it away
+
+      > :ok = Dockd.destroy(instance, endpoint)
+
+  That stops and removes the container. Destroying one that is already gone is
+  fine, so cleanup code does not have to check first.
+
+  File copies stage through `temp_root` and clean up after themselves, but a
+  hard kill can leave a directory behind. To check and sweep:
+
+      > {:ok, leftovers} = Dockd.list_temp_files(temp_root)
+      > :ok = Dockd.delete_temp_files(temp_root)
 
   ### One-shot commands
 
@@ -70,18 +162,29 @@ defmodule Dockd do
       > {:ok, {"bar\\n", shell}} = Dockd.shell_send(shell, "echo $FOO")
       > :ok = Dockd.close_shell(shell)
 
-      > :ok = Dockd.destroy(instance, endpoint)
+  Close the shell when you are done with it. It is a live exec session on the
+  container, not something dockd cleans up for you.
 
-  For a shell a *human* drives, in a real terminal window with its own TTY, see
-  `Dockd.Shell` instead — `open_shell/3` is the programmatic form.
+  ## Specs from data
 
-  `apply_package/7` resolves package names against the `root` you pass and runs
-  the full provisioning pipeline (pull or build, create, start, fetch repos,
-  copy files, run setup steps). The returned `Dockd.Instance` is a
-  view of the live container — pass it (or its name) to any other
-  function in this module. See "Packages" below for the full
-  resolution rules and how to install additional package sets from
-  git.
+  A container is described by a `Dockd.Spec`. Build one in Elixir with
+  `Dockd.Spec.new/3`, or from a plain map with `Dockd.Spec.from_map/1` — which is
+  all a "package" is:
+
+      {:ok, spec} =
+        Dockd.Spec.from_map(%{
+          instance_name: "webapp",
+          image: "node:20-slim",
+          shell: "/bin/bash"
+        })
+
+      {:ok, result} = Dockd.apply(spec, endpoint, false, %{}, temp_root)
+
+  Keys are atoms, here and in every nested entry. Where that map comes from —
+  a module attribute, a file you read, a database row — is yours to decide;
+  dockd never goes looking for one. You did the loading and any interpolating,
+  so what is in the map is what reaches Docker. `Dockd.Spec.from_map/1`
+  documents the consequences.
 
   ## Lifecycle
 
@@ -90,67 +193,12 @@ defmodule Dockd do
       step results from provisioning.
     - `apply_image/7` — the same, building the spec from an image and an
       instance name.
-    - `apply_package/7` — the same, loading the spec from a JSON package file
-      (see "Packages" below). `load_package_spec/3` is the read half on its own.
     - `list/2` — enumerate every dockd-managed `Instance` currently on the
       daemon.
     - `get/3` — fetch one `Instance` by its instance name.
     - `start/3` / `stop/3` / `restart/3` — control the container without
       destroying it.
     - `destroy/3` — stop and remove an instance.
-
-  ## Packages on disk
-
-    - `install_packages/3` — install a package set from a git repository or a
-      local directory.
-    - `new_package/3` — scaffold a new package's files on disk.
-    - `list_packages/2` — enumerate installed packages.
-    - `delete_package/3` — remove an installed package from a packages root.
-
-  ## Packages
-
-  A package is a directory under a packages `root` containing a
-  `package.json` (the serialized `Dockd.Spec`: image, shell, env,
-  mounts, repos, copies, setup steps, etc.) plus any supporting files
-  the spec references — typically a `Dockerfile` for `build`-based
-  packages. The directory name is the package's identity.
-
-  `apply_package/7` resolves its reference as follows:
-
-    - any string ending in `.json` is treated as a literal file path
-    - any other string containing `/` is treated as a package directory
-      and resolves to `<dir>/package.json`
-    - any other string is resolved against `<root>/<name>/package.json`
-
-  `root` is an argument. There is no configured packages root and no
-  `DOCKD_PACKAGES_PATH`: `~/.dockd/packages` is a fine choice, but it is the
-  caller's choice to make and to write down.
-
-  Packages generated or installed into a root can be applied by basename:
-
-      root = Path.join(System.user_home!(), ".dockd/packages")
-
-      # Resolves to <root>/webapp/package.json
-      {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply_package(root, "webapp", endpoint, false, %{}, System.tmp_dir!())
-
-      # Explicit directory, or explicit file path. `root` is unused for these,
-      # but still passed so the argument list keeps one shape.
-      {:ok, result} =
-        Dockd.apply_package(root, "./my-stack", endpoint, false, %{}, tmp)
-
-      {:ok, result} =
-        Dockd.apply_package(root, "./my-stack/package.json", endpoint, false, %{}, tmp)
-
-  Additional packages are installed with `install_packages/3`, from either a
-  git repository or a local directory. Every `<source>/packages/<name>/`
-  directory that contains a `package.json` is copied into `<root>/<name>/`, after
-  which the package can be applied by name. `list_packages/2` enumerates what is
-  currently installed, and `delete_package/3` removes a package by name.
-
-      {:ok, ["webapp"]} = Dockd.install_packages(root, "./my-recipes")
-
-      [%{name: "webapp"}] = Dockd.list_packages(root)
 
   ## Visibility
 
@@ -171,9 +219,9 @@ defmodule Dockd do
 
   ## Host-side staging
 
-  Dockd writes copied files and cloned repos to a staging dir under the
-  `temp_root` you pass before uploading them into containers. These functions
-  report and clean up that staging dir, and each takes the root as its argument:
+  Dockd writes copied files to a staging dir under the `temp_root` you pass
+  before uploading them into containers. These functions report and clean up
+  that staging dir, and each takes the root as its argument:
 
     - `list_temp_files/1`
     - `delete_temp_files/1` — deletes recursively, so it refuses `""`, a relative
@@ -184,32 +232,26 @@ defmodule Dockd do
 
   Beyond the required positional arguments, public functions take a trailing
   `opts` keyword list for genuinely optional caller context: `:api_version`,
-  `:platform`, `:networks`, `:network_mode`, and the host tooling
-  (`:git_path`, `:git_env`, `:tar_path`, `:tar_env`, `:tar_extra_args`,
-  `:container_staging_root`). See `option_keys/0`. None of these survive on the
-  container.
+  `:platform`, `:networks`, `:network_mode`, and `:container_staging_root` (the
+  in-container directory a file copy stages through, `"/tmp"` by default). None
+  of these survive on the container, and keys outside the set are ignored as in
+  any keyword-option API.
 
-  Keys that used to live here and are now positional — `:socket`, `:host`,
-  `:disk_mount_enabled`, `:packages_path`, `:dest_dir` — are rejected with a
-  message naming their replacement, rather than silently ignored.
+  The daemon endpoint and `disk_mount_enabled` are deliberately *not* among them
+  — they are positional, so they cannot be forgotten and silently defaulted.
   """
 
   alias Dockd.ApplyResult
-  alias Dockd.Error
-  alias Dockd.FileCopy
+  alias Dockd.Files
   alias Dockd.Instance
-  alias Dockd.Packages
   alias Dockd.Provisioner
   alias Dockd.Spec
-  alias Dockd.Spec.Interpolator
-  alias Dockd.Spec.Normalizer
-  alias Dockd.Spec.Parser
 
   @typedoc """
-  The host environment `:env` entries and `${VAR}` interpolation resolve against.
+  The host environment bare-name `:env` entries resolve against.
 
-  Always an explicit argument, never `System.get_env/0`: a package or spec can
-  only reach the values the caller chose to hand it. `%{}` resolves nothing.
+  Always an explicit argument, never `System.get_env/0`: a spec can only reach
+  the values the caller chose to hand it. `%{}` resolves nothing.
   """
   @type host_env :: %{optional(binary()) => binary()}
 
@@ -217,45 +259,16 @@ defmodule Dockd do
   @log_option_keys [:stdout, :stderr, :timestamps]
 
   @doc """
-  Returns the caller-runtime option keys `apply/6` reads.
-
-  These are genuinely optional: Docker request tuning (`:api_version`,
-  `:platform`, `:networks`, `:network_mode`) and the host tooling a spec needs
-  only when it clones a repo or copies a file (`:git_path`, `:git_env`,
-  `:tar_path`, `:tar_env`, `:tar_extra_args`, `:container_staging_root`).
-
-  The daemon endpoint and `disk_mount_enabled` are *not* here — they are required
-  positional arguments, so they cannot be forgotten and silently defaulted.
-
-  Keys outside this list are ignored, as in any keyword-option API.
-  """
-  @spec option_keys() :: [atom()]
-  def option_keys do
-    [
-      :api_version,
-      :platform,
-      :networks,
-      :network_mode,
-      :git_path,
-      :git_env,
-      :tar_path,
-      :tar_env,
-      :tar_extra_args,
-      :container_staging_root
-    ]
-  end
-
-  @doc """
   Creates a Docker container from `spec` and returns the result.
 
   Takes a `%Dockd.Spec{}` and its four required runtime inputs:
 
     - `endpoint` — the Docker daemon, e.g. `"unix:///var/run/docker.sock"`
-    - `disk_mount_enabled` — `true` permits host mounts, repo clones, file copies
-      and host-derived env; `false` strips them
+    - `disk_mount_enabled` — `true` permits host mounts, file copies and
+      host-derived env; `false` strips them
     - `host_env` — the environment `:env` entries resolve against. `%{}` resolves
       nothing from the host
-    - `temp_root` — absolute host directory to stage repo clones and file copies in
+    - `temp_root` — absolute host directory to stage file copies in
 
   None of them has a default. `disk_mount_enabled` in particular used to treat an
   absent value as `true`, which meant forgetting it granted maximum host exposure.
@@ -286,12 +299,12 @@ defmodule Dockd do
         {:ok, %Dockd.ApplyResult{instance: instance}} ->
           instance
 
-        {:error, %Dockd.Error{instance: instance}} when not is_nil(instance) ->
+        {:error, %ErrorMessage{details: %{instance: instance}}} ->
           Dockd.destroy(instance, endpoint)
       end
   """
   @spec apply(Spec.t(), binary(), boolean(), host_env(), Path.t(), keyword()) ::
-          {:ok, ApplyResult.t()} | {:error, Error.t()}
+          {:ok, ApplyResult.t()} | {:error, ErrorMessage.t()}
   def apply(%Spec{} = spec, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ []) do
     Provisioner.run(spec, endpoint, disk_mount_enabled, host_env, temp_root, opts)
   end
@@ -315,7 +328,7 @@ defmodule Dockd do
         )
   """
   @spec apply_image(binary(), binary(), binary(), boolean(), host_env(), Path.t(), keyword()) ::
-          {:ok, ApplyResult.t()} | {:error, Error.t()}
+          {:ok, ApplyResult.t()} | {:error, ErrorMessage.t()}
   def apply_image(
         image,
         instance_name,
@@ -333,228 +346,6 @@ defmodule Dockd do
   end
 
   @doc """
-  Loads a JSON package from `root` and applies it.
-
-  Resolves the package reference as described in the "Packages" section:
-
-    - `<name>.json` or any path containing `/` is treated as a file path
-    - any other string is resolved against `<root>/<name>/package.json`
-
-  The document is read, parsed, interpolated against `host_env`, and normalized
-  into spec attributes. `host_env` is the same map `:env` entries resolve against,
-  so `${VAR}` in a package expands only to values the caller supplied — pass `%{}`
-  to substitute nothing.
-
-  ## Examples
-
-      # Resolved against <root>/elixir/package.json.
-      {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply_package(root, "elixir", endpoint, false, %{}, tmp)
-
-      # Explicit path — anything with `/` or ending in `.json`. `root` is unused
-      # for these, but still required so the argument list does not change shape.
-      {:ok, result} =
-        Dockd.apply_package(root, "/abs/path/stack.json", endpoint, false, %{}, tmp)
-
-      # Interpolating ${HOME} in the package requires passing it deliberately.
-      {:ok, result} =
-        Dockd.apply_package(root, "elixir", endpoint, true,
-          %{"HOME" => System.user_home!()}, tmp)
-  """
-  @spec apply_package(Path.t(), binary(), binary(), boolean(), host_env(), Path.t(), keyword()) ::
-          {:ok, ApplyResult.t()} | {:error, Error.t()}
-  def apply_package(root, ref, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ []) do
-    with {:ok, spec} <- load_package_spec(root, ref, host_env) do
-      Provisioner.run(spec, endpoint, disk_mount_enabled, host_env, temp_root, opts)
-    end
-  end
-
-  @doc """
-  Loads a package from `root` into a `Dockd.Spec` without applying it.
-
-  The read half of `apply_package/7`: resolve the reference, parse the JSON,
-  substitute `${VAR}` from `host_env`, normalize, and validate. Useful for
-  inspecting or adjusting a spec before handing it to `apply/6`, and the
-  lower-arity path when the four runtime inputs are not all in hand yet.
-  """
-  @spec load_package_spec(Path.t(), binary(), host_env()) ::
-          {:ok, Spec.t()} | {:error, Error.t()}
-  def load_package_spec(root, ref, host_env) do
-    path = Packages.resolve_path(root, ref)
-
-    with {:ok, decoded} <- Parser.parse_file(path),
-         {:ok, substituted} <- Interpolator.substitute(decoded, host_env),
-         {:ok, attrs} <- Normalizer.normalize(substituted, Path.dirname(path)) do
-      case Spec.from_attrs(attrs) do
-        {:ok, spec} -> {:ok, spec}
-        {:error, error} -> {:error, prefix_message(error, path)}
-      end
-    end
-  end
-
-  @doc """
-  Installs packages from a git repository or a local directory into the
-  configured packages root.
-
-  `ref` selects the source: an existing directory on the host installs from
-  that directory, anything else is treated as a git URL and cloned with the
-  host `git` binary. Either way, every `<source>/packages/<name>/` directory
-  containing a `package.json` is copied into `<root>/<name>/`, and an
-  existing target directory is replaced.
-
-  A git URL can be anything `git clone` accepts (HTTPS, SSH, or the
-  `github.com/user/repo` shorthand). A source with no top-level `packages/`
-  directory is a `:fetch` error.
-
-  Options:
-
-    - `:ref` — git branch or tag to clone. Ignored when installing from a
-      local directory, which is used exactly as it is on disk.
-    - `:packages_subdir` — the subdirectory of the source to read packages from.
-      Defaults to `"packages"`.
-
-  A git install additionally requires `:staging_root`, `:git_path`, and `:git_env`
-  — the clone directory, the `git` executable, and the exact environment to run it
-  in. They are options rather than positional arguments because a local-directory
-  install has no use for them, but a git install without them is a `:fetch` error,
-  never a PATH lookup.
-
-  Returns `{:ok, [name]}` with the installed package names.
-
-  ## Examples
-
-      # From a local checkout — anything that is an existing directory.
-      {:ok, ["foo", "bar"]} = Dockd.install_packages(root, "./my-recipes")
-
-      # From a remote repository.
-      {:ok, ["foo", "bar"]} =
-        Dockd.install_packages(root, "https://github.com/me/recipes",
-          staging_root: System.tmp_dir!(),
-          git_path: "/usr/bin/git",
-          git_env: %{"HOME" => System.user_home!()},
-          ref: "v1.2.0"
-        )
-  """
-  @spec install_packages(Path.t(), binary(), keyword()) ::
-          {:ok, [binary()]} | {:error, Error.t()}
-  def install_packages(root, ref, opts \\ []) do
-    if File.dir?(ref) do
-      Packages.install_from_path(root, ref, opts)
-    else
-      Packages.install_from_git(
-        root,
-        ref,
-        Keyword.get(opts, :staging_root),
-        Keyword.get(opts, :git_path),
-        Keyword.get(opts, :git_env),
-        opts
-      )
-    end
-  end
-
-  @doc """
-  Scaffolds a new package into `dir`, so you never have to hand-write
-  `package.json` and `Dockerfile`.
-
-  `dir` **is** the package directory, and `instance_name` is the container name
-  the package will create. The generated package always builds its own image from
-  the generated `Dockerfile`, so `:image` is the tag that build produces and
-  `:from` is the Dockerfile's base image.
-
-  Only the keys you pass are written. Refuses to touch an existing directory
-  unless `force: true`, and validates before writing anything — a rejected call
-  leaves nothing behind. See `Dockd.Packages.new/3` for the full option list.
-
-  ## Examples
-
-      # Minimal — image defaults to dockd-greeter:latest, Dockerfile to
-      # FROM Dockd.Spec.Encoder.default_from/0.
-      {:ok, %{files: _}} = Dockd.new_package("./greeter", "greeter")
-
-      # Into a shareable package set, ready for install_packages/3.
-      {:ok, %{instance_name: "greeter"}} =
-        Dockd.new_package("./my-recipes/packages/greeter", "greeter",
-          image: "dockd-greeter:1",
-          from: "busybox:1.37.0",
-          shell: "/bin/sh",
-          env: [{"API_KEY", optional: true}],
-          steps: [%{step_name: "verify", cmd: ["sh", "-c", "test -f /etc/greeting"]}]
-        )
-
-      {:ok, ["greeter"]} = Dockd.install_packages(root, "./my-recipes")
-  """
-  @spec new_package(Path.t(), binary(), keyword()) ::
-          {:ok,
-           %{
-             instance_name: binary(),
-             path: Path.t(),
-             files: [Path.t()],
-             overwrote?: boolean()
-           }}
-          | {:error, Error.t()}
-  def new_package(dir, instance_name, opts \\ []) do
-    Packages.new(dir, instance_name, opts)
-  end
-
-  @doc """
-  Lists every package installed under `root`.
-
-  A subdirectory counts as an installed package when it contains a readable
-  `package.json`. Each entry is a map with `:name`, `:path`, and `:spec`,
-  sorted by name.
-
-  `:spec` is itself a result tuple — `{:ok, %Dockd.Spec{}}` or
-  `{:error, %Dockd.Error{}}` — so one malformed `package.json` surfaces its own
-  parse error instead of hiding every other installed package.
-
-  Never fails: an unreadable or missing `root` returns `[]`.
-
-  Note that specs are parsed without `${VAR}` interpolation, so this is safe to
-  call for metadata (image, shell, description) even for a package that
-  references variables you have no values for.
-
-  ## Examples
-
-      [%{name: "webapp", path: path, spec: {:ok, spec}}] = Dockd.list_packages(root)
-
-      [] = Dockd.list_packages("/tmp/empty")
-  """
-  @spec list_packages(Path.t(), keyword()) :: [
-          %{
-            name: binary(),
-            path: Path.t(),
-            spec: {:ok, Spec.t()} | {:error, Error.t()}
-          }
-        ]
-  def list_packages(root, opts \\ []) do
-    Packages.list(root, opts)
-  end
-
-  @doc """
-  Deletes an installed package from `root`.
-
-  Takes a bare package name — the same name `apply_package/7` resolves and
-  `list_packages/2` reports. Paths and `.json` references are rejected with a
-  `:validate` error, so nothing outside `root` can be removed.
-
-  Idempotent — deleting a package that is not installed returns `:ok`. Running
-  instances created from the package are not touched; a package is only the
-  recipe on disk.
-
-  ## Examples
-
-      {:ok, ["webapp"]} = Dockd.install_packages(root, "./my-recipes")
-      :ok = Dockd.delete_package(root, "webapp")
-
-      # Already gone — still :ok.
-      :ok = Dockd.delete_package(root, "webapp")
-  """
-  @spec delete_package(Path.t(), binary(), keyword()) :: :ok | {:error, Error.t()}
-  def delete_package(root, name, opts \\ []) do
-    Packages.delete(root, name, opts)
-  end
-
-  @doc """
   Lists every dockd-managed `Instance` currently on the Docker daemon.
 
   Discovers containers by filtering on the marker label
@@ -567,7 +358,7 @@ defmodule Dockd do
       Enum.map(instances, & &1.name)
       #=> ["dockd-smoke", "dockd-builder"]
   """
-  @spec list(binary(), keyword()) :: {:ok, [Instance.t()]} | {:error, Error.t()}
+  @spec list(binary(), keyword()) :: {:ok, [Instance.t()]} | {:error, ErrorMessage.t()}
   def list(endpoint, opts \\ []) do
     with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
       marker = "#{Instance.marker_label()}=true"
@@ -578,7 +369,10 @@ defmodule Dockd do
 
         {:error, reason} ->
           {:error,
-           Error.docker_phase_error(:discover, "failed to list Docker containers", reason, nil)}
+           ErrorMessage.not_found("failed to list Docker containers", %{
+             phase: :discover,
+             reason: reason
+           })}
       end
     end
   end
@@ -596,10 +390,10 @@ defmodule Dockd do
 
       case Dockd.get("not-here", endpoint) do
         {:ok, instance} -> instance
-        {:error, %Dockd.Error{} = err} -> err
+        {:error, %ErrorMessage{} = err} -> err
       end
   """
-  @spec get(binary(), binary(), keyword()) :: {:ok, Instance.t()} | {:error, Error.t()}
+  @spec get(binary(), binary(), keyword()) :: {:ok, Instance.t()} | {:error, ErrorMessage.t()}
   def get(name, endpoint, opts \\ []) do
     with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
       case Docker.find_container(Spec.prefix_name(name), docker_options) do
@@ -608,7 +402,10 @@ defmodule Dockd do
 
         {:error, reason} ->
           {:error,
-           Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
+           ErrorMessage.not_found("failed to inspect Docker container", %{
+             phase: :discover,
+             reason: reason
+           })}
       end
     end
   end
@@ -638,7 +435,7 @@ defmodule Dockd do
       # Idempotent — destroying something that's already gone is :ok.
       :ok = Dockd.destroy("smoke", endpoint)
   """
-  @spec destroy(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  @spec destroy(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, ErrorMessage.t()}
   def destroy(instance_or_ref, endpoint, opts \\ [])
 
   def destroy(%Instance{id: id}, endpoint, opts) do
@@ -659,7 +456,7 @@ defmodule Dockd do
       :ok = Dockd.start(instance, endpoint)
       :ok = Dockd.start("smoke", endpoint)
   """
-  @spec start(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  @spec start(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, ErrorMessage.t()}
   def start(instance_or_ref, endpoint, opts \\ []) do
     with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
       case Docker.start_container(ref, docker_options) do
@@ -671,7 +468,10 @@ defmodule Dockd do
 
         {:error, reason} ->
           {:error,
-           Error.docker_phase_error(:lifecycle, "failed to start Docker container", reason, nil)}
+           ErrorMessage.bad_gateway("failed to start Docker container", %{
+             phase: :lifecycle,
+             reason: reason
+           })}
       end
     end
   end
@@ -686,7 +486,7 @@ defmodule Dockd do
       :ok = Dockd.stop(instance, endpoint)
       :ok = Dockd.stop("smoke", endpoint)
   """
-  @spec stop(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  @spec stop(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, ErrorMessage.t()}
   def stop(instance_or_ref, endpoint, opts \\ []) do
     with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
       case Docker.stop_container(ref, docker_options) do
@@ -698,7 +498,10 @@ defmodule Dockd do
 
         {:error, reason} ->
           {:error,
-           Error.docker_phase_error(:lifecycle, "failed to stop Docker container", reason, nil)}
+           ErrorMessage.bad_gateway("failed to stop Docker container", %{
+             phase: :lifecycle,
+             reason: reason
+           })}
       end
     end
   end
@@ -713,7 +516,7 @@ defmodule Dockd do
 
       :ok = Dockd.restart(instance, endpoint)
   """
-  @spec restart(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  @spec restart(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, ErrorMessage.t()}
   def restart(instance_or_ref, endpoint, opts \\ []) do
     with :ok <- stop(instance_or_ref, endpoint, opts) do
       start(instance_or_ref, endpoint, opts)
@@ -731,7 +534,7 @@ defmodule Dockd do
       {:ok, false} = Dockd.running?("smoke", endpoint)
   """
   @spec running?(Instance.t() | binary(), binary(), keyword()) ::
-          {:ok, boolean()} | {:error, Error.t()}
+          {:ok, boolean()} | {:error, ErrorMessage.t()}
   def running?(instance_or_ref, endpoint, opts \\ []) do
     with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
       {:ok, Docker.container_running?(ref, docker_options)}
@@ -760,11 +563,22 @@ defmodule Dockd do
       {:ok, stderr} = Dockd.logs("smoke", endpoint, stdout: false, stderr: true)
   """
   @spec logs(Instance.t() | binary(), binary(), keyword()) ::
-          Docker.result(binary()) | {:error, Error.t()}
+          {:ok, binary()} | {:error, ErrorMessage.t()}
   def logs(instance_or_ref, endpoint, opts \\ []) do
     with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
       {params, log_options} = split_log_opts(opts)
-      Docker.container_logs(ref, params, log_options ++ docker_options)
+
+      case Docker.container_logs(ref, params, log_options ++ docker_options) do
+        {:ok, logs} ->
+          {:ok, logs}
+
+        {:error, reason} ->
+          {:error,
+           ErrorMessage.not_found("failed to read Docker container logs", %{
+             phase: :discover,
+             reason: reason
+           })}
+      end
     end
   end
 
@@ -782,7 +596,7 @@ defmodule Dockd do
       raw["NetworkSettings"]["IPAddress"]
   """
   @spec inspect(Instance.t() | binary(), binary(), keyword()) ::
-          {:ok, map()} | {:error, Error.t()}
+          {:ok, map()} | {:error, ErrorMessage.t()}
   def inspect(instance_or_ref, endpoint, opts \\ []) do
     with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
       case Docker.find_container(ref, docker_options) do
@@ -791,7 +605,10 @@ defmodule Dockd do
 
         {:error, reason} ->
           {:error,
-           Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
+           ErrorMessage.not_found("failed to inspect Docker container", %{
+             phase: :discover,
+             reason: reason
+           })}
       end
     end
   end
@@ -808,7 +625,7 @@ defmodule Dockd do
       {:ok, fresh} = Dockd.refresh("smoke", endpoint)
   """
   @spec refresh(Instance.t() | binary(), binary(), keyword()) ::
-          {:ok, Instance.t()} | {:error, Error.t()}
+          {:ok, Instance.t()} | {:error, ErrorMessage.t()}
   def refresh(instance_or_ref, endpoint, opts \\ [])
 
   def refresh(%Instance{} = instance, endpoint, opts) do
@@ -840,17 +657,27 @@ defmodule Dockd do
       {:ok, _} = Dockd.shell_command("smoke", "uname -a", endpoint)
   """
   @spec shell_command(Instance.t() | binary(), [binary()] | binary(), binary(), keyword()) ::
-          Docker.result(Docker.exec_result()) | {:error, Error.t()}
+          {:ok, Docker.exec_result()} | {:error, ErrorMessage.t()}
   def shell_command(instance_or_ref, command, endpoint, opts \\ []) do
     with {:ok, {ref, instance_opts}} <- resolve_ref(instance_or_ref, endpoint, opts) do
-      Docker.Terminal.run_with_status(ref, command, instance_opts)
+      case Docker.Terminal.run_with_status(ref, command, instance_opts) do
+        {:ok, result} ->
+          {:ok, result}
+
+        {:error, reason} ->
+          {:error,
+           ErrorMessage.bad_gateway("failed to run command in Docker container", %{
+             phase: :setup,
+             reason: reason
+           })}
+      end
     end
   end
 
   @doc """
   Opens a persistent interactive shell on the instance.
 
-  Returns a `Docker.Terminal.handle/0` (the container ref) that
+  Returns a `t:Docker.Terminal.handle/0` (the container ref) that
   preserves shell state (cwd, env, shell variables) across
   `shell_send/3` calls. The same handle is threaded back through
   `shell_send/3` and finally `close_shell/2`. Pair every successful
@@ -872,39 +699,33 @@ defmodule Dockd do
       {:ok, shell} = Dockd.open_shell("smoke", endpoint)
   """
   @spec open_shell(Instance.t() | binary(), binary(), keyword()) ::
-          Docker.result(Docker.Terminal.handle()) | {:error, Error.t()}
+          {:ok, Docker.Terminal.handle()} | {:error, ErrorMessage.t()}
   def open_shell(instance_or_ref, endpoint, opts \\ []) do
     with {:ok, {ref, instance_opts}} <- resolve_ref(instance_or_ref, endpoint, opts),
          {:ok, configured} <- configured_shell_for(instance_or_ref, endpoint, opts) do
       open_opts = instance_opts ++ resolve_shell_arg(opts, configured)
 
-      with {:ok, _session} <- Docker.Terminal.open(ref, open_opts) do
-        {:ok, ref}
+      case Docker.Terminal.open(ref, open_opts) do
+        {:ok, _session} ->
+          {:ok, ref}
+
+        {:error, reason} ->
+          {:error,
+           ErrorMessage.bad_gateway("failed to open a shell in Docker container", %{
+             phase: :setup,
+             reason: reason
+           })}
       end
     end
   end
 
-  @doc """
-  Decides the `:shell` option to add when opening a shell into an instance.
-
-  Exposed because `open_shell/3`'s shell precedence is worth being able to
-  reason about (and test) on its own. Returns the keyword list to append to the
-  Docker options — either `[shell: [program]]` or `[]`.
-
-  Precedence:
-
-    1. an explicit `opts[:shell]` wins, so nothing is added (`[]`)
-    2. otherwise the instance's `configured` program is used, argv-wrapped
-    3. otherwise nothing is added and Docker falls back to `/bin/sh`
-
-  ## Examples
-
-      [shell: ["claude"]] = Dockd.resolve_shell_arg([], "claude")
-      [] = Dockd.resolve_shell_arg([shell: ["bash", "-l"]], "claude")
-      [] = Dockd.resolve_shell_arg([], nil)
-  """
+  # Decides the `:shell` option to add when opening a shell into an instance:
+  #
+  #   1. an explicit `opts[:shell]` wins, so nothing is added (`[]`)
+  #   2. otherwise the instance's `configured` program is used, argv-wrapped
+  #   3. otherwise nothing is added and Docker falls back to `/bin/sh`
   @spec resolve_shell_arg(keyword(), binary() | nil) :: keyword()
-  def resolve_shell_arg(opts, configured) do
+  defp resolve_shell_arg(opts, configured) do
     if is_binary(configured) and not Keyword.has_key?(opts, :shell),
       do: [shell: [configured]],
       else: []
@@ -930,12 +751,33 @@ defmodule Dockd do
       {:ok, {"bar\\n", shell}} = Dockd.shell_send(shell, "echo $FOO")
 
       :ok = Dockd.close_shell(shell)
+
+  On failure the handle is **not** in the error tuple — it is at
+  `details.shell`, so the session can still be closed or retried:
+
+      {:error, %ErrorMessage{details: %{shell: shell}}} = Dockd.shell_send(shell, "pwd")
+      :ok = Dockd.close_shell(shell)
   """
   @spec shell_send(Docker.Terminal.handle(), iodata(), keyword()) ::
           {:ok, {binary() | {binary(), binary()}, Docker.Terminal.handle()}}
-          | {:error, {term(), Docker.Terminal.handle()}}
+          | {:error, ErrorMessage.t()}
   def shell_send(shell, command, opts \\ []) do
-    Docker.Terminal.command(shell, command, opts)
+    case Docker.Terminal.command(shell, command, opts) do
+      {:ok, _} = ok ->
+        ok
+
+      # `Docker.Terminal.command/3` always hands the handle back alongside the
+      # reason. It moves to `details` so every public function fails the same
+      # shape, but it still has to survive: without it the caller cannot close
+      # the session it just failed to write to.
+      {:error, {reason, handle}} ->
+        {:error,
+         ErrorMessage.bad_gateway("failed to send command to shell", %{
+           phase: :setup,
+           reason: reason,
+           shell: handle
+         })}
+    end
   end
 
   @doc """
@@ -960,7 +802,7 @@ defmodule Dockd do
   `copies` is a list of `%{src:, dest:}` maps — the same shape accepted by
   `Dockd.Spec`'s `:copy` field, with `src` required to be an absolute path. Uses
   the same tar + put_archive pipeline that `apply/6` uses at create time, so it
-  needs the same `temp_root` to stage in and the same `:tar_path` / `:tar_env`.
+  needs the same `temp_root` to stage in.
 
   ## Examples
 
@@ -972,25 +814,15 @@ defmodule Dockd do
             %{src: "/srv/scripts", dest: "/opt/scripts"}
           ],
           System.tmp_dir!(),
-          endpoint,
-          tar_path: "/usr/bin/tar",
-          tar_env: %{}
+          endpoint
         )
   """
   @spec copy_to(Instance.t() | binary(), [map()], Path.t(), binary(), keyword()) ::
-          :ok | {:error, Error.t()}
+          :ok | {:error, ErrorMessage.t()}
   def copy_to(instance_or_ref, copies, temp_root, endpoint, opts \\ []) do
     with {:ok, container_id, docker_options} <-
            resolve_container_id(instance_or_ref, endpoint, opts) do
-      FileCopy.copy_files(
-        copies,
-        container_id,
-        temp_root,
-        Keyword.get(opts, :tar_path),
-        Keyword.get(opts, :tar_env),
-        docker_options,
-        opts
-      )
+      Files.copy_files(copies, container_id, temp_root, docker_options, opts)
     end
   end
 
@@ -998,7 +830,7 @@ defmodule Dockd do
   Lists the staging directories dockd has left under `temp_root` on the local
   node.
 
-  These are created during file copies and git repo fetches when preparing data
+  These are created during file copies when preparing data
   for upload into a container. They are usually cleaned up automatically; this
   function exposes whatever is left.
 
@@ -1006,7 +838,7 @@ defmodule Dockd do
   """
   @spec list_temp_files(Path.t()) :: {:ok, [Path.t()]}
   def list_temp_files(temp_root) do
-    {:ok, FileCopy.list_temp_files(temp_root)}
+    {:ok, Files.list_temp_files(temp_root)}
   end
 
   @doc """
@@ -1017,9 +849,9 @@ defmodule Dockd do
   value read from the environment: the directory a destructive sweep targets must
   be one the caller named. `""`, a relative path, and `"/"` are refused.
   """
-  @spec delete_temp_files(Path.t()) :: :ok | {:error, Error.t()}
+  @spec delete_temp_files(Path.t()) :: :ok | {:error, ErrorMessage.t()}
   def delete_temp_files(temp_root) do
-    FileCopy.delete_temp_files(temp_root)
+    Files.delete_temp_files(temp_root)
   end
 
   # ---------------------------------------------------------------------------
@@ -1067,7 +899,10 @@ defmodule Dockd do
 
       {:error, reason} ->
         {:error,
-         Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
+         ErrorMessage.not_found("failed to inspect Docker container", %{
+           phase: :discover,
+           reason: reason
+         })}
     end
   end
 
@@ -1094,10 +929,10 @@ defmodule Dockd do
 
       {:error, reason} ->
         {:error,
-         Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
+         ErrorMessage.not_found("failed to inspect Docker container", %{
+           phase: :discover,
+           reason: reason
+         })}
     end
   end
-
-  defp prefix_message(%Error{message: message} = error, path),
-    do: %{error | message: "#{path}: #{message}"}
 end

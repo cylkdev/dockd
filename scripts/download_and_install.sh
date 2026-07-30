@@ -37,9 +37,9 @@ git clone --depth 1 --branch "$REF" "$REPO" "$clone_dir"
 cd "$clone_dir"
 
 echo "==> Building release"
-scripts/release_burrito_app.sh
+scripts/build_release.sh
 
 echo "==> Installing release"
-scripts/install_burrito_release.sh
+scripts/install.sh
 
 echo "==> dockd installation complete."
