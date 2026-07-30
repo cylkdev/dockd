@@ -34,7 +34,7 @@ defmodule Dockd.Spec.Normalizer do
   string typically pass `File.cwd!/0` or any chosen base directory.
   """
   @spec normalize(map(), Path.t()) :: {:ok, map()} | {:error, Error.t()}
-  def normalize(decoded, package_dir) when is_map(decoded) and is_binary(package_dir) do
+  def normalize(decoded, package_dir) do
     Enum.reduce_while(decoded, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
       atom = String.to_atom(key)
 
@@ -61,17 +61,15 @@ defmodule Dockd.Spec.Normalizer do
       {:error, %Error{phase: :validate, message: "instance JSON key \"build\" must be an object"}}
 
   defp normalize_attr(:env, value, _package_dir) when is_list(value) do
-    value
-    |> Enum.reduce_while({:ok, []}, fn entry, {:ok, acc} ->
-      case normalize_env_entry(entry) do
-        {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
-      {:error, _} = err -> err
-    end
+    reduced =
+      Enum.reduce_while(value, {:ok, []}, fn entry, {:ok, acc} ->
+        case normalize_env_entry(entry) do
+          {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+
+    with {:ok, reversed} <- reduced, do: {:ok, Enum.reverse(reversed)}
   end
 
   defp normalize_attr(:env, _value, _package_dir),

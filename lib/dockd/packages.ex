@@ -38,6 +38,7 @@ defmodule Dockd.Packages do
   """
 
   alias Dockd.Error
+  alias Dockd.HostTool
   alias Dockd.Spec
   alias Dockd.Spec.Encoder
   alias Dockd.Spec.Normalizer
@@ -56,7 +57,7 @@ defmodule Dockd.Packages do
     - any other string is resolved against `<root>/<name>/package.json`
   """
   @spec resolve_path(Path.t(), binary(), keyword()) :: Path.t()
-  def resolve_path(root, ref, opts \\ []) when is_binary(ref) and is_list(opts) do
+  def resolve_path(root, ref, _opts \\ []) when is_binary(ref) do
     cond do
       String.ends_with?(ref, ".json") ->
         ref
@@ -90,7 +91,7 @@ defmodule Dockd.Packages do
             spec: {:ok, Spec.t()} | {:error, Error.t()}
           }
         ]
-  def list(root, opts \\ []) when is_binary(root) and is_list(opts) do
+  def list(root, _opts \\ []) when is_binary(root) do
     case File.ls(root) do
       {:ok, entries} ->
         entries
@@ -309,13 +310,16 @@ defmodule Dockd.Packages do
     package_path = Path.join(dir, @package_filename)
     dockerfile_path = Path.join(dir, Encoder.dockerfile_name())
 
+    # Both documents are built and validated before anything is written, so a
+    # rejected :dockerfile cannot leave a package.json behind with no Dockerfile.
     with {:ok, document} <- Encoder.document(instance_name, opts),
+         {:ok, dockerfile} <- Encoder.dockerfile(opts),
          json = Encoder.encode(document),
          :ok <- validate_document(json, dir),
          :ok <- check_collision(dir, existed?, Keyword.get(opts, :force, false)),
          :ok <- reset_dir(dir, existed?),
          :ok <- write_file(package_path, json),
-         :ok <- write_file(dockerfile_path, Encoder.dockerfile(opts)) do
+         :ok <- write_file(dockerfile_path, dockerfile) do
       {:ok,
        %{
          instance_name: instance_name,
@@ -346,8 +350,28 @@ defmodule Dockd.Packages do
   defp check_collision(_dir, _existed?, _force?), do: :ok
 
   defp reset_dir(dir, existed?) do
-    if existed?, do: File.rm_rf(dir)
+    with :ok <- clear_dir(dir, existed?) do
+      make_dir(dir)
+    end
+  end
 
+  defp clear_dir(_dir, false), do: :ok
+
+  defp clear_dir(dir, true) do
+    case File.rm_rf(dir) do
+      {:ok, _removed} ->
+        :ok
+
+      {:error, reason, path} ->
+        {:error,
+         %Error{
+           phase: :generate,
+           message: "could not replace #{path}: #{:file.format_error(reason)}"
+         }}
+    end
+  end
+
+  defp make_dir(dir) do
     case File.mkdir_p(dir) do
       :ok ->
         :ok
@@ -403,25 +427,24 @@ defmodule Dockd.Packages do
   end
 
   defp install_each(candidates, dest_dir) do
-    Enum.reduce_while(candidates, {:ok, []}, fn {name, src}, {:ok, acc} ->
-      with {:ok, _spec} <- load_metadata_spec(Path.join(src, @package_filename)),
-           :ok <- copy_package(src, Path.join(dest_dir, name)) do
-        {:cont, {:ok, [name | acc]}}
-      else
-        {:error, %Error{} = err} ->
-          {:halt,
-           {:error,
-            %Error{
-              err
-              | phase: :fetch,
-                message: "package #{inspect(name)}: #{err.message}"
-            }}}
-      end
-    end)
-    |> case do
-      {:ok, acc} -> {:ok, Enum.reverse(acc)}
-      err -> err
-    end
+    reduced =
+      Enum.reduce_while(candidates, {:ok, []}, fn {name, src}, {:ok, acc} ->
+        with {:ok, _spec} <- load_metadata_spec(Path.join(src, @package_filename)),
+             :ok <- copy_package(src, Path.join(dest_dir, name)) do
+          {:cont, {:ok, [name | acc]}}
+        else
+          {:error, %Error{} = err} ->
+            {:halt,
+             {:error,
+              %Error{
+                err
+                | phase: :fetch,
+                  message: "package #{inspect(name)}: #{err.message}"
+              }}}
+        end
+      end)
+
+    with {:ok, acc} <- reduced, do: {:ok, Enum.reverse(acc)}
   end
 
   defp copy_package(src, dest) do
@@ -442,44 +465,19 @@ defmodule Dockd.Packages do
     end
   end
 
-  defp ensure_git(git_path) when is_binary(git_path) and git_path !== "" do
-    if File.regular?(git_path),
-      do: :ok,
-      else:
-        {:error, %Error{phase: :fetch, message: "git_path does not name a file: #{git_path}"}}
+  defp ensure_git(git_path),
+    do: fetch_check(HostTool.executable(git_path, "git", "installing from git"))
+
+  defp ensure_env(env), do: fetch_check(HostTool.env(env, "git"))
+
+  defp staging_dir(staging_root) do
+    with :ok <- fetch_check(HostTool.staging_root(staging_root, "staging_root")) do
+      {:ok, Path.join(staging_root, "dockd-pkg-#{System.unique_integer([:positive])}")}
+    end
   end
 
-  defp ensure_git(other) do
-    {:error,
-     %Error{
-       phase: :fetch,
-       message:
-         "installing from git needs git. Pass git_path with the absolute path to the git " <>
-           "executable, got: #{inspect(other)}"
-     }}
-  end
-
-  defp ensure_env(env) when is_map(env), do: :ok
-
-  defp ensure_env(other),
-    do:
-      {:error,
-       %Error{
-         phase: :fetch,
-         message: "git_env must be a map of name => value, got: #{inspect(other)}"
-       }}
-
-  defp staging_dir(staging_root) when is_binary(staging_root) and staging_root !== "" do
-    {:ok, Path.join(staging_root, "dockd-pkg-#{System.unique_integer([:positive])}")}
-  end
-
-  defp staging_dir(other) do
-    {:error,
-     %Error{
-       phase: :fetch,
-       message: "a staging_root is required to clone into, got: #{inspect(other)}"
-     }}
-  end
+  defp fetch_check(:ok), do: :ok
+  defp fetch_check({:error, message}), do: {:error, %Error{phase: :fetch, message: message}}
 
   defp clone(url, ref, target, git_path, git_env) do
     args =

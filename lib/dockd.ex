@@ -180,10 +180,6 @@ defmodule Dockd do
       path, and `"/"`. The directory a destructive sweep targets has to be one
       the caller named.
 
-  And the broader, extension-friendly aggregate:
-
-    - `info/1` — returns `%{temp_files: %{...}}` today, more keys later.
-
   ## Options
 
   Beyond the required positional arguments, public functions take a trailing
@@ -220,35 +216,8 @@ defmodule Dockd do
   @log_param_keys [:tail, :since, :until, :follow]
   @log_option_keys [:stdout, :stderr, :timestamps]
 
-  # The daemon endpoint and :disk_mount_enabled are absent on purpose — they are
-  # positional arguments, so they cannot be forgotten and silently defaulted.
-  @apply_opts [
-    :api_version,
-    :platform,
-    :networks,
-    :network_mode,
-    :git_path,
-    :git_env,
-    :tar_path,
-    :tar_env,
-    :tar_extra_args,
-    :container_staging_root
-  ]
-
-  # Retired keys, kept only so a caller still passing one gets a pointed error
-  # instead of a silent no-op.
-  @retired_opts %{
-    socket: "the positional `endpoint` argument",
-    host: "the positional `endpoint` argument",
-    disk_mount_enabled: "the positional `disk_mount_enabled` argument",
-    packages_path: "the positional `root` argument",
-    dest_dir: "the positional `root` argument",
-    launcher_path: "the positional `launcher_path` argument of Dockd.Shell.open_window/6",
-    instance_name: "the positional `instance_name` argument"
-  }
-
   @doc """
-  Returns the caller-runtime option keys accepted by `apply/6`.
+  Returns the caller-runtime option keys `apply/6` reads.
 
   These are genuinely optional: Docker request tuning (`:api_version`,
   `:platform`, `:networks`, `:network_mode`) and the host tooling a spec needs
@@ -256,12 +225,24 @@ defmodule Dockd do
   `:tar_path`, `:tar_env`, `:tar_extra_args`, `:container_staging_root`).
 
   The daemon endpoint and `disk_mount_enabled` are *not* here — they are required
-  positional arguments. `apply/6` rejects any unknown caller option, and names the
-  positional replacement for keys that used to live here.
+  positional arguments, so they cannot be forgotten and silently defaulted.
+
+  Keys outside this list are ignored, as in any keyword-option API.
   """
   @spec option_keys() :: [atom()]
   def option_keys do
-    @apply_opts
+    [
+      :api_version,
+      :platform,
+      :networks,
+      :network_mode,
+      :git_path,
+      :git_env,
+      :tar_path,
+      :tar_env,
+      :tar_extra_args,
+      :container_staging_root
+    ]
   end
 
   @doc """
@@ -311,11 +292,8 @@ defmodule Dockd do
   """
   @spec apply(Spec.t(), binary(), boolean(), host_env(), Path.t(), keyword()) ::
           {:ok, ApplyResult.t()} | {:error, Error.t()}
-  def apply(%Spec{} = spec, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ [])
-      when is_list(opts) do
-    with :ok <- check_call_opts(opts) do
-      Provisioner.run(spec, endpoint, disk_mount_enabled, host_env, temp_root, opts)
-    end
+  def apply(%Spec{} = spec, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ []) do
+    Provisioner.run(spec, endpoint, disk_mount_enabled, host_env, temp_root, opts)
   end
 
   @doc """
@@ -326,7 +304,7 @@ defmodule Dockd do
   it as an option without the two being separable only by a lookup table.
 
   Spec options and caller options share the trailing keyword list;
-  `Dockd.Spec.option_keys/0` decides the split, and unknown keys are rejected.
+  `Dockd.Spec.option_keys/0` decides the split.
 
   ## Examples
 
@@ -338,12 +316,18 @@ defmodule Dockd do
   """
   @spec apply_image(binary(), binary(), binary(), boolean(), host_env(), Path.t(), keyword()) ::
           {:ok, ApplyResult.t()} | {:error, Error.t()}
-  def apply_image(image, instance_name, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ [])
-      when is_list(opts) do
+  def apply_image(
+        image,
+        instance_name,
+        endpoint,
+        disk_mount_enabled,
+        host_env,
+        temp_root,
+        opts \\ []
+      ) do
     {spec_opts, call_opts} = Keyword.split(opts, Spec.option_keys())
 
-    with :ok <- check_call_opts(call_opts),
-         {:ok, spec} <- Spec.new(image, instance_name, spec_opts) do
+    with {:ok, spec} <- Spec.new(image, instance_name, spec_opts) do
       Provisioner.run(spec, endpoint, disk_mount_enabled, host_env, temp_root, call_opts)
     end
   end
@@ -379,10 +363,8 @@ defmodule Dockd do
   """
   @spec apply_package(Path.t(), binary(), binary(), boolean(), host_env(), Path.t(), keyword()) ::
           {:ok, ApplyResult.t()} | {:error, Error.t()}
-  def apply_package(root, ref, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ [])
-      when is_binary(ref) and is_list(opts) do
-    with :ok <- check_call_opts(opts),
-         {:ok, spec} <- load_package_spec(root, ref, host_env) do
+  def apply_package(root, ref, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ []) do
+    with {:ok, spec} <- load_package_spec(root, ref, host_env) do
       Provisioner.run(spec, endpoint, disk_mount_enabled, host_env, temp_root, opts)
     end
   end
@@ -397,8 +379,7 @@ defmodule Dockd do
   """
   @spec load_package_spec(Path.t(), binary(), host_env()) ::
           {:ok, Spec.t()} | {:error, Error.t()}
-  def load_package_spec(root, ref, host_env)
-      when is_binary(root) and is_binary(ref) and is_map(host_env) do
+  def load_package_spec(root, ref, host_env) do
     path = Packages.resolve_path(root, ref)
 
     with {:ok, decoded} <- Parser.parse_file(path),
@@ -456,8 +437,7 @@ defmodule Dockd do
   """
   @spec install_packages(Path.t(), binary(), keyword()) ::
           {:ok, [binary()]} | {:error, Error.t()}
-  def install_packages(root, ref, opts \\ [])
-      when is_binary(root) and is_binary(ref) and is_list(opts) do
+  def install_packages(root, ref, opts \\ []) do
     if File.dir?(ref) do
       Packages.install_from_path(root, ref, opts)
     else
@@ -512,8 +492,7 @@ defmodule Dockd do
              overwrote?: boolean()
            }}
           | {:error, Error.t()}
-  def new_package(dir, instance_name, opts \\ [])
-      when is_binary(dir) and is_binary(instance_name) and is_list(opts) do
+  def new_package(dir, instance_name, opts \\ []) do
     Packages.new(dir, instance_name, opts)
   end
 
@@ -547,7 +526,7 @@ defmodule Dockd do
             spec: {:ok, Spec.t()} | {:error, Error.t()}
           }
         ]
-  def list_packages(root, opts \\ []) when is_binary(root) and is_list(opts) do
+  def list_packages(root, opts \\ []) do
     Packages.list(root, opts)
   end
 
@@ -571,8 +550,7 @@ defmodule Dockd do
       :ok = Dockd.delete_package(root, "webapp")
   """
   @spec delete_package(Path.t(), binary(), keyword()) :: :ok | {:error, Error.t()}
-  def delete_package(root, name, opts \\ [])
-      when is_binary(root) and is_binary(name) and is_list(opts) do
+  def delete_package(root, name, opts \\ []) do
     Packages.delete(root, name, opts)
   end
 
@@ -590,7 +568,7 @@ defmodule Dockd do
       #=> ["dockd-smoke", "dockd-builder"]
   """
   @spec list(binary(), keyword()) :: {:ok, [Instance.t()]} | {:error, Error.t()}
-  def list(endpoint, opts \\ []) when is_list(opts) do
+  def list(endpoint, opts \\ []) do
     with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
       marker = "#{Instance.marker_label()}=true"
 
@@ -622,7 +600,7 @@ defmodule Dockd do
       end
   """
   @spec get(binary(), binary(), keyword()) :: {:ok, Instance.t()} | {:error, Error.t()}
-  def get(name, endpoint, opts \\ []) when is_binary(name) and is_list(opts) do
+  def get(name, endpoint, opts \\ []) do
     with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
       case Docker.find_container(Spec.prefix_name(name), docker_options) do
         {:ok, body} ->
@@ -663,11 +641,11 @@ defmodule Dockd do
   @spec destroy(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
   def destroy(instance_or_ref, endpoint, opts \\ [])
 
-  def destroy(%Instance{id: id}, endpoint, opts) when is_binary(id) and is_list(opts) do
+  def destroy(%Instance{id: id}, endpoint, opts) do
     Provisioner.destroy(id, endpoint, opts)
   end
 
-  def destroy(ref, endpoint, opts) when is_binary(ref) and is_list(opts) do
+  def destroy(ref, endpoint, opts) do
     Provisioner.destroy(Spec.prefix_name(ref), endpoint, opts)
   end
 
@@ -833,11 +811,11 @@ defmodule Dockd do
           {:ok, Instance.t()} | {:error, Error.t()}
   def refresh(instance_or_ref, endpoint, opts \\ [])
 
-  def refresh(%Instance{} = instance, endpoint, opts) when is_list(opts) do
+  def refresh(%Instance{} = instance, endpoint, opts) do
     get(Instance.short_name(instance), endpoint, opts)
   end
 
-  def refresh(ref, endpoint, opts) when is_binary(ref) and is_list(opts) do
+  def refresh(ref, endpoint, opts) do
     get(ref, endpoint, opts)
   end
 
@@ -900,9 +878,8 @@ defmodule Dockd do
          {:ok, configured} <- configured_shell_for(instance_or_ref, endpoint, opts) do
       open_opts = instance_opts ++ resolve_shell_arg(opts, configured)
 
-      case Docker.Terminal.open(ref, open_opts) do
-        {:ok, _session} -> {:ok, ref}
-        {:error, _} = err -> err
+      with {:ok, _session} <- Docker.Terminal.open(ref, open_opts) do
+        {:ok, ref}
       end
     end
   end
@@ -928,11 +905,9 @@ defmodule Dockd do
   """
   @spec resolve_shell_arg(keyword(), binary() | nil) :: keyword()
   def resolve_shell_arg(opts, configured) do
-    cond do
-      Keyword.has_key?(opts, :shell) -> []
-      is_binary(configured) -> [shell: [configured]]
-      true -> []
-    end
+    if is_binary(configured) and not Keyword.has_key?(opts, :shell),
+      do: [shell: [configured]],
+      else: []
   end
 
   @doc """
@@ -1004,22 +979,18 @@ defmodule Dockd do
   """
   @spec copy_to(Instance.t() | binary(), [map()], Path.t(), binary(), keyword()) ::
           :ok | {:error, Error.t()}
-  def copy_to(instance_or_ref, copies, temp_root, endpoint, opts \\ [])
-      when is_list(copies) and is_list(opts) do
-    case resolve_container_id(instance_or_ref, endpoint, opts) do
-      {:ok, container_id, docker_options} ->
-        FileCopy.copy_files(
-          copies,
-          container_id,
-          temp_root,
-          Keyword.get(opts, :tar_path),
-          Keyword.get(opts, :tar_env),
-          docker_options,
-          opts
-        )
-
-      {:error, _} = err ->
-        err
+  def copy_to(instance_or_ref, copies, temp_root, endpoint, opts \\ []) do
+    with {:ok, container_id, docker_options} <-
+           resolve_container_id(instance_or_ref, endpoint, opts) do
+      FileCopy.copy_files(
+        copies,
+        container_id,
+        temp_root,
+        Keyword.get(opts, :tar_path),
+        Keyword.get(opts, :tar_env),
+        docker_options,
+        opts
+      )
     end
   end
 
@@ -1034,7 +1005,7 @@ defmodule Dockd do
   `temp_root` is the same directory you passed to `apply/6` or `copy_to/5`.
   """
   @spec list_temp_files(Path.t()) :: {:ok, [Path.t()]}
-  def list_temp_files(temp_root) when is_binary(temp_root) do
+  def list_temp_files(temp_root) do
     {:ok, FileCopy.list_temp_files(temp_root)}
   end
 
@@ -1051,71 +1022,39 @@ defmodule Dockd do
     FileCopy.delete_temp_files(temp_root)
   end
 
-  @doc """
-  Returns an aggregate info map about dockd's staging state under `temp_root`.
-
-  The shape is `%{temp_files: %{...}}` and is intentionally
-  extension-friendly: callers should pattern-match on the keys they
-  care about so future additions don't conflict with existing data.
-
-  Currently included:
-
-    - `:temp_files` — `%{count, total_bytes, oldest_at, newest_at}` for
-      the staging dirs under `temp_root`.
-  """
-  @spec info(Path.t()) ::
-          {:ok,
-           %{
-             temp_files: %{
-               count: non_neg_integer(),
-               total_bytes: non_neg_integer(),
-               oldest_at: DateTime.t() | nil,
-               newest_at: DateTime.t() | nil
-             }
-           }}
-  def info(temp_root) when is_binary(temp_root) do
-    {:ok, %{temp_files: FileCopy.temp_files_info(temp_root)}}
-  end
-
   # ---------------------------------------------------------------------------
 
   # Reads the instance's configured program. Avoids I/O when we already hold the
-  # hydrated struct; auto-hydrates a bare ref via get/3. An explicit opts[:shell]
-  # wins, so there is nothing to look up.
-  defp configured_shell_for(instance_or_ref, endpoint, opts) do
-    cond do
-      Keyword.has_key?(opts, :shell) -> {:ok, nil}
-      match?(%Instance{}, instance_or_ref) -> {:ok, instance_or_ref.shell}
-      true -> hydrated_shell(instance_or_ref, endpoint, opts)
+  # hydrated struct; auto-hydrates a bare ref via get/3, and reports a failed
+  # lookup rather than falling back to a default program. `resolve_shell_arg/2`
+  # decides whether the result is used — an explicit `opts[:shell]` wins.
+  defp configured_shell_for(%Instance{shell: shell}, _endpoint, _opts), do: {:ok, shell}
+
+  defp configured_shell_for(ref, endpoint, opts) do
+    with {:ok, %Instance{shell: shell}} <- get(ref, endpoint, opts) do
+      {:ok, shell}
     end
   end
 
-  defp hydrated_shell(ref, endpoint, opts) do
-    case get(ref, endpoint, opts) do
-      {:ok, %Instance{shell: shell}} -> {:ok, shell}
-      _ -> {:ok, nil}
-    end
-  end
-
-  defp resolve_ref(%Instance{id: id}, endpoint, opts) when is_binary(id) do
+  defp resolve_ref(%Instance{id: id}, endpoint, opts) do
     with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
       {:ok, {id, docker_options}}
     end
   end
 
-  defp resolve_ref(ref, endpoint, opts) when is_binary(ref) do
+  defp resolve_ref(ref, endpoint, opts) do
     with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
       {:ok, {Spec.prefix_name(ref), docker_options}}
     end
   end
 
-  defp resolve_container_id(%Instance{id: id}, endpoint, opts) when is_binary(id) do
+  defp resolve_container_id(%Instance{id: id}, endpoint, opts) do
     with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
       {:ok, id, docker_options}
     end
   end
 
-  defp resolve_container_id(ref, endpoint, opts) when is_binary(ref) do
+  defp resolve_container_id(ref, endpoint, opts) do
     with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
       lookup_container_id(ref, docker_options)
     end
@@ -1125,15 +1064,6 @@ defmodule Dockd do
     case Docker.find_container(Spec.prefix_name(ref), docker_options) do
       {:ok, %{"Id" => id}} ->
         {:ok, id, docker_options}
-
-      {:ok, body} ->
-        {:error,
-         Error.docker_phase_error(
-           :discover,
-           "Docker inspect missing container id",
-           body,
-           nil
-         )}
 
       {:error, reason} ->
         {:error,
@@ -1156,7 +1086,7 @@ defmodule Dockd do
   end
 
   defp hydrate_each([summary | rest], docker_options, acc) do
-    id = Map.get(summary, "Id") || Map.get(summary, "id")
+    id = Map.fetch!(summary, "Id")
 
     case Docker.find_container(id, docker_options) do
       {:ok, body} ->
@@ -1166,36 +1096,6 @@ defmodule Dockd do
         {:error,
          Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
     end
-  end
-
-  # Retired keys get a message naming their positional replacement, so a caller
-  # who still passes one is told where the value moved rather than having it
-  # silently dropped.
-  defp check_call_opts(call_opts) do
-    keys = Keyword.keys(call_opts)
-
-    case Enum.find(keys, &Map.has_key?(@retired_opts, &1)) do
-      nil -> check_unknown_opts(keys)
-      key -> {:error, retired_option_error(key)}
-    end
-  end
-
-  defp check_unknown_opts(keys) do
-    case keys -- @apply_opts do
-      [] ->
-        :ok
-
-      [key | _] ->
-        {:error, %Error{phase: :validate, message: "unknown option: #{Kernel.inspect(key)}"}}
-    end
-  end
-
-  defp retired_option_error(key) do
-    %Error{
-      phase: :validate,
-      message:
-        "#{Kernel.inspect(key)} is no longer an option; pass #{Map.fetch!(@retired_opts, key)}"
-    }
   end
 
   defp prefix_message(%Error{message: message} = error, path),

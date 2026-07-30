@@ -49,12 +49,13 @@ defmodule Dockd.FileCopy do
 
   Per-call staging lives under `<temp_root>/dockd-copy-<unique>/`. On clean runs the
   `after` block tears it down. To sweep orphans left behind by hard kills or crashes,
-  this module exposes `list_temp_files/1`, `delete_temp_files/1`, and
-  `temp_files_info/1`. They operate on whichever root the caller names, so they also
-  cover `dockd-fetch-*` dirs created by `Dockd.Git` under the same root.
+  this module exposes `list_temp_files/1` and `delete_temp_files/1`. They operate on
+  whichever root the caller names, so they also cover `dockd-fetch-*` dirs created by
+  `Dockd.Git` under the same root.
   """
 
   alias Dockd.Error
+  alias Dockd.HostTool
 
   @doc """
   Copies the given host files/directories into a running container in one batch.
@@ -86,11 +87,10 @@ defmodule Dockd.FileCopy do
   def copy_files([], _container_id, _temp_root, _tar_path, _tar_env, _docker_options, _opts),
     do: :ok
 
-  def copy_files(specs, container_id, temp_root, tar_path, tar_env, docker_options, opts)
-      when is_list(specs) and is_binary(container_id) and is_list(docker_options) do
-    with :ok <- ensure_tar(tar_path),
-         :ok <- ensure_env(tar_env),
-         :ok <- validate_temp_root(temp_root),
+  def copy_files(specs, container_id, temp_root, tar_path, tar_env, docker_options, opts) do
+    with :ok <- copy_check(HostTool.executable(tar_path, "tar", "copying host files")),
+         :ok <- copy_check(HostTool.env(tar_env, "tar")),
+         :ok <- copy_check(HostTool.staging_root(temp_root, "temp_root")),
          :ok <- validate_paths(specs) do
       unique = "dockd-copy-#{System.unique_integer([:positive])}"
       host_tmp = Path.join(temp_root, unique)
@@ -114,43 +114,10 @@ defmodule Dockd.FileCopy do
     end
   end
 
-  defp ensure_tar(tar_path) when is_binary(tar_path) and tar_path !== "" do
-    # Preflighted rather than discovered: a missing tar used to raise ErlangError
-    # out of System.cmd instead of returning a tagged error.
-    if File.regular?(tar_path),
-      do: :ok,
-      else: {:error, %Error{phase: :copy, message: "tar_path does not name a file: #{tar_path}"}}
-  end
-
-  defp ensure_tar(other) do
-    {:error,
-     %Error{
-       phase: :copy,
-       message:
-         "copying host files needs tar. Pass tar_path with the absolute path to the tar " <>
-           "executable, got: #{inspect(other)}"
-     }}
-  end
-
-  defp ensure_env(env) when is_map(env), do: :ok
-
-  defp ensure_env(other),
-    do:
-      {:error,
-       %Error{
-         phase: :copy,
-         message: "tar_env must be a map of name => value, got: #{inspect(other)}"
-       }}
-
-  defp validate_temp_root(root) when is_binary(root) and root !== "", do: :ok
-
-  defp validate_temp_root(other),
-    do:
-      {:error,
-       %Error{
-         phase: :copy,
-         message: "a host temp_root is required to stage copies, got: #{inspect(other)}"
-       }}
+  # tar is preflighted rather than discovered: a missing tar used to raise
+  # ErlangError out of System.cmd instead of returning a tagged error.
+  defp copy_check(:ok), do: :ok
+  defp copy_check({:error, message}), do: {:error, %Error{phase: :copy, message: message}}
 
   defp validate_paths(specs) do
     Enum.reduce_while(specs, :ok, fn %{dest: dest} = spec, :ok ->
@@ -178,18 +145,17 @@ defmodule Dockd.FileCopy do
   end
 
   defp stage_all(specs, host_tmp) do
-    specs
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {spec, index}, {:ok, rows} ->
-      case stage_one(spec, index, host_tmp) do
-        {:ok, row} -> {:cont, {:ok, [row | rows]}}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, rows} -> {:ok, Enum.reverse(rows)}
-      err -> err
-    end
+    reduced =
+      specs
+      |> Enum.with_index()
+      |> Enum.reduce_while({:ok, []}, fn {spec, index}, {:ok, rows} ->
+        case stage_one(spec, index, host_tmp) do
+          {:ok, row} -> {:cont, {:ok, [row | rows]}}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+
+    with {:ok, rows} <- reduced, do: {:ok, Enum.reverse(rows)}
   end
 
   defp stage_one(%{src: src, dest: dest} = spec, index, host_tmp) do
@@ -198,7 +164,7 @@ defmodule Dockd.FileCopy do
 
     # `src` is already absolute — validate_paths/1 rejects anything else, so there
     # is no Path.expand and no dependency on the caller's CWD.
-    with :ok <- stage_path(src, staged, src) do
+    with :ok <- stage_path(src, staged) do
       {:ok,
        %{
          entry: entry,
@@ -209,16 +175,16 @@ defmodule Dockd.FileCopy do
     end
   end
 
-  defp stage_path(expanded, staged, src) do
+  defp stage_path(src, staged) do
     cond do
-      File.regular?(expanded) ->
-        case File.cp(expanded, staged) do
+      File.regular?(src) ->
+        case File.cp(src, staged) do
           :ok -> :ok
           {:error, reason} -> error("could not stage file #{src}", reason)
         end
 
-      File.dir?(expanded) ->
-        case File.cp_r(expanded, staged) do
+      File.dir?(src) ->
+        case File.cp_r(src, staged) do
           {:ok, _} -> :ok
           {:error, reason, path} -> error("could not stage dir #{path}", reason)
         end
@@ -375,90 +341,10 @@ defmodule Dockd.FileCopy do
     end
   end
 
-  @doc """
-  Returns aggregate stats about the temp files under `temp_root`.
-
-  Useful for deciding whether to call `delete_temp_files/1`. The `:total_bytes` value
-  recursively sums regular-file sizes; `:oldest_at` / `:newest_at` are derived from
-  each top-level entry's own mtime.
-  """
-  @spec temp_files_info(Path.t()) :: %{
-          count: non_neg_integer(),
-          total_bytes: non_neg_integer(),
-          oldest_at: DateTime.t() | nil,
-          newest_at: DateTime.t() | nil
-        }
-  def temp_files_info(temp_root) when is_binary(temp_root) do
-    temp_root
-    |> list_temp_files()
-    |> Enum.reduce(
-      %{count: 0, total_bytes: 0, oldest_at: nil, newest_at: nil},
-      fn path, acc ->
-        mtime = entry_mtime(path)
-
-        %{
-          count: acc.count + 1,
-          total_bytes: acc.total_bytes + du(path),
-          oldest_at: min_time(acc.oldest_at, mtime),
-          newest_at: max_time(acc.newest_at, mtime)
-        }
-      end
-    )
-  end
-
-  defp safe_to_sweep(root) when is_binary(root) do
-    cond do
-      root === "" ->
-        {:error, %Error{phase: :destroy, message: "temp_root must not be empty"}}
-
-      Path.type(root) !== :absolute ->
-        {:error,
-         %Error{
-           phase: :destroy,
-           message: "temp_root must be an absolute path, got: #{inspect(root)}"
-         }}
-
-      Path.absname(root) === "/" ->
-        {:error, %Error{phase: :destroy, message: ~s(temp_root must not be "/")}}
-
-      true ->
-        :ok
+  defp safe_to_sweep(root) do
+    case HostTool.sweepable_root(root, "temp_root") do
+      :ok -> :ok
+      {:error, message} -> {:error, %Error{phase: :destroy, message: message}}
     end
   end
-
-  defp safe_to_sweep(other),
-    do:
-      {:error,
-       %Error{phase: :destroy, message: "temp_root must be a string, got: #{inspect(other)}"}}
-
-  defp du(path) do
-    case File.stat(path) do
-      {:ok, %File.Stat{type: :regular, size: size}} ->
-        size
-
-      {:ok, %File.Stat{type: :directory}} ->
-        case File.ls(path) do
-          {:ok, entries} -> Enum.reduce(entries, 0, &(du(Path.join(path, &1)) + &2))
-          {:error, _} -> 0
-        end
-
-      _ ->
-        0
-    end
-  end
-
-  defp entry_mtime(path) do
-    case File.stat(path, time: :posix) do
-      {:ok, %File.Stat{mtime: posix}} -> DateTime.from_unix!(posix)
-      {:error, _} -> nil
-    end
-  end
-
-  defp min_time(nil, t), do: t
-  defp min_time(t, nil), do: t
-  defp min_time(a, b), do: if(DateTime.compare(a, b) == :lt, do: a, else: b)
-
-  defp max_time(nil, t), do: t
-  defp max_time(t, nil), do: t
-  defp max_time(a, b), do: if(DateTime.compare(a, b) == :gt, do: a, else: b)
 end

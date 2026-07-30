@@ -91,7 +91,7 @@ defmodule Dockd.Ssh.DockerDialStdio do
   `:assigns` key, so the template can reference values as `<%= @key %>`.
   """
   @spec render_script(Path.t(), keyword()) :: binary()
-  def render_script(template_path, assigns \\ []) when is_binary(template_path) do
+  def render_script(template_path, assigns \\ []) do
     EEx.eval_file(template_path, assigns: assigns)
   end
 
@@ -204,17 +204,11 @@ defmodule Dockd.Ssh.DockerDialStdio do
     end
   end
 
-  defp require_executable(path, name) when is_binary(path) and path !== "" do
-    if File.regular?(path),
-      do: {:ok, path},
-      else: {:error, "#{name}_path does not name a file: #{path}"}
+  defp require_executable(path, name) do
+    with :ok <- Dockd.HostTool.executable(path, name, "installing over SSH") do
+      {:ok, path}
+    end
   end
-
-  defp require_executable(other, name),
-    do:
-      {:error,
-       "installing over SSH needs #{name}. Pass #{name}_path with its absolute path, " <>
-         "got: #{inspect(other)}"}
 
   # `remote_path` is interpolated into a remote shell command, so a value with a
   # space, `;`, `$`, or a glob would be expanded by the remote shell.
@@ -332,12 +326,29 @@ defmodule Dockd.Ssh.DockerDialStdio do
   defp run_content_plan([{_step, cmd, args, check}], content, timeout) do
     case ElixirExec.run([cmd | args], stdin: true) do
       {:ok, conn} ->
-        :ok = ElixirExec.write(conn, content)
-        :ok = ElixirExec.write(conn, :eof)
-        collect_content_output(conn, [], check, timeout)
+        with :ok <- write_stdin(conn, content) do
+          collect_content_output(conn, [], check, timeout)
+        end
 
       {:error, reason} ->
         {:error, "subprocess failed: #{inspect(reason)}"}
+    end
+  end
+
+  # The script body is piped to ssh's stdin. A host that drops the connection
+  # mid-write is an ordinary failure, so it is reported — these used to be
+  # `:ok = ...` matches, which raised MatchError out of a function whose contract
+  # is `{:error, String.t()}`.
+  defp write_stdin(conn, content) do
+    with :ok <- write_chunk(conn, content) do
+      write_chunk(conn, :eof)
+    end
+  end
+
+  defp write_chunk(conn, chunk) do
+    case ElixirExec.write(conn, chunk) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "could not write remote script to ssh: #{inspect(reason)}"}
     end
   end
 

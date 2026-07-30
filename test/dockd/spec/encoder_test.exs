@@ -5,20 +5,39 @@ defmodule Dockd.Spec.EncoderTest do
   alias Dockd.Spec.Parser
 
   describe "document/2" do
+    # The name rules live in Dockd.Spec, so a scaffolded package is held to the
+    # same grammar a loaded one is. These assert on Spec's messages.
     test "requires a non-empty instance name" do
       assert {:error, err} = Encoder.document("", [])
       assert err.phase === :validate
-      assert err.message =~ "instance name must be a non-empty string"
+      assert err.message =~ "non-empty binary :instance_name"
     end
 
     test "rejects an instance name that cannot appear in an image tag" do
       assert {:error, err} = Encoder.document("my package", [])
-      assert err.message =~ "must start with a letter or digit"
+      assert err.message =~ ":instance_name must match"
+    end
+
+    # Regression: the encoder used to keep its own copy of the name rules that
+    # omitted the dockd- prefix rejection, so it scaffolded a package that then
+    # failed at apply time.
+    test "rejects an instance name that already carries the dockd- prefix" do
+      assert {:error, err} = Encoder.document("dockd-greeter", [])
+      assert err.phase === :validate
+      assert err.message =~ "must not include the dockd- prefix"
     end
 
     test "defaults the image to a tag derived from the instance name" do
       assert {:ok, doc} = Encoder.document("greeter", [])
       assert doc["image"] === "dockd-greeter:latest"
+    end
+
+    # Silently emitting "dockd-greeter:latest" here would write a plausible
+    # package that is not the one the caller asked for.
+    test "reports a wrong-typed :image instead of defaulting it" do
+      assert {:error, err} = Encoder.document("greeter", image: 42)
+      assert err.phase === :validate
+      assert err.message =~ ":image must be a non-empty string"
     end
 
     test "always wires the build to the generated Dockerfile" do
@@ -78,12 +97,15 @@ defmodule Dockd.Spec.EncoderTest do
              ]
     end
 
-    test "rejects mutually exclusive env options" do
-      assert {:error, err} =
+    # Mutually-exclusive env options are the Normalizer's rule (see
+    # normalizer_test.exs). The encoder no longer re-checks them; Packages.new/3
+    # runs the encoded document back through the Normalizer before writing, and
+    # packages_test.exs pins that end to end.
+    test "encodes mutually exclusive env options without checking them" do
+      assert {:ok, doc} =
                Encoder.document("greeter", env: [{"FOO", value: "a", default: "b"}])
 
-      assert err.phase === :validate
-      assert err.message =~ "at most one of"
+      assert doc["env"] === [%{"name" => "FOO", "value" => "a", "default" => "b"}]
     end
 
     test "rejects a non-list env" do
@@ -165,19 +187,32 @@ defmodule Dockd.Spec.EncoderTest do
 
   describe "dockerfile/1" do
     test "generates FROM from the :from option" do
-      assert Encoder.dockerfile(from: "busybox:1.37.0") === "FROM busybox:1.37.0\n"
+      assert Encoder.dockerfile(from: "busybox:1.37.0") === {:ok, "FROM busybox:1.37.0\n"}
     end
 
     test "defaults the base image" do
-      assert Encoder.dockerfile([]) === "FROM debian:trixie\n"
+      assert Encoder.dockerfile([]) === {:ok, "FROM debian:trixie\n"}
     end
 
     test "uses an explicit body verbatim and ensures a trailing newline" do
-      assert Encoder.dockerfile(dockerfile: "FROM x\nRUN y") === "FROM x\nRUN y\n"
+      assert Encoder.dockerfile(dockerfile: "FROM x\nRUN y") === {:ok, "FROM x\nRUN y\n"}
     end
 
     test "does not double a trailing newline" do
-      assert Encoder.dockerfile(dockerfile: "FROM x\n") === "FROM x\n"
+      assert Encoder.dockerfile(dockerfile: "FROM x\n") === {:ok, "FROM x\n"}
+    end
+
+    # These used to fall back to the default, so `dockerfile: 42` silently wrote a
+    # FROM debian:trixie image the caller never asked for.
+    test "reports a wrong-typed :dockerfile instead of defaulting it" do
+      assert {:error, err} = Encoder.dockerfile(dockerfile: 42)
+      assert err.phase === :validate
+      assert err.message =~ ":dockerfile must be a non-empty string"
+    end
+
+    test "reports a wrong-typed :from instead of defaulting it" do
+      assert {:error, err} = Encoder.dockerfile(from: "")
+      assert err.message =~ ":from must be a non-empty string"
     end
   end
 end

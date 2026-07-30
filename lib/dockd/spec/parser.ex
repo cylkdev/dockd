@@ -29,7 +29,7 @@ defmodule Dockd.Spec.Parser do
   `:validate`-phase `Dockd.Error` shape, so callers handle one failure type.
   """
   @spec parse_file(Path.t()) :: {:ok, map()} | {:error, Error.t()}
-  def parse_file(path) when is_binary(path) do
+  def parse_file(path) do
     case File.read(path) do
       {:ok, body} ->
         parse(body)
@@ -50,15 +50,12 @@ defmodule Dockd.Spec.Parser do
   shape, key, or required-field error.
   """
   @spec parse(binary()) :: {:ok, map()} | {:error, Error.t()}
-  def parse(json_string) when is_binary(json_string) do
+  def parse(json_string) do
     with {:ok, value} <- decode_json(json_string),
          :ok <- ensure_object(value),
-         :ok <- check_unknown_keys(value) do
-      check_description(value)
-      |> case do
-        :ok -> {:ok, value}
-        err -> err
-      end
+         :ok <- check_unknown_keys(value),
+         :ok <- check_description(value) do
+      {:ok, value}
     end
   end
 

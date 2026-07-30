@@ -23,6 +23,7 @@ defmodule Dockd.Provisioner do
 
   alias Dockd.ApplyResult
   alias Dockd.Error
+  alias Dockd.HostTool
   alias Dockd.Instance
   alias Dockd.Spec
   alias Dockd.StepResult
@@ -191,14 +192,12 @@ defmodule Dockd.Provisioner do
   # incomplete %Spec{} literal, but not one built with an explicit nil.
   defp validate_spec(spec), do: Spec.validate(spec)
 
-  defp validate_temp_root(root) when is_binary(root) and root !== "" do
-    if Path.type(root) === :absolute,
-      do: :ok,
-      else: validate_error_tuple("temp_root must be an absolute path, got: #{inspect(root)}")
+  defp validate_temp_root(root) do
+    case HostTool.staging_root(root, "temp_root") do
+      :ok -> :ok
+      {:error, message} -> validate_error_tuple(message)
+    end
   end
-
-  defp validate_temp_root(other),
-    do: validate_error_tuple("a host temp_root is required, got: #{inspect(other)}")
 
   defp validate_error_tuple(message), do: {:error, validate_error(message)}
 
@@ -273,7 +272,6 @@ defmodule Dockd.Provisioner do
     end)
   end
 
-  defp host_exposure_present?(nil), do: false
   defp host_exposure_present?([]), do: false
   defp host_exposure_present?(_), do: true
 
@@ -289,7 +287,10 @@ defmodule Dockd.Provisioner do
     %{spec | env: kept}
   end
 
-  defp strip_host_env_entries(spec), do: spec
+  # Fails closed: a non-list :env cannot be split, so it is emptied rather than
+  # passed through unstripped. expand_env/1 reports the typed error immediately
+  # after, so no error path is lost.
+  defp strip_host_env_entries(%Spec{} = spec), do: %{spec | env: []}
 
   defp literal_env_entry?(entry) when is_binary(entry), do: String.contains?(entry, "=")
 
@@ -319,12 +320,18 @@ defmodule Dockd.Provisioner do
   """
   @spec resolve_env(Spec.t(), %{optional(binary()) => binary()}) ::
           {:ok, [binary()]} | {:error, Error.t()}
-  def resolve_env(%Spec{env: entries}, host_env) when is_list(entries) and is_map(host_env),
+  def resolve_env(%Spec{env: entries}, host_env) when is_list(entries),
     do: resolve_env_entries(entries, host_env)
 
   def resolve_env(%Spec{}, _host_env),
     do: {:error, validate_error(":env must be a list")}
 
+  # Not merely a fast path. Without it, `expand_env/1`'s only return narrows
+  # `spec.env` to the resolved `[binary()]`, and dialyzer then reads
+  # `normalize_mounts/1`'s catch-all — the sole ":mounts must be a list"
+  # validator — as unreachable. The declared `Spec.t()` is optimistic; a
+  # hand-built struct can still violate it at runtime, which is what that
+  # validator is for. Keep this clause and `mix dialyzer` stays clean.
   defp expand_env(%{spec: %Spec{env: []}} = ctx), do: {:ok, ctx}
 
   defp expand_env(%{spec: %Spec{} = spec, host_env: host_env} = ctx) do
@@ -402,8 +409,6 @@ defmodule Dockd.Provisioner do
   # Pipeline — mounts
   # ---------------------------------------------------------------------------
 
-  defp normalize_mounts(%{spec: %Spec{mounts: []}} = ctx), do: {:ok, ctx}
-
   defp normalize_mounts(
          %{spec: %Spec{mounts: entries} = spec, docker_options: docker_options} = ctx
        )
@@ -440,7 +445,7 @@ defmodule Dockd.Provisioner do
   end
 
   defp classify_mount_entry(m) when is_map(m) do
-    case Map.get(m, :target) || Map.get(m, "target") do
+    case Spec.fetch_either(m, :target) do
       target when is_binary(target) and target !== "" ->
         {:mount, atomize_mount_keys(m)}
 
@@ -478,7 +483,7 @@ defmodule Dockd.Provisioner do
   end
 
   defp do_validate_source(_image, %{} = build) do
-    case Map.get(build, :dockerfile) || Map.get(build, "dockerfile") do
+    case Spec.fetch_either(build, :dockerfile) do
       df when is_binary(df) ->
         validate_dockerfile_path(df)
 
@@ -711,8 +716,8 @@ defmodule Dockd.Provisioner do
   defp normalize_copy(_spec, index),
     do: {:error, "copy #{index + 1} must be a map"}
 
-  defp get_value(map, key),
-    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  # One helper, not two: `get_value/2` and `atomize_key/2` had identical bodies.
+  defp get_value(map, key), do: Spec.fetch_either(map, key)
 
   defp drop_nil(map),
     do: for({k, v} <- map, not is_nil(v), into: %{}, do: {k, v})
@@ -736,8 +741,8 @@ defmodule Dockd.Provisioner do
   defp build_image(%{spec: %Spec{image: tag}, docker_options: docker_options} = ctx, build) do
     # Both paths are absolute — `Spec.validate/1` rejects anything else, so there
     # is no Path.expand here and no dependency on the caller's CWD.
-    dockerfile = atomize_key(build, :dockerfile)
-    context = atomize_key(build, :context)
+    dockerfile = get_value(build, :dockerfile)
+    context = get_value(build, :context)
 
     {context_path, dockerfile_path} =
       if File.dir?(dockerfile) do
@@ -798,8 +803,6 @@ defmodule Dockd.Provisioner do
     end
   end
 
-  defp atomize_key(map, key),
-    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
 
   # ---------------------------------------------------------------------------
   # Pipeline — container lifecycle
@@ -817,7 +820,7 @@ defmodule Dockd.Provisioner do
       |> maybe_put_interactive_shell(shell)
       |> put_unless_empty(:env, env)
 
-    labels = Map.merge(user_labels || %{}, Instance.managed_labels(spec))
+    labels = Map.merge(user_labels, Instance.managed_labels(spec))
 
     case Docker.create_container(Spec.prefix_name(name), image, labels, create_options) do
       {:ok, container_id} ->
@@ -1054,7 +1057,7 @@ defmodule Dockd.Provisioner do
 
     case result do
       {:error, _} = err -> err
-      %{seen: _} -> :ok
+      _acc -> :ok
     end
   end
 

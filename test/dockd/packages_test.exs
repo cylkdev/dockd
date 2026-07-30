@@ -324,6 +324,31 @@ defmodule Dockd.PackagesTest do
       assert File.read!(Path.join(dir, "Dockerfile")) === "FROM busybox:1.37.0\n"
     end
 
+    # The scaffolder gates on the same rules a loaded package is held to: it
+    # encodes the document, then runs it back through the Parser and Normalizer
+    # before writing. Nothing should reach disk when that gate rejects it.
+    test "rejects mutually exclusive env options and writes nothing" do
+      dir = Path.join(sandbox_dir("dockd-new-env-exclusive"), "greeter")
+
+      assert {:error, err} =
+               Dockd.new_package(dir, "greeter", env: [{"FOO", value: "a", default: "b"}])
+
+      assert err.phase === :validate
+      assert err.message =~ "cannot coexist"
+      refute File.exists?(Path.join(dir, "package.json"))
+    end
+
+    # Regression: the encoder's own copy of the name rules omitted the dockd-
+    # prefix check, so this scaffolded a package that failed when applied.
+    test "rejects an instance name that already carries the dockd- prefix" do
+      dir = Path.join(sandbox_dir("dockd-new-prefixed"), "greeter")
+
+      assert {:error, err} = Dockd.new_package(dir, "dockd-greeter")
+      assert err.phase === :validate
+      assert err.message =~ "must not include the dockd- prefix"
+      refute File.exists?(Path.join(dir, "package.json"))
+    end
+
     test "the generated package parses as a Spec" do
       dir = Path.join(sandbox_dir("dockd-new-parse"), "greeter")
       assert {:ok, _} = Dockd.new_package(dir, "greeter", image: "dockd-greeter:1")

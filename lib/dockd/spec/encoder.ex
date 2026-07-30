@@ -30,10 +30,6 @@ defmodule Dockd.Spec.Encoder do
   @dockerfile_name "Dockerfile"
   @default_from "debian:trixie"
 
-  # The instance name becomes part of the default image tag, so keep it to
-  # characters a Docker reference accepts.
-  @name_pattern ~r/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
-
   @doc """
   Builds the string-keyed JSON document for `instance_name` from `opts`.
 
@@ -42,15 +38,21 @@ defmodule Dockd.Spec.Encoder do
   build produces rather than something to pull.
 
   Only the keys present in `opts` are emitted.
+
+  An `:image` that is present but not a non-empty string is a `:validate` error
+  rather than being replaced by the default — silently emitting
+  `"dockd-<name>:latest"` for `image: 42` would write a plausible-looking package
+  that is not the one the caller asked for.
   """
   @spec document(binary(), keyword()) :: {:ok, map()} | {:error, Error.t()}
-  def document(instance_name, opts) when is_list(opts) do
-    with {:ok, instance_name} <- validate_instance_name(instance_name),
+  def document(instance_name, opts) do
+    with :ok <- Spec.validate_instance_name(instance_name),
+         {:ok, image} <- image(opts, instance_name),
          {:ok, env} <- encode_env(Keyword.get(opts, :env, [])) do
       document =
         %{
           "instance_name" => instance_name,
-          "image" => image(opts, instance_name),
+          "image" => image,
           "build" => build(opts)
         }
         |> put_unless_empty("env", env)
@@ -68,22 +70,36 @@ defmodule Dockd.Spec.Encoder do
   still delegated to `JSON.encode!/1` — escaping is never hand-rolled.
   """
   @spec encode(map()) :: binary()
-  def encode(document) when is_map(document), do: encode_value(document, 0) <> "\n"
+  def encode(document), do: encode_value(document, 0) <> "\n"
 
   @doc """
   Returns the body of the generated `Dockerfile`.
 
   `:dockerfile` supplies a complete body verbatim; otherwise a minimal
   `FROM <from>` is generated, defaulting to `#{@default_from}`.
-  """
-  @spec dockerfile(keyword()) :: binary()
-  def dockerfile(opts) when is_list(opts) do
-    case Keyword.get(opts, :dockerfile) do
-      body when is_binary(body) and body !== "" ->
-        ensure_trailing_newline(body)
 
-      _ ->
-        "FROM #{Keyword.get(opts, :from, @default_from)}\n"
+  A `:dockerfile` or `:from` that is present but not a non-empty string is a
+  `:validate` error. It used to fall back to the default instead, which meant
+  `dockerfile: 42` silently wrote a `FROM debian:trixie` image the caller never
+  asked for.
+  """
+  @spec dockerfile(keyword()) :: {:ok, binary()} | {:error, Error.t()}
+  def dockerfile(opts) do
+    case Keyword.fetch(opts, :dockerfile) do
+      :error -> from_line(opts)
+      {:ok, nil} -> from_line(opts)
+      {:ok, body} when is_binary(body) and body !== "" -> {:ok, ensure_trailing_newline(body)}
+      {:ok, other} -> {:error, validate_error(":dockerfile must be a non-empty string, got: #{inspect(other)}")}
+    end
+  end
+
+  defp from_line(opts) do
+    case Keyword.get(opts, :from, @default_from) do
+      from when is_binary(from) and from !== "" ->
+        {:ok, "FROM #{from}\n"}
+
+      other ->
+        {:error, validate_error(":from must be a non-empty string, got: #{inspect(other)}")}
     end
   end
 
@@ -107,34 +123,21 @@ defmodule Dockd.Spec.Encoder do
   cannot drift apart.
   """
   @spec default_image(binary()) :: binary()
-  def default_image(instance_name) when is_binary(instance_name),
+  def default_image(instance_name),
     do: Spec.prefix_name(instance_name) <> ":latest"
 
   # ---------------------------------------------------------------------------
   # Document assembly
   # ---------------------------------------------------------------------------
 
-  defp validate_instance_name(name) when is_binary(name) and name !== "" do
-    if Regex.match?(@name_pattern, name) do
-      {:ok, name}
-    else
-      {:error,
-       validate_error(
-         "instance name #{inspect(name)} must start with a letter or digit and " <>
-           "contain only letters, digits, dots, dashes or underscores"
-       )}
-    end
-  end
-
-  defp validate_instance_name(other),
-    do:
-      {:error,
-       validate_error("instance name must be a non-empty string, got: #{inspect(other)}")}
-
+  # Absent means "use the tag the build produces" — a documented default. Present
+  # but unusable is the caller's mistake, and is reported instead of coerced.
   defp image(opts, instance_name) do
-    case Keyword.get(opts, :image) do
-      image when is_binary(image) and image !== "" -> image
-      _ -> default_image(instance_name)
+    case Keyword.fetch(opts, :image) do
+      :error -> {:ok, default_image(instance_name)}
+      {:ok, nil} -> {:ok, default_image(instance_name)}
+      {:ok, image} when is_binary(image) and image !== "" -> {:ok, image}
+      {:ok, other} -> {:error, validate_error(":image must be a non-empty string, got: #{inspect(other)}")}
     end
   end
 
@@ -162,17 +165,15 @@ defmodule Dockd.Spec.Encoder do
   # ---------------------------------------------------------------------------
 
   defp encode_env(entries) when is_list(entries) do
-    entries
-    |> Enum.reduce_while({:ok, []}, fn entry, {:ok, acc} ->
-      case encode_env_entry(entry) do
-        {:ok, encoded} -> {:cont, {:ok, [encoded | acc]}}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, acc} -> {:ok, Enum.reverse(acc)}
-      err -> err
-    end
+    reduced =
+      Enum.reduce_while(entries, {:ok, []}, fn entry, {:ok, acc} ->
+        case encode_env_entry(entry) do
+          {:ok, encoded} -> {:cont, {:ok, [encoded | acc]}}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+
+    with {:ok, acc} <- reduced, do: {:ok, Enum.reverse(acc)}
   end
 
   defp encode_env(other),
@@ -189,8 +190,11 @@ defmodule Dockd.Spec.Encoder do
   end
 
   defp encode_env_entry({name, entry_opts}) when is_binary(name) and is_list(entry_opts) do
-    with :ok <- check_env_name(name),
-         :ok <- check_env_exclusive(name, entry_opts) do
+    # Mutually-exclusive :value/:default/:optional are *not* checked here.
+    # `Dockd.Packages.new/3` runs the encoded JSON back through the Parser and
+    # Normalizer before writing it, and `Normalizer.check_env_entry_exclusions/2`
+    # is that rule's one home.
+    with :ok <- check_env_name(name) do
       encoded =
         Enum.reduce(@env_opt_keys, %{"name" => name}, fn key, acc ->
           case Keyword.fetch(entry_opts, key) do
@@ -212,26 +216,10 @@ defmodule Dockd.Spec.Encoder do
          ":env entries must be a string, a {name, opts} tuple or a map, got: #{inspect(other)}"
        )}
 
-  defp check_env_name(name) when is_binary(name) and name !== "", do: :ok
+  defp check_env_name(""),
+    do: {:error, validate_error(":env entry requires a non-empty name, got: \"\"")}
 
-  defp check_env_name(other),
-    do: {:error, validate_error(":env entry requires a non-empty name, got: #{inspect(other)}")}
-
-  # The normalizer rejects these combinations at load time; catching it here
-  # gives a better message than failing when the package is eventually applied.
-  defp check_env_exclusive(name, entry_opts) do
-    case Enum.filter(@env_opt_keys, &Keyword.has_key?(entry_opts, &1)) do
-      keys when length(keys) > 1 ->
-        {:error,
-         validate_error(
-           ":env entry #{inspect(name)} may set at most one of :value, :default or " <>
-             ":optional, got: #{inspect(keys)}"
-         )}
-
-      _ ->
-        :ok
-    end
-  end
+  defp check_env_name(name) when is_binary(name), do: :ok
 
   # ---------------------------------------------------------------------------
   # Pretty-printing

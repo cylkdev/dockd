@@ -42,6 +42,14 @@ defmodule Dockd.StepResult do
   #   4. :exit_code is either an integer or nil; never a binary or other type.
   #   5. :env, when non-nil, is a list of binaries; :workdir and :user, when non-nil,
   #      are binaries.
+  #
+  # Invariants 1-3 are enforced by @enforce_keys, not merely documented: the
+  # "base case" above says a struct with everything nil has no meaningful
+  # interpretation, so a literal that omits those three should not compile.
+  # :exit_code is deliberately *not* enforced — nil is a real value (invariant 4),
+  # meaning Docker reported no status.
+
+  @enforce_keys [:step_name, :cmd, :output]
 
   @type t :: %__MODULE__{
           step_name: binary(),

@@ -27,7 +27,7 @@ defmodule Dockd.Spec.Interpolator do
   matching key in `env` and no `:-default` form.
   """
   @spec substitute(term(), env()) :: {:ok, term()} | {:error, Error.t()}
-  def substitute(value, env) when is_map(env) do
+  def substitute(value, env) do
     walk(value, env, "$")
   end
 
@@ -60,8 +60,11 @@ defmodule Dockd.Spec.Interpolator do
     end)
   end
 
-  defp parse_match([full, var, default]),
-    do: {full, var, String.contains?(full, ":-"), default}
+  # Three captures means the optional `:-default` group participated, so the
+  # default is present by construction — no need to re-derive that from the
+  # matched text. Two captures is the no-default form: `Regex.scan/2` drops the
+  # trailing group entirely rather than yielding "".
+  defp parse_match([full, var, default]), do: {full, var, true, default}
 
   defp parse_match([full, var]), do: {full, var, false, ""}
 

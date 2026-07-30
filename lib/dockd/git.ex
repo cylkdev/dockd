@@ -35,6 +35,7 @@ defmodule Dockd.Git do
   """
 
   alias Dockd.Error
+  alias Dockd.HostTool
 
   @doc """
   Clones the given git repos on the host and uploads them into a container.
@@ -73,11 +74,10 @@ defmodule Dockd.Git do
   def download_repos_to_host([], _container_id, _temp_root, _git_path, _git_env, _docker_options, _opts),
     do: :ok
 
-  def download_repos_to_host(specs, container_id, temp_root, git_path, git_env, docker_options, opts)
-      when is_list(specs) and is_binary(container_id) and is_list(docker_options) do
-    with :ok <- ensure_git(git_path),
-         :ok <- ensure_env(git_env),
-         {:ok, host_tmp} <- staging_dir(temp_root) do
+  def download_repos_to_host(specs, container_id, temp_root, git_path, git_env, docker_options, opts) do
+    with :ok <- ensure_git(git_path) do
+      host_tmp = staging_dir(temp_root)
+
       try do
         with :ok <- make_staging_dir(host_tmp),
              {:ok, copies} <- clone_all(specs, host_tmp, git_path, git_env) do
@@ -97,63 +97,31 @@ defmodule Dockd.Git do
     end
   end
 
-  defp ensure_git(git_path) when is_binary(git_path) and git_path !== "" do
-    if File.regular?(git_path) do
-      :ok
-    else
-      {:error,
-       %Error{
-         phase: :fetch,
-         message: "git_path does not name a file: #{git_path}"
-       }}
+  # Type and presence of git_path/git_env are established by
+  # Provisioner.validate_tools/1 before the only call site reaches here, so the
+  # one thing left to check is that the path actually names an executable.
+  defp ensure_git(git_path) do
+    case HostTool.executable(git_path, "git", "cloning :repos") do
+      :ok -> :ok
+      {:error, message} -> {:error, %Error{phase: :fetch, message: message}}
     end
   end
 
-  defp ensure_git(other) do
-    {:error,
-     %Error{
-       phase: :fetch,
-       message:
-         "cloning :repos needs git. Pass git_path with the absolute path to the git " <>
-           "executable, got: #{inspect(other)}"
-     }}
-  end
-
-  defp ensure_env(env) when is_map(env), do: :ok
-
-  defp ensure_env(other) do
-    {:error,
-     %Error{
-       phase: :fetch,
-       message: "git_env must be a map of name => value, got: #{inspect(other)}"
-     }}
-  end
-
-  defp staging_dir(temp_root) when is_binary(temp_root) and temp_root !== "" do
-    {:ok, Path.join(temp_root, "dockd-fetch-#{System.unique_integer([:positive])}")}
-  end
-
-  defp staging_dir(other) do
-    {:error,
-     %Error{
-       phase: :fetch,
-       message: "a host temp_root is required to stage clones, got: #{inspect(other)}"
-     }}
-  end
+  defp staging_dir(temp_root),
+    do: Path.join(temp_root, "dockd-fetch-#{System.unique_integer([:positive])}")
 
   defp clone_all(specs, host_tmp, git_path, git_env) do
-    specs
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {spec, index}, {:ok, acc} ->
-      case clone_one(spec, index, host_tmp, git_path, git_env) do
-        {:ok, copy_spec} -> {:cont, {:ok, [copy_spec | acc]}}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, acc} -> {:ok, Enum.reverse(acc)}
-      err -> err
-    end
+    reduced =
+      specs
+      |> Enum.with_index()
+      |> Enum.reduce_while({:ok, []}, fn {spec, index}, {:ok, acc} ->
+        case clone_one(spec, index, host_tmp, git_path, git_env) do
+          {:ok, copy_spec} -> {:cont, {:ok, [copy_spec | acc]}}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+
+    with {:ok, acc} <- reduced, do: {:ok, Enum.reverse(acc)}
   end
 
   defp clone_one(%{url: url, dest: dest} = spec, index, host_tmp, git_path, git_env) do

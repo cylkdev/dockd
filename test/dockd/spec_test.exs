@@ -47,6 +47,18 @@ defmodule Dockd.SpecTest do
       end
     end
 
+    # The provisioner merges :labels straight into the managed labels. It used to
+    # hedge with `user_labels || %{}`, so a nil was accepted everywhere except
+    # that merge; now the invariant is stated once, here.
+    test "rejects labels that are not a map" do
+      for bad <- [nil, [], "a=b"] do
+        assert {:error, %Error{phase: :validate, message: message}} =
+                 Spec.new("busybox:latest", "my-box", labels: bad)
+
+        assert message =~ ":labels must be a map"
+      end
+    end
+
     # "foo" and "dockd-foo" would otherwise name the same container.
     test "rejects an instance name that already carries the dockd- prefix" do
       assert {:error, %Error{phase: :validate, message: message}} =

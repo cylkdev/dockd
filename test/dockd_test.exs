@@ -593,6 +593,26 @@ defmodule DockdTest do
     end
   end
 
+  describe "running?/3" do
+    # Unlike logs/2 and inspect/3, an unknown name is not an error here: the
+    # question "is it running" has a truthful answer for a container that does
+    # not exist, and callers use it to branch before deciding to create one.
+    test "reports false for a container that does not exist" do
+      assert {:ok, false} =
+               Dockd.running?("definitely-missing-#{System.unique_integer([:positive])}", endpoint())
+    end
+
+    test "reports false after the instance is destroyed" do
+      assert {:ok, %ApplyResult{instance: instance}} =
+               create(@image, unique_name(), shell: "/bin/sh")
+
+      assert {:ok, true} = Dockd.running?(instance, endpoint())
+
+      assert :ok = Dockd.destroy(instance, endpoint())
+      assert {:ok, false} = Dockd.running?(instance, endpoint())
+    end
+  end
+
   describe "logs/2" do
     test "returns the container log binary; :tail and :timestamps pass through" do
       assert {:ok, %ApplyResult{instance: instance}} =
@@ -713,8 +733,8 @@ defmodule DockdTest do
     end
   end
 
-  describe "list_temp_files/1, delete_temp_files/1, info/1" do
-    test "delete_temp_files clears the named root and info then reports zero" do
+  describe "list_temp_files/1, delete_temp_files/1" do
+    test "delete_temp_files clears the named root" do
       root = scaffold_dir()
       File.mkdir_p!(Path.join(root, "dockd-copy-1"))
       File.write!(Path.join([root, "dockd-copy-1", "staged"]), "leftover")
@@ -723,12 +743,6 @@ defmodule DockdTest do
 
       assert :ok = Dockd.delete_temp_files(root)
       assert {:ok, []} = Dockd.list_temp_files(root)
-
-      assert {:ok, %{temp_files: temp_files}} = Dockd.info(root)
-      assert temp_files.count === 0
-      assert temp_files.total_bytes === 0
-      assert temp_files.oldest_at === nil
-      assert temp_files.newest_at === nil
 
       # The root itself survives a sweep of its children.
       assert File.dir?(root)

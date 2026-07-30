@@ -8,44 +8,14 @@ defmodule Dockd.ApplyOptsTest do
   @endpoint "unix:///nonexistent/docker.sock"
   @tmp "/tmp"
 
-  describe "caller-option validation" do
-    test "rejects an unknown caller option when given a pre-built Spec" do
+  describe "caller options" do
+    # An unrecognized key is ignored, as in any keyword-option API — it does not
+    # become a :validate error, so the call proceeds to the daemon.
+    test "ignores an option outside option_keys/0" do
       {:ok, spec} = Spec.new("busybox:1.37.0", "smoke")
 
       assert {:error, err} = Dockd.apply(spec, @endpoint, false, %{}, @tmp, scoket: "/x")
-
-      assert err.phase === :validate
-      assert err.message =~ "unknown option"
-    end
-
-    test "rejects an unknown caller option when given an image string" do
-      assert {:error, err} =
-               Dockd.apply_image("busybox:1.37.0", "smoke", @endpoint, false, %{}, @tmp,
-                 scoket: "/x"
-               )
-
-      assert err.phase === :validate
-      assert err.message =~ "unknown option"
-    end
-
-    # Each of these used to be an option. Silently dropping one would mean
-    # reverting to an ambient value, so they name their replacement instead.
-    test "points a retired option at its positional replacement" do
-      {:ok, spec} = Spec.new("busybox:1.37.0", "smoke")
-
-      for {key, value, expected} <- [
-            {:socket, "/var/run/docker.sock", "endpoint"},
-            {:host, "tcp://10.0.0.1:2376", "endpoint"},
-            {:disk_mount_enabled, true, "disk_mount_enabled"},
-            {:packages_path, "/tmp/pkgs", "root"},
-            {:dest_dir, "/tmp/pkgs", "root"}
-          ] do
-        assert {:error, err} = Dockd.apply(spec, @endpoint, false, %{}, @tmp, [{key, value}])
-
-        assert err.phase === :validate
-        assert err.message =~ "no longer an option"
-        assert err.message =~ expected
-      end
+      refute err.phase === :validate
     end
   end
 

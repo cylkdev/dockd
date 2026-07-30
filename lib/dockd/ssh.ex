@@ -31,13 +31,40 @@ defmodule Dockd.Ssh do
     else
       template = Keyword.get(opts, :template_path, DockerDialStdio.default_template_path())
       assigns = Keyword.get(opts, :assigns, [])
+      body = DockerDialStdio.render_script(template, assigns)
 
-      File.mkdir_p!(dir)
-      File.write!(target, DockerDialStdio.render_script(template, assigns))
-      File.chmod!(target, 0o755)
-      {:ok, %{path: target, overwrote?: existed?}}
+      with :ok <- mkdir(dir),
+           :ok <- write(target, body),
+           :ok <- chmod(target) do
+        {:ok, %{path: target, overwrote?: existed?}}
+      end
     end
   end
+
+  # A read-only target directory is an ordinary outcome here, not a bug, so it is
+  # reported rather than raised — `generate_script/2` promises a tuple.
+  defp mkdir(dir) do
+    case File.mkdir_p(dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "could not create #{dir}: #{format(reason)}"}
+    end
+  end
+
+  defp write(target, body) do
+    case File.write(target, body) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "could not write #{target}: #{format(reason)}"}
+    end
+  end
+
+  defp chmod(target) do
+    case File.chmod(target, 0o755) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "could not make #{target} executable: #{format(reason)}"}
+    end
+  end
+
+  defp format(reason), do: reason |> :file.format_error() |> to_string()
 
   @doc """
   Resolves an install source.
@@ -68,18 +95,4 @@ defmodule Dockd.Ssh do
     end
   end
 
-  @doc """
-  Deploys a resolved `source` to `user_at_host` using the given `ssh` and `scp`
-  executables.
-
-  `ssh_path` and `scp_path` are required so the connection cannot depend on
-  whichever binaries happen to be on `PATH`. Forwards `:remote_path`,
-  `:identity`, `:port`, `:ssh_opts`, and `:timeout` to
-  `Dockd.Ssh.DockerDialStdio.install/5`.
-  """
-  @spec install_script(binary() | :default, binary(), Path.t(), Path.t(), keyword()) ::
-          {:ok, %{remote_path: binary()}} | {:error, term()}
-  def install_script(source, user_at_host, ssh_path, scp_path, opts \\ []) do
-    DockerDialStdio.install(source, user_at_host, ssh_path, scp_path, opts)
-  end
 end

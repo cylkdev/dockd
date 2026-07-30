@@ -118,18 +118,6 @@ defmodule Dockd.EnvTest do
   end
 
   describe ":mounts validation" do
-    test "rejects :binds (removed) at the unknown-option check" do
-      assert {:error, %Error{phase: :validate, message: msg}} = apply_opts(binds: ["/h:/c"])
-      assert msg =~ "unknown option"
-      assert msg =~ ":binds"
-    end
-
-    test "rejects :inherit_env (removed) at the unknown-option check" do
-      assert {:error, %Error{phase: :validate, message: msg}} = apply_opts(inherit_env: ["FOO"])
-      assert msg =~ "unknown option"
-      assert msg =~ ":inherit_env"
-    end
-
     test "rejects malformed string entries" do
       assert {:error, %Error{phase: :validate, message: msg}} =
                apply_spec_opts(mounts: ["bad-mount-no-colon"])

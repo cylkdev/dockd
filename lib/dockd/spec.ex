@@ -108,7 +108,7 @@ defmodule Dockd.Spec do
       #=> "smoke"
   """
   @spec new(binary(), binary(), keyword()) :: {:ok, t()} | {:error, Error.t()}
-  def new(image, instance_name, opts \\ []) when is_list(opts) do
+  def new(image, instance_name, opts \\ []) do
     spec = %__MODULE__{
       image: image,
       instance_name: instance_name,
@@ -138,7 +138,7 @@ defmodule Dockd.Spec do
   package-sourced and Elixir-native specs share one validation body.
   """
   @spec from_attrs(map()) :: {:ok, t()} | {:error, Error.t()}
-  def from_attrs(attrs) when is_map(attrs) do
+  def from_attrs(attrs) do
     opts =
       attrs
       |> Map.drop([:image, :instance_name])
@@ -166,7 +166,8 @@ defmodule Dockd.Spec do
   @spec validate(t()) :: :ok | {:error, Error.t()}
   def validate(%__MODULE__{} = spec) do
     with :ok <- validate_image(spec.image),
-         :ok <- validate_instance_name(spec.instance_name) do
+         :ok <- validate_instance_name(spec.instance_name),
+         :ok <- validate_labels(spec.labels) do
       validate_build(spec.build)
     end
   end
@@ -194,9 +195,19 @@ defmodule Dockd.Spec do
   def short_name(@container_name_prefix <> rest), do: rest
   def short_name(other) when is_binary(other), do: other
 
-  @doc "Returns the `dockd-` container-name prefix."
-  @spec container_name_prefix() :: binary()
-  def container_name_prefix, do: @container_name_prefix
+  @doc false
+  # Reads `key` from a map that may be atom- or string-keyed. Package documents
+  # arrive string-keyed and only their *top-level* keys are atomized by
+  # `Dockd.Spec.Normalizer`, so nested `:build` / step / repo / copy entries
+  # genuinely show up either way. `Map.fetch/2` first rather than `||`, so a
+  # legitimate `false` is not mistaken for an absent key.
+  @spec fetch_either(map(), atom()) :: term()
+  def fetch_either(map, key) when is_atom(key) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> value
+      :error -> Map.get(map, Atom.to_string(key))
+    end
+  end
 
   # ---------------------------------------------------------------------------
 
@@ -205,7 +216,13 @@ defmodule Dockd.Spec do
   defp validate_image(other),
     do: error("Dockd.Spec requires a non-empty binary :image, got: #{inspect(other)}")
 
-  defp validate_instance_name(name) when is_binary(name) and name !== "" do
+  @doc false
+  # Public so `Dockd.Spec.Encoder` can gate a scaffolded package on the *same*
+  # rules a loaded one is held to. It used to keep its own copy of the pattern
+  # and its own message, and that copy omitted the `dockd-` prefix rejection —
+  # so the scaffolder happily wrote a package that failed when applied.
+  @spec validate_instance_name(term()) :: :ok | {:error, Error.t()}
+  def validate_instance_name(name) when is_binary(name) and name !== "" do
     cond do
       String.starts_with?(name, @container_name_prefix) ->
         error(
@@ -224,8 +241,16 @@ defmodule Dockd.Spec do
     end
   end
 
-  defp validate_instance_name(other),
+  def validate_instance_name(other),
     do: error("Dockd.Spec requires a non-empty binary :instance_name, got: #{inspect(other)}")
+
+  # Checked here so `Dockd.Provisioner` can merge the map straight into the
+  # managed labels. It used to hedge with `user_labels || %{}` instead, which
+  # meant a `nil` was silently acceptable everywhere except this one merge.
+  defp validate_labels(labels) when is_map(labels), do: :ok
+
+  defp validate_labels(other),
+    do: error(":labels must be a map, got: #{inspect(other)}")
 
   defp validate_build(nil), do: :ok
 
@@ -239,7 +264,7 @@ defmodule Dockd.Spec do
     do: error(":build must be a map or nil, got: #{inspect(other)}")
 
   defp validate_absolute(build, key) do
-    case Map.get(build, key) || Map.get(build, Atom.to_string(key)) do
+    case fetch_either(build, key) do
       nil ->
         :ok
 

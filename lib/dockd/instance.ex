@@ -77,7 +77,7 @@ defmodule Dockd.Instance do
   `Docker.find_container/2`).
   """
   @spec from_inspect(map()) :: t()
-  def from_inspect(%{} = body) do
+  def from_inspect(body) do
     config = Map.get(body, "Config", %{})
     host_config = Map.get(body, "HostConfig", %{})
     state = Map.get(body, "State", %{})
@@ -97,10 +97,13 @@ defmodule Dockd.Instance do
   @doc """
   Returns the user-facing instance name (the container name with the
   `dockd-` prefix stripped).
+
+  `nil` when the inspect payload carried no `"Name"` — `name_from/1` can produce
+  that, so a guard here would raise on an `Instance` this module built itself.
   """
-  @spec short_name(t()) :: binary()
-  def short_name(%__MODULE__{name: name}) when is_binary(name),
-    do: Spec.short_name(name)
+  @spec short_name(t()) :: binary() | nil
+  def short_name(%__MODULE__{name: nil}), do: nil
+  def short_name(%__MODULE__{name: name}), do: Spec.short_name(name)
 
   # ---------------------------------------------------------------------------
 

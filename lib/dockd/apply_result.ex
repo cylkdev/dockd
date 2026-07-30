@@ -12,6 +12,11 @@ defmodule Dockd.ApplyResult do
   alias Dockd.Instance
   alias Dockd.StepResult
 
+  # :instance is enforced, not merely typed non-nil: an ApplyResult without one
+  # describes nothing. A failed apply carries its partial instance on the
+  # `%Dockd.Error{}` instead, so there is no case that needs a nil here.
+  @enforce_keys [:instance]
+
   @type t :: %__MODULE__{
           instance: Instance.t(),
           step_results: [StepResult.t()]

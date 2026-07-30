@@ -31,6 +31,18 @@ defmodule Dockd.SshTest do
       assert {:ok, %{overwrote?: true}} = Dockd.Ssh.generate_script(tmp, force: true)
       assert String.starts_with?(File.read!(path), "#!/bin/sh")
     end
+
+    # These used to be File.mkdir_p!/File.write!, so an unwritable target raised
+    # File.Error out of a function whose contract is a tuple.
+    test "reports an unwritable directory instead of raising", %{tmp: tmp} do
+      readonly = Path.join(tmp, "readonly")
+      File.mkdir_p!(readonly)
+      File.chmod!(readonly, 0o500)
+      on_exit(fn -> File.chmod(readonly, 0o700) end)
+
+      assert {:error, msg} = Dockd.Ssh.generate_script(Path.join(readonly, "nested"), [])
+      assert msg =~ "could not create"
+    end
   end
 
   describe "resolve_source/1" do
