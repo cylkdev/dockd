@@ -61,13 +61,14 @@ defmodule Dockd.Instance do
   Builds the dockd-managed label map for a container created from `spec`.
 
   The result is merged with any user-supplied labels at container-create
-  time.
+  time. `spec.instance_name` is already the short, user-facing name — the
+  `dockd-` prefix belongs to the container name, not to the label.
   """
   @spec managed_labels(Spec.t()) :: %{binary() => binary()}
   def managed_labels(%Spec{instance_name: name}) do
     %{
       @marker_label => "true",
-      @name_label => Spec.short_name(name)
+      @name_label => name
     }
   end
 

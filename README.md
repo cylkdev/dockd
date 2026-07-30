@@ -25,31 +25,63 @@ If you see connection errors, start Docker Desktop (Mac/Windows) or the Docker d
 ## Quick Start
 
 ```elixir
-# Create and start a container. :instance_name is required.
+endpoint = "unix:///var/run/docker.sock"
+
+# Create and start a container. The image and instance name are positional, and
+# so are the four runtime inputs: endpoint, disk_mount_enabled, host_env, temp_root.
 {:ok, %Dockd.ApplyResult{instance: instance}} =
-  Dockd.apply("debian:trixie", instance_name: "scratch", shell: "/bin/bash")
+  Dockd.apply_image("debian:trixie", "scratch", endpoint, false, %{}, System.tmp_dir!(),
+    shell: "/bin/bash"
+  )
 
 # Run something in it.
-{:ok, %{output: output, exit_code: 0}} = Dockd.shell_command(instance, "uname -a")
+{:ok, %{output: output, exit_code: 0}} =
+  Dockd.shell_command(instance, "uname -a", endpoint)
+
 IO.puts(output)
 
 # Tear it down.
-:ok = Dockd.destroy(instance)
+:ok = Dockd.destroy(instance, endpoint)
 ```
 
 Any Docker image works -- `ubuntu:24.04`, `alpine:latest`, `node:20-slim`, and so on.
 
+### Nothing is read from the environment
+
+Dockd has no configuration. It reads no environment variable, no application
+config, no home directory, no working directory, and no system temp directory —
+so anything it needs, you pass. The four arguments above are the ones you will
+see everywhere:
+
+| Argument | What it decides | Pass `%{}` / `false` to... |
+|----------|-----------------|----------------------------|
+| `endpoint` | Which daemon your containers land on. Not `DOCKER_HOST` | — |
+| `disk_mount_enabled` | Whether host mounts, repo clones, file copies and host env are allowed. **No default** — an absent value used to mean `true` | `false`: allow none of it |
+| `host_env` | The only values `:env` entries and `${VAR}` can resolve to | `%{}`: resolve nothing from the host |
+| `temp_root` | Where repo clones and file copies are staged on the host | — |
+
+If you want the conventional locations, name them yourself — that way the choice
+is visible in your code:
+
+```elixir
+endpoint    = "unix:///var/run/docker.sock"
+packages    = Path.join(System.user_home!(), ".dockd/packages")
+temp_root   = System.tmp_dir!()
+host_env    = %{"HOME" => System.user_home!()}
+```
+
 To get a real interactive shell in a new terminal window, use
-`Dockd.Shell.open_window/2`; it launches `docker exec -it` in its own window so
-your current terminal stays free.
+`Dockd.Shell.open_window/6`; it launches `docker exec -it` in its own window so
+your current terminal stays free. It takes the `docker` path and endpoint too, so
+the window targets the same daemon the instance lives on rather than whatever the
+new window's `PATH` and `DOCKER_HOST` happen to resolve to.
 
 ## Elixir API
 
 ```elixir
 # Create a container, running setup steps before it's considered ready.
 {:ok, %Dockd.ApplyResult{instance: instance, step_results: steps}} =
-  Dockd.apply("debian:trixie",
-    instance_name: "builder",
+  Dockd.apply_image("debian:trixie", "builder", endpoint, false, %{}, temp_root,
     shell: "/bin/bash",
     steps: [
       %{step_name: "update", cmd: ["apt-get", "update"]},
@@ -60,39 +92,55 @@ your current terminal stays free.
 # Run a one-off command inside the instance.
 # :output is stdout and stderr combined.
 {:ok, %{output: "hello\n", exit_code: 0}} =
-  Dockd.shell_command(instance, "echo hello")
+  Dockd.shell_command(instance, "echo hello", endpoint)
 
 # Or open a persistent shell that preserves state between commands.
-{:ok, shell} = Dockd.open_shell(instance)
+{:ok, shell} = Dockd.open_shell(instance, endpoint)
 {:ok, {_, shell}}   = Dockd.shell_send(shell, "cd /tmp")
 {:ok, {out, shell}} = Dockd.shell_send(shell, "pwd")  # out =~ "/tmp"
 :ok = Dockd.close_shell(shell)
 
 # Clean up when done.
-:ok = Dockd.destroy(instance)
+:ok = Dockd.destroy(instance, endpoint)
 ```
 
-`Dockd.apply/2` returns a `%Dockd.ApplyResult{}` carrying the live
+`Dockd.apply_image/7` returns a `%Dockd.ApplyResult{}` carrying the live
 `%Dockd.Instance{}` plus the captured output of each setup step. Pass the
 instance (or just its name) to every other function.
 
-Both `shell_command/3` and `open_shell/2` are thin wrappers over
+If you would rather build the spec first — to inspect or adjust it — use
+`Dockd.Spec.new/3` and then `Dockd.apply/6`. `Spec.new/3` is the only
+constructor, and it returns `{:ok, spec}` or a `:validate` error rather than
+raising:
+
+```elixir
+{:ok, spec} = Dockd.Spec.new("debian:trixie", "builder", shell: "/bin/bash")
+{:ok, result} = Dockd.apply(spec, endpoint, false, %{}, temp_root)
+```
+
+Both `shell_command/4` and `open_shell/3` are thin wrappers over
 [`Docker.Terminal`](https://hexdocs.pm/docker/Docker.Terminal.html): use
-`shell_command/3` for stateless one-shot commands (output + exit code),
+`shell_command/4` for stateless one-shot commands (output + exit code),
 and `open_shell` + `shell_send` + `close_shell` when commands must build
 on each other (working directory, shell variables, etc.).
 
-Other lifecycle functions: `list/1`, `get/2`, `start/2`, `stop/2`, `restart/2`,
-`running?/2`, `logs/2`, `inspect/2`, `refresh/2`, `copy_to/3`.
+Other lifecycle functions, each taking the endpoint after its subject: `list/2`,
+`get/3`, `start/3`, `stop/3`, `restart/3`, `running?/3`, `logs/3`, `inspect/3`,
+`refresh/3`, `copy_to/5`.
 
 ### Instance options
 
 These describe the workspace itself. They map one-to-one onto `Dockd.Spec`
 fields (`Dockd.Spec.option_keys/0`).
 
+The instance name is **not** among them: it is a positional argument of
+`apply_image/7`, `Spec.new/3`, and `new_package/3`, because it is always
+required. Dockd stores the short name you pass and derives the container name
+`dockd-<name>` itself, so passing a name that already starts with `dockd-` is a
+`:validate` error rather than a silent duplicate.
+
 | Option | Default | Description |
 |--------|---------|-------------|
-| `:instance_name` | **required** | Container name. Prefixed with `dockd-` if it isn't already. There is no auto-generated default -- omitting it is a `:validate` error |
 | `:shell` | `"/bin/sh"` | Shell to use inside the container |
 | `:description` | `nil` | Free-text description, stored on the spec |
 | `:steps` | `[]` | Commands to run inside the container before it's ready |
@@ -114,28 +162,43 @@ In the Elixir API, each `:env` entry is one of:
 | Shape | Behavior |
 |-------|----------|
 | `"FOO=bar"` | literal - passed through unchanged |
-| `"FOO"` (no `=`) | inherit from the host environment; **`:validate` error if unset** |
+| `"FOO"` (no `=`) | read from `host_env`; **`:validate` error if absent from it** |
 | `{"FOO", value: "bar"}` | literal, in tuple form |
-| `{"FOO", default: "x"}` | inherit, fall back to `"x"` when unset |
-| `{"FOO", optional: true}` | inherit, silently drop the entry when unset |
+| `{"FOO", default: "x"}` | `"x"` wins, **even when `host_env` has `FOO`** |
+| `{"FOO", optional: true}` | read from `host_env`, silently drop the entry when absent |
+
+"Inherit" means *from the `host_env` map you passed* — never from the calling
+process. Note the `:default` row: an explicitly-passed default outranks
+`host_env`, so ambient state cannot quietly override a value you wrote down.
 
 The JSON package format uses a different, object-based shape for `env` -- see
 [the `env` field reference](#env-list) below.
 
-### Connection options
+### Caller options
 
-These configure the daemon connection and provisioning policy rather than the
-workspace (`Dockd.option_keys/0`). They share the same flat keyword list, are
-never stored on the container, and unknown keys are rejected.
+These tune the request rather than describing the workspace
+(`Dockd.option_keys/0`). They share the same flat keyword list, are never stored
+on the container, and unknown keys are rejected.
 
 | Option | Description |
 |--------|-------------|
-| `:socket` | Path to the Docker Unix socket |
-| `:host` | Docker daemon host |
 | `:api_version` | Docker Engine API version to talk to |
 | `:platform` | Target platform (e.g. `"linux/amd64"`) |
 | `:networks` / `:network_mode` | Container networking |
-| `:disk_mount_enabled` | Policy flag gating host disk mounts |
+| `:git_path` / `:git_env` | The `git` executable and the exact environment to run it in. Required when a spec has `:repos` |
+| `:tar_path` / `:tar_env` / `:tar_extra_args` | The `tar` executable, its environment, and its archive flags. Required when a spec has `:copy` (or `:repos`, which uploads via `tar`) |
+| `:container_staging_root` | Writable directory inside the container to stage uploads. Defaults to `"/tmp"` |
+
+The host tooling entries are options rather than positional arguments because
+only some specs need them — but a spec with `:repos` or `:copy` and no tooling is
+a `:validate` error naming what is missing, never a `PATH` lookup. `:git_env`
+always gets `GIT_TERMINAL_PROMPT=0` forced on, so a private URL fails fast
+instead of blocking on a credential prompt nobody can see.
+
+**Retired keys.** `:socket`, `:host`, `:disk_mount_enabled`, `:packages_path`,
+`:dest_dir`, `:launcher_path`, and `:instance_name` used to live here and are now
+positional arguments. Passing one is an error that names its replacement, so an
+old call site fails loudly rather than reverting to an ambient default.
 
 ## Packages
 
@@ -143,7 +206,7 @@ A **package** is a JSON file that describes a complete instance - image, shell,
 files to bring in, setup commands - so you can launch a reusable environment with
 one call. Packages are the fastest way to share a "stack" (e.g. "Node 20 with
 your toolchain preinstalled and a project directory mounted") with someone else: hand them the
-file, they run `Dockd.apply_package("./my-stack.json")`, and they get the same
+file, they run `Dockd.apply_package(root, "./my-stack.json", …)`, and they get the same
 container you do.
 
 ### A minimal package
@@ -164,16 +227,18 @@ Setting `"shell"` is what keeps the container alive after it starts - see the
 Run it:
 
 ```elixir
-{:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("./hello.json")
-{:ok, %{output: out}} = Dockd.shell_command(instance, "uname -a")
+{:ok, %Dockd.ApplyResult{instance: instance}} =
+  Dockd.apply_package(packages, "./hello.json", endpoint, false, %{}, temp_root)
+
+{:ok, %{output: out}} = Dockd.shell_command(instance, "uname -a", endpoint)
 IO.puts(out)
-Dockd.destroy(instance)
+Dockd.destroy(instance, endpoint)
 ```
 
 That's the whole contract. The package's keys mirror the instance options
-accepted by `Dockd.apply/2`, with `"image"` and `"instance_name"` both required. You only
-specify what you need; everything else falls back to the same defaults
-`Dockd.apply/2` uses.
+accepted by `Dockd.apply_image/7`, with `"image"` and `"instance_name"` both
+required. You only specify what you need; everything else falls back to the same
+defaults `Dockd.apply_image/7` uses.
 
 ### A realistic package
 
@@ -211,7 +276,7 @@ Run it the same way:
 
 ```elixir
 {:ok, %Dockd.ApplyResult{instance: instance}} =
-  Dockd.apply_package("./python-instance.json")
+  Dockd.apply_package(packages, "./python-instance.json", endpoint, true, host_env, temp_root)
 ```
 
 ### Field reference
@@ -270,7 +335,7 @@ rejected with a `:validate` error. Because the name is fixed by the package,
 applying the same package twice concurrently will collide.
 
 This is *not* the package's identity: a package is identified by its directory
-name, which is what `Dockd.apply_package("greeter")` resolves. The two are
+name, which is what `Dockd.apply_package(root, "greeter", …)` resolves. The two are
 independent, though scaffolding defaults them to the same value.
 
 #### `env` (list)
@@ -455,14 +520,23 @@ can land on top of a directory that was just created by a `repo` clone.
 ### Environment interpolation
 
 Every string value (not key) is recursively scanned for `${VAR}` references and
-substituted from your shell's environment:
+substituted from the `host_env` map you pass — **not** from your shell's
+environment. A package can only reach values you handed it, so `%{}` substitutes
+nothing and a package that needs `${HOME}` gets it only if you passed `"HOME"`:
 
-- `${HOME}` - required: missing variables produce a `:validate` error pointing
-  at the JSON path (e.g. `$.copy[0].src`).
+- `${HOME}` - required: a name absent from `host_env` produces a `:validate`
+  error pointing at the JSON path (e.g. `$.copy[0].src`).
 - `${HOME:-default}` - fall back to a literal default when the variable is unset.
 - Multiple references in one string are all substituted (`"${USER}@${HOST}"`).
 - Substitution happens before validation, so a `${VAR}` inside a list or nested
   map is fine.
+
+```elixir
+# ${PWD} and ${LOG_LEVEL} below resolve only because they are passed in.
+{:ok, result} =
+  Dockd.apply_package(packages, "node-app", endpoint, true,
+    %{"PWD" => File.cwd!(), "LOG_LEVEL" => "debug"}, temp_root)
+```
 
 ```json
 {
@@ -478,44 +552,70 @@ substituted from your shell's environment:
 Two entry points:
 
 ```elixir
-# A path on disk - typical for project-local packages.
+# A path on disk - typical for project-local packages. `packages` is unused for a
+# path reference, but still passed so the argument list keeps one shape.
 {:ok, %Dockd.ApplyResult{instance: instance}} =
-  Dockd.apply_package("./packages/python.json")
+  Dockd.apply_package(packages, "./packages/python.json", endpoint, false, %{}, temp_root)
 
-# A bare name - resolves to <packages_root>/<name>/package.json.
-{:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("webapp")
+# A bare name - resolves to <packages>/webapp/package.json.
+{:ok, %Dockd.ApplyResult{instance: instance}} =
+  Dockd.apply_package(packages, "webapp", endpoint, false, %{}, temp_root)
 ```
+
+A package's `${VAR}` references resolve against the `host_env` you pass, so a
+package can only reach values you handed it:
+
+```elixir
+# This package interpolates ${HOME}; nothing else about your environment is visible.
+{:ok, result} =
+  Dockd.apply_package(packages, "webapp", endpoint, true,
+    %{"HOME" => System.user_home!()}, temp_root)
+```
+
+To read a package into a `Dockd.Spec` without applying it — to inspect or adjust
+it first — use `Dockd.load_package_spec/3`, then `Dockd.apply/6`.
 
 ### Installed packages
 
-Package names resolve from the configured packages root, which defaults to
-`~/.dockd/packages`. It can be overridden per call with `:packages_path`, or
-globally via the `DOCKD_PACKAGES_PATH` environment variable or
-`config :dockd, packages_path: ...`.
+Package names resolve against the `root` you pass. There is no configured
+packages root: no `DOCKD_PACKAGES_PATH`, no `config :dockd, packages_path:`, no
+`~/.dockd/packages` fallback. `~/.dockd/packages` remains a perfectly good
+choice — it is just yours to make and to write down.
 
-Package sets live in their own directory trees. `Dockd.install_packages/2`
-copies every `packages/<name>/` directory the source ships with into the
-packages root, from either a git repository or a local directory:
+Package sets live in their own directory trees. `Dockd.install_packages/3`
+copies every `packages/<name>/` directory the source ships with into `root`, from
+either a git repository or a local directory:
 
 ```elixir
-# From a remote repository - anything `git clone` accepts, plus the
-# `github.com/user/repo` shorthand.
-{:ok, ["python", "webapp"]} = Dockd.install_packages("github.com/me/recipes")
-
-# Pin a branch or tag.
-{:ok, _} = Dockd.install_packages("github.com/me/recipes", ref: "v1.2.0")
-
 # From a local directory - any existing directory on disk takes this path.
-{:ok, ["python", "webapp"]} = Dockd.install_packages("./my-recipes")
+{:ok, ["python", "webapp"]} = Dockd.install_packages(packages, "./my-recipes")
+
+# From a remote repository - anything `git clone` accepts, plus the
+# `github.com/user/repo` shorthand. A clone needs somewhere to stage and a git
+# to run, so both are passed explicitly.
+{:ok, ["python", "webapp"]} =
+  Dockd.install_packages(packages, "github.com/me/recipes",
+    staging_root: temp_root,
+    git_path: "/usr/bin/git",
+    git_env: %{"HOME" => System.user_home!()},
+    ref: "v1.2.0"
+  )
 ```
 
-The source must have a top-level `packages/` directory; otherwise you get a
-`:fetch` error. An existing target directory is replaced.
+`git_env` is the whole environment `git` runs in. That is what makes credentials
+an explicit decision: pass `HOME` and `SSH_AUTH_SOCK` when a clone needs your
+`~/.gitconfig` or SSH agent, and omit them to clone in isolation. Dockd always
+forces `GIT_TERMINAL_PROMPT=0`, so a private URL you have no credentials for
+fails immediately instead of hanging on an invisible prompt.
+
+The source must have a top-level `packages/` directory (override with
+`:packages_subdir`); otherwise you get a `:fetch` error. An existing target
+directory is replaced.
 
 See what's installed:
 
 ```elixir
-Dockd.list_packages()
+Dockd.list_packages(packages)
 #=> [%{name: "webapp", path: "...", spec: {:ok, %Dockd.Spec{}}}]
 ```
 
@@ -524,12 +624,14 @@ reports its own parse error instead of hiding the rest.
 
 ### Scaffolding a package
 
-You don't have to write those files by hand. `Dockd.new_package/2` writes them
-for you. The path you pass **is** the package directory:
+You don't have to write those files by hand. `Dockd.new_package/3` writes them
+for you. The path you pass **is** the package directory, and the instance name is
+its own argument — it used to default to the directory's basename, which for a
+relative path like `"."` really meant your current working directory:
 
 ```elixir
 {:ok, %{instance_name: "greeter", files: files}} =
-  Dockd.new_package("./my-recipes/packages/greeter",
+  Dockd.new_package("./my-recipes/packages/greeter", "greeter",
     image: "dockd-greeter:1",
     from: "busybox:1.37.0",
     shell: "/bin/sh",
@@ -582,17 +684,19 @@ translated into the JSON object form for you.
 Scaffolding refuses to touch an existing directory unless you pass
 `force: true`, and validates the document before writing anything - an invalid
 call leaves nothing behind. Relative `build` paths resolve against the package
-directory, so the result keeps working after `install_packages/2` copies it
+directory, so the result keeps working after `install_packages/3` copies it
 elsewhere:
 
 ```elixir
-{:ok, ["greeter"]} = Dockd.install_packages("./my-recipes")
-{:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("greeter")
+{:ok, ["greeter"]} = Dockd.install_packages(packages, "./my-recipes")
+
+{:ok, %Dockd.ApplyResult{instance: instance}} =
+  Dockd.apply_package(packages, "greeter", endpoint, false, %{}, temp_root)
 ```
 
 To add your own installed package by hand, place a directory at
-`<packages_root>/<name>/` containing `package.json` and any referenced support
-files, then call `Dockd.apply_package("name")`.
+`<root>/<name>/` containing `package.json` and any referenced support files, then
+call `Dockd.apply_package(root, "name", ...)`.
 
 ### A package that builds its own image
 
@@ -634,11 +738,12 @@ Install it and apply it by name. The `Dockerfile` is copied in alongside the
 `package.json`, and `"image"` becomes the tag of the image that gets built:
 
 ```elixir
-{:ok, ["greeter"]} = Dockd.install_packages("./my-recipes")
+{:ok, ["greeter"]} = Dockd.install_packages(packages, "./my-recipes")
 
-{:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("greeter")
+{:ok, %Dockd.ApplyResult{instance: instance}} =
+  Dockd.apply_package(packages, "greeter", endpoint, false, %{}, temp_root)
 
-{:ok, %{output: out}} = Dockd.shell_command(instance, "cat /etc/greeting")
+{:ok, %{output: out}} = Dockd.shell_command(instance, "cat /etc/greeting", endpoint)
 IO.puts(out)  #=> "hello"
 ```
 
@@ -663,27 +768,32 @@ where things went wrong:
 | `:fetch` | `git clone` failed, package install failed, or upload to the container failed |
 | `:copy` | Source path doesn't exist on the host, or upload failed |
 | `:setup` | A `step` exited non-zero - `error.exit_code` and `error.output` are populated |
-| `:lifecycle` | `start/2` or `stop/2` failed on an existing container |
+| `:lifecycle` | `start/3` or `stop/3` failed on an existing container |
 | `:destroy` | Stopping or removing a container failed |
 | `:discover` | Looking up or hydrating an instance from the daemon failed |
 
 When a container was created before the failure, `error.instance` is a partial
-instance you should pass to `Dockd.destroy/1` to clean up.
+instance you should pass to `Dockd.destroy/3` to clean up.
+
+No public function raises on bad input — every one returns
+`{:ok, _} | {:error, %Dockd.Error{}}` with a phase tag, so a `FunctionClauseError`
+or `ArgumentError` from your data is a bug in dockd rather than something to
+rescue.
 
 ```elixir
-case Dockd.apply_package("./mystack.json") do
+case Dockd.apply_package(packages, "./mystack.json", endpoint, false, %{}, temp_root) do
   {:ok, %Dockd.ApplyResult{instance: instance}} ->
-    {:ok, %{output: out}} = Dockd.shell_command(instance, "uname -a")
+    {:ok, %{output: out}} = Dockd.shell_command(instance, "uname -a", endpoint)
     IO.puts(out)
     instance
 
   {:error, %Dockd.Error{phase: :setup, exit_code: code, output: output, instance: instance}} ->
     IO.puts("setup failed (exit #{code}):\n#{output}")
-    if instance, do: Dockd.destroy(instance)
+    if instance, do: Dockd.destroy(instance, endpoint)
 
   {:error, error} ->
     IO.puts("apply failed at #{error.phase}: #{error.message}")
-    if error.instance, do: Dockd.destroy(error.instance)
+    if error.instance, do: Dockd.destroy(error.instance, endpoint)
 end
 ```
 
@@ -692,8 +802,9 @@ end
 - **Keep packages in your repo** so collaborators get the same instance.
   `./packages/<stack>.json` is a good convention.
 - **Prefer inherited `env` entries over hard-coded literals** for secrets -
-  `"env": [{"name": "GITHUB_TOKEN"}]` reads from the host without committing
-  the value.
+  `"env": [{"name": "GITHUB_TOKEN"}]` reads the value from the `host_env` map you
+  pass, without committing it. Pass only the names a package should see: an empty
+  `host_env` means it can reach nothing.
 - **Use `${PWD}` and `${HOME}`** in `mounts`/`copy` so the same package works
   for everyone on the team.
 - **Check an installed package parses** with `Dockd.list_packages/1`, whose

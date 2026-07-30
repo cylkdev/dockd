@@ -65,35 +65,34 @@ defmodule Dockd.Ssh.DockerDialStdio do
 
   @template_filename "docker_dial_stdio_script.sh.eex"
 
+  # BatchMode=yes turns "prompt on stdin" into "fail". A prompt has no terminal to
+  # read from here, and in the content flow it competes with the script body.
+  @default_ssh_opts ["-o", "BatchMode=yes"]
+  @default_timeout 30_000
+  @safe_remote_path ~r{^[A-Za-z0-9_./-]+$}
+
   @doc """
   Returns the absolute path of the bundled EEx template on the *local*
   filesystem.
 
-  The template lives in this application's `priv` directory.
+  A named, opt-in call rather than a fallback inside `render_script/2`: it reads
+  `:code.priv_dir/1`, so the value depends on where this build is installed.
   """
-  @spec template_path() :: Path.t()
-  def template_path do
+  @spec default_template_path() :: Path.t()
+  def default_template_path do
     Path.join([:code.priv_dir(:dockd), "eex", @template_filename])
   end
 
   @doc """
-  Back-compat alias for `template_path/0`. The bundled file is now an EEx
-  template, but the path still names a file on disk that callers can read or
-  copy as-is — the template has no expressions today.
-  """
-  @spec local_path() :: Path.t()
-  def local_path, do: template_path()
+  Renders the EEx template at `template_path` to a binary.
 
-  @doc """
-  Renders the bundled EEx template to a binary.
-
-  `assigns` is forwarded to `EEx.eval_file/2` under the `:assigns` key, so
-  the template can reference values as `<%= @key %>`. The current template
-  has no expressions, so passing assigns is harmless.
+  `template_path` is a required argument — pass `default_template_path/0` for the
+  bundled template. `assigns` is forwarded to `EEx.eval_file/2` under the
+  `:assigns` key, so the template can reference values as `<%= @key %>`.
   """
-  @spec render_script(keyword()) :: binary()
-  def render_script(assigns \\ []) do
-    EEx.eval_file(template_path(), assigns: assigns)
+  @spec render_script(Path.t(), keyword()) :: binary()
+  def render_script(template_path, assigns \\ []) when is_binary(template_path) do
+    EEx.eval_file(template_path, assigns: assigns)
   end
 
   @doc """
@@ -124,55 +123,118 @@ defmodule Dockd.Ssh.DockerDialStdio do
     * `{:content, binary}` — stream the binary directly to the host over a
       single `ssh` invocation that writes the file, chmods it, and verifies
       it in one shell command. No local disk is touched.
-    * `:default` — sugar for `{:content, render_script([])}`.
+    * `:default` — sugar for `{:content, render_script(default_template_path())}`.
 
   ## Parameters
 
     * `script_source` — see above.
     * `user_at_host` — SSH destination in `user@host` form.
+    * `ssh_path` — absolute path to the `ssh` executable. Required.
+    * `scp_path` — absolute path to the `scp` executable. Required.
     * `opts` — keyword list:
       * `:remote_path` — destination path on the host. Defaults to
-        `default_remote_path/0`.
+        `default_remote_path/0`. Rejected unless it is an absolute path free of
+        shell metacharacters, since it is interpolated into a remote command.
       * `:identity` — passed through to `scp`/`ssh` as `-i`.
       * `:port` — SSH port (passed as `-P` to `scp` and `-p` to `ssh`).
+      * `:ssh_opts` — extra `-o` style flags. Defaults to
+        `["-o", "BatchMode=yes"]`, which makes an unauthenticated host fail
+        instead of prompting on stdin — a prompt here has no terminal to read
+        from, and in the content flow it collides with the script body being
+        written to stdin.
+      * `:timeout` — milliseconds to wait for the remote write. Defaults to
+        `30_000`.
 
   ## Returns
 
     * `{:ok, %{source: script_source(), remote_path: Path.t()}}` on success.
     * `{:error, message}` when any subprocess fails or verification fails.
   """
-  @spec install(script_source(), String.t(), keyword()) ::
+  @spec install(script_source(), String.t(), Path.t(), Path.t(), keyword()) ::
           {:ok, %{source: script_source(), remote_path: Path.t()}}
           | {:error, String.t()}
-  def install(script_source, user_at_host, opts \\ [])
+  def install(script_source, user_at_host, ssh_path, scp_path, opts \\ [])
 
-  def install(:default, user_at_host, opts) do
-    install({:content, render_script([])}, user_at_host, opts)
+  def install(:default, user_at_host, ssh_path, scp_path, opts) do
+    content = render_script(default_template_path())
+    install({:content, content}, user_at_host, ssh_path, scp_path, opts)
   end
 
-  def install({:content, content}, user_at_host, opts) when is_binary(content) do
-    remote_path = Keyword.get(opts, :remote_path, default_remote_path())
-    identity = Keyword.get(opts, :identity)
-    port = Keyword.get(opts, :port)
+  def install({:content, content}, user_at_host, ssh_path, _scp_path, opts)
+      when is_binary(content) do
+    with {:ok, ssh} <- require_executable(ssh_path, "ssh"),
+         {:ok, remote_path} <- resolve_remote_path(opts) do
+      plan =
+        build_content_plan(
+          user_at_host,
+          remote_path,
+          Keyword.get(opts, :identity),
+          Keyword.get(opts, :port),
+          ssh,
+          Keyword.get(opts, :ssh_opts, @default_ssh_opts)
+        )
 
-    plan = build_content_plan(user_at_host, remote_path, identity, port)
-
-    case run_content_plan(plan, content) do
-      :ok -> {:ok, %{source: {:content, content}, remote_path: remote_path}}
-      {:error, message} -> {:error, message}
+      case run_content_plan(plan, content, Keyword.get(opts, :timeout, @default_timeout)) do
+        :ok -> {:ok, %{source: {:content, content}, remote_path: remote_path}}
+        {:error, message} -> {:error, message}
+      end
     end
   end
 
-  def install(script_path, user_at_host, opts) when is_binary(script_path) do
-    remote_path = Keyword.get(opts, :remote_path, default_remote_path())
-    identity = Keyword.get(opts, :identity)
-    port = Keyword.get(opts, :port)
+  def install(script_path, user_at_host, ssh_path, scp_path, opts) when is_binary(script_path) do
+    with {:ok, ssh} <- require_executable(ssh_path, "ssh"),
+         {:ok, scp} <- require_executable(scp_path, "scp"),
+         {:ok, remote_path} <- resolve_remote_path(opts) do
+      plan =
+        build_plan(
+          script_path,
+          user_at_host,
+          remote_path,
+          Keyword.get(opts, :identity),
+          Keyword.get(opts, :port),
+          ssh,
+          scp,
+          Keyword.get(opts, :ssh_opts, @default_ssh_opts)
+        )
 
-    plan = build_plan(script_path, user_at_host, remote_path, identity, port)
+      case run_plan(plan) do
+        :ok -> {:ok, %{source: script_path, remote_path: remote_path}}
+        {:error, message} -> {:error, message}
+      end
+    end
+  end
 
-    case run_plan(plan) do
-      :ok -> {:ok, %{source: script_path, remote_path: remote_path}}
-      {:error, message} -> {:error, message}
+  defp require_executable(path, name) when is_binary(path) and path !== "" do
+    if File.regular?(path),
+      do: {:ok, path},
+      else: {:error, "#{name}_path does not name a file: #{path}"}
+  end
+
+  defp require_executable(other, name),
+    do:
+      {:error,
+       "installing over SSH needs #{name}. Pass #{name}_path with its absolute path, " <>
+         "got: #{inspect(other)}"}
+
+  # `remote_path` is interpolated into a remote shell command, so a value with a
+  # space, `;`, `$`, or a glob would be expanded by the remote shell.
+  defp resolve_remote_path(opts) do
+    path = Keyword.get(opts, :remote_path, default_remote_path())
+
+    cond do
+      not is_binary(path) or path === "" ->
+        {:error, "remote_path must be a non-empty string, got: #{inspect(path)}"}
+
+      Path.type(path) !== :absolute ->
+        {:error, "remote_path must be an absolute path, got: #{path}"}
+
+      not Regex.match?(@safe_remote_path, path) ->
+        {:error,
+         "remote_path must contain only letters, digits, and the characters _.-/ " <>
+           "(it is interpolated into a remote shell command), got: #{path}"}
+
+      true ->
+        {:ok, path}
     end
   end
 
@@ -185,18 +247,26 @@ defmodule Dockd.Ssh.DockerDialStdio do
   the verification step (which additionally requires the literal `"ok"` to
   appear in stdout).
   """
-  @spec build_plan(Path.t(), String.t(), Path.t(), String.t() | nil, String.t() | nil) ::
-          [{atom(), String.t(), [String.t()], :no_check | :expect_ok}]
-  def build_plan(local, user_at_host, remote_path, identity, port) do
-    id_args = identity_arg(identity)
+  @spec build_plan(
+          Path.t(),
+          String.t(),
+          Path.t(),
+          String.t() | nil,
+          String.t() | nil,
+          Path.t(),
+          Path.t(),
+          [String.t()]
+        ) :: [{atom(), String.t(), [String.t()], :no_check | :expect_ok}]
+  def build_plan(local, user_at_host, remote_path, identity, port, ssh, scp, ssh_opts) do
+    base = identity_arg(identity) ++ ssh_opts
 
     [
-      {:scp, "scp", id_args ++ port_arg(port, "-P") ++ [local, "#{user_at_host}:#{remote_path}"],
+      {:scp, scp, base ++ port_arg(port, "-P") ++ [local, "#{user_at_host}:#{remote_path}"],
        :no_check},
-      {:ssh_chmod, "ssh",
-       id_args ++ port_arg(port, "-p") ++ [user_at_host, "chmod", "+x", remote_path], :no_check},
-      {:ssh_verify, "ssh",
-       id_args ++ port_arg(port, "-p") ++ [user_at_host, "[ -x #{remote_path} ] && echo ok"],
+      {:ssh_chmod, ssh,
+       base ++ port_arg(port, "-p") ++ [user_at_host, "chmod", "+x", remote_path], :no_check},
+      {:ssh_verify, ssh,
+       base ++ port_arg(port, "-p") ++ [user_at_host, "[ -x #{remote_path} ] && echo ok"],
        :expect_ok}
     ]
   end
@@ -206,22 +276,29 @@ defmodule Dockd.Ssh.DockerDialStdio do
   flow. The single `ssh` step writes the file, chmods it, and verifies it in
   one remote shell command; the file body arrives over stdin.
 
-  Returns a one-element list shaped like `build_plan/5` entries so callers can
+  Returns a one-element list shaped like `build_plan/8` entries so callers can
   introspect both flows uniformly.
   """
-  @spec build_content_plan(String.t(), Path.t(), String.t() | nil, String.t() | nil) ::
-          [{atom(), String.t(), [String.t()], :expect_ok}]
-  def build_content_plan(user_at_host, remote_path, identity, port) do
-    id_args = identity_arg(identity)
+  @spec build_content_plan(
+          String.t(),
+          Path.t(),
+          String.t() | nil,
+          String.t() | nil,
+          Path.t(),
+          [String.t()]
+        ) :: [{atom(), String.t(), [String.t()], :expect_ok}]
+  def build_content_plan(user_at_host, remote_path, identity, port, ssh, ssh_opts) do
+    base = identity_arg(identity) ++ ssh_opts
+    quoted = shell_quote(remote_path)
 
-    remote_cmd =
-      "cat > #{remote_path} && chmod +x #{remote_path} && [ -x #{remote_path} ] && echo ok"
+    remote_cmd = "cat > #{quoted} && chmod +x #{quoted} && [ -x #{quoted} ] && echo ok"
 
     [
-      {:ssh_pipe, "ssh", id_args ++ port_arg(port, "-p") ++ [user_at_host, remote_cmd],
-       :expect_ok}
+      {:ssh_pipe, ssh, base ++ port_arg(port, "-p") ++ [user_at_host, remote_cmd], :expect_ok}
     ]
   end
+
+  defp shell_quote(value), do: "'" <> String.replace(value, "'", ~s('"'"')) <> "'"
 
   defp run_plan([]), do: :ok
 
@@ -252,25 +329,25 @@ defmodule Dockd.Ssh.DockerDialStdio do
     IO.iodata_to_binary([stdout, stderr])
   end
 
-  defp run_content_plan([{_step, cmd, args, check}], content) do
+  defp run_content_plan([{_step, cmd, args, check}], content, timeout) do
     case ElixirExec.run([cmd | args], stdin: true) do
       {:ok, conn} ->
         :ok = ElixirExec.write(conn, content)
         :ok = ElixirExec.write(conn, :eof)
-        collect_content_output(conn, [], check)
+        collect_content_output(conn, [], check, timeout)
 
       {:error, reason} ->
         {:error, "subprocess failed: #{inspect(reason)}"}
     end
   end
 
-  defp collect_content_output(conn, acc, check) do
-    case ElixirExec.read(conn, 30_000) do
+  defp collect_content_output(conn, acc, check, timeout) do
+    case ElixirExec.read(conn, timeout) do
       {:ok, {:stdout, data}} ->
-        collect_content_output(conn, [acc, data], check)
+        collect_content_output(conn, [acc, data], check, timeout)
 
       {:ok, {:stderr, data}} ->
-        collect_content_output(conn, [acc, data], check)
+        collect_content_output(conn, [acc, data], check, timeout)
 
       {:ok, {:exit, 0}} ->
         verify_check(check, IO.iodata_to_binary(acc))

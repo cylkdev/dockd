@@ -2,16 +2,21 @@ defmodule Dockd.Provisioner do
   @moduledoc """
   Runs the create-an-`Instance` pipeline.
 
-  Takes a `Dockd.Spec` (what the user wants) plus a keyword list of
-  per-call options (caller runtime context — Docker daemon connection
-  settings and the `:disk_mount_enabled` policy) and produces a
-  `Dockd.ApplyResult` (the new `Instance` plus any step results).
+  Takes a `Dockd.Spec` (what the user wants) plus its required runtime inputs —
+  the Docker daemon `endpoint`, the `disk_mount_enabled` policy, the `host_env`
+  map, and the host `temp_root` — and produces a `Dockd.ApplyResult` (the new
+  `Instance` plus any step results).
 
-  All caller-runtime state lives in `opts` and the internal pipeline
-  context; nothing about this module's state survives a single call.
-  Errors are tagged with the phase that produced them; when a container
-  was created before the failure, the error carries a hydrated
-  `Dockd.Instance` so callers can clean up with `Dockd.destroy/1`.
+  Those four are positional arguments, not options, because the pipeline cannot
+  run without them and none of them may be inferred from ambient process state.
+  In particular `disk_mount_enabled` fails **closed**: there is no clause that
+  treats an absent value as permission to expose the host.
+
+  All caller-runtime state lives in the arguments and the internal pipeline
+  context; nothing about this module's state survives a single call. Errors are
+  tagged with the phase that produced them; when a container was created before
+  the failure, the error carries a hydrated `Dockd.Instance` so callers can clean
+  up with `Dockd.destroy/3`.
   """
 
   require Logger
@@ -22,7 +27,9 @@ defmodule Dockd.Provisioner do
   alias Dockd.Spec
   alias Dockd.StepResult
 
-  @docker_connection_keys [:socket, :host, :platform, :networks, :network_mode]
+  # :socket and :host are absent by design — the daemon target is the positional
+  # `endpoint` argument, so it cannot be forgotten and silently defaulted.
+  @docker_option_keys [:api_version, :platform, :networks, :network_mode]
 
   @host_path_keys [:mounts, :repos, :copy]
 
@@ -33,38 +40,67 @@ defmodule Dockd.Provisioner do
   @doc """
   Runs the full create-an-`Instance` provisioning pipeline for `spec`.
 
-  Builds a per-call context from `spec` and the connection/policy options in
-  `opts`, then executes the pipeline in order: enforce disk-mount policy, expand
-  env, normalize mounts, validate the image source, normalize step/repo/copy
-  specs, resolve the image (build or pull), create and start the container,
-  fetch repos, copy host files, run setup steps, and hydrate the resulting
-  `Dockd.Instance`.
+  Builds a per-call context from the arguments, then executes the pipeline in
+  order: validate the spec, enforce disk-mount policy, expand env, normalize
+  mounts, validate the image source, normalize step/repo/copy specs, resolve the
+  image (build or pull), create and start the container, fetch repos, copy host
+  files, run setup steps, and hydrate the resulting `Dockd.Instance`.
+
+  Arguments:
+
+    - `spec` — the `Dockd.Spec` to realize
+    - `endpoint` — the Docker daemon to talk to, e.g.
+      `"unix:///var/run/docker.sock"` or `"tcp://10.0.0.1:2376"`
+    - `disk_mount_enabled` — `true` permits host mounts, repo clones, file copies
+      and host-derived env; `false` strips them. No default: an absent policy must
+      never mean "expose the host"
+    - `host_env` — the environment `:env` entries resolve against. Pass `%{}` to
+      resolve nothing from the host
+    - `temp_root` — host directory for repo-clone and file-copy staging
+
+  `validate_spec/1` runs first so a hand-built `%Dockd.Spec{}` with a `nil`
+  `:image` or `:instance_name` produces a `:validate` error rather than crashing
+  further down.
 
   Returns `{:ok, %Dockd.ApplyResult{}}` on success. On failure returns
   `{:error, %Dockd.Error{}}` tagged with the phase that failed; when a container
   was already created, the error carries a hydrated (or stub) `Dockd.Instance`
   and any captured `step_results` so the caller can clean up with
-  `Dockd.destroy/1`.
+  `Dockd.destroy/3`.
   """
-  @spec run(Spec.t(), keyword()) :: {:ok, ApplyResult.t()} | {:error, Error.t()}
-  def run(%Spec{} = spec, opts \\ []) when is_list(opts) do
-    ctx = %{
-      spec: spec,
-      docker_options: docker_options_from(opts),
-      container_id: nil,
-      steps: [],
-      repos: [],
-      copies: [],
-      step_results: []
-    }
+  @spec run(Spec.t(), binary(), boolean(), %{optional(binary()) => binary()}, Path.t(), keyword()) ::
+          {:ok, ApplyResult.t()} | {:error, Error.t()}
+  def run(%Spec{} = spec, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ [])
+      when is_map(host_env) and is_list(opts) do
+    with {:ok, docker_options} <- docker_options_from(endpoint, opts),
+         :ok <- validate_spec(spec),
+         :ok <- validate_temp_root(temp_root) do
+      ctx = %{
+        spec: spec,
+        docker_options: docker_options,
+        host_env: host_env,
+        temp_root: temp_root,
+        tools: tools_from(opts),
+        container_id: nil,
+        steps: [],
+        repos: [],
+        copies: [],
+        step_results: []
+      }
 
-    with {:ok, ctx} <- enforce_disk_mount_policy(ctx, opts),
+      run_pipeline(ctx, disk_mount_enabled)
+    end
+  end
+
+  defp run_pipeline(ctx, disk_mount_enabled) do
+    with {:ok, ctx} <- enforce_disk_mount_policy(ctx, disk_mount_enabled),
          {:ok, ctx} <- expand_env(ctx),
          {:ok, ctx} <- normalize_mounts(ctx),
          {:ok, ctx} <- validate_source(ctx),
          {:ok, ctx} <- normalize_step_specs(ctx),
          {:ok, ctx} <- normalize_repo_specs(ctx),
          {:ok, ctx} <- normalize_copy_specs(ctx),
+         {:ok, ctx} <- validate_tools(ctx),
          {:ok, ctx} <- resolve_image(ctx),
          {:ok, ctx} <- create_container(ctx),
          {:ok, ctx} <- start_container(ctx),
@@ -82,50 +118,140 @@ defmodule Dockd.Provisioner do
   Tolerates 304 (already stopped) and 404 (not found) responses so that
   destroying an already-gone container is a no-op.
   """
-  @spec destroy(binary(), keyword()) :: :ok | {:error, Error.t()}
-  def destroy(container_ref, opts \\ []) when is_binary(container_ref) and is_list(opts) do
-    docker_options = docker_options_from(opts)
-
-    with :ok <- stop_container_tolerant(container_ref, docker_options) do
+  @spec destroy(binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  def destroy(container_ref, endpoint, opts \\ [])
+      when is_binary(container_ref) and is_list(opts) do
+    with {:ok, docker_options} <- docker_options_from(endpoint, opts),
+         :ok <- stop_container_tolerant(container_ref, docker_options) do
       delete_container_tolerant(container_ref, docker_options)
     end
   end
 
   @doc """
-  Extracts the Docker-client connection options from a per-call `opts`
-  keyword list. Used by `Dockd` to forward connection settings to
-  `Docker.*` calls outside this module.
+  Builds the Docker-client options for a call against `endpoint`.
 
-  Note: the caller-facing `:api_version` key is renamed to `:version`
-  before being forwarded, to match the keyword expected by the `Docker`
-  client.
+  `endpoint` is required and must be a non-empty binary. This is the only place
+  the daemon target is assembled, and it can never produce an empty list: with no
+  endpoint the `Docker` client would fall back to `DOCKER_HOST`, making *which
+  daemon a container is created on* depend on ambient process state.
+
+  A `unix://` endpoint (or a bare filesystem path) becomes `:socket`; anything
+  else becomes `:host`. The caller-facing `:api_version` option is renamed to
+  `:version` to match the keyword the `Docker` client expects.
   """
-  @spec docker_options_from(keyword()) :: keyword()
-  def docker_options_from(opts) when is_list(opts) do
-    opts
-    |> Keyword.take(@docker_connection_keys ++ [:api_version])
-    |> rename_keyword(:api_version, :version)
+  @spec docker_options_from(binary(), keyword()) :: {:ok, keyword()} | {:error, Error.t()}
+  def docker_options_from(endpoint, opts \\ []) when is_list(opts) do
+    with {:ok, connection} <- endpoint_option(endpoint) do
+      extra =
+        opts
+        |> Keyword.take(@docker_option_keys)
+        |> rename_keyword(:api_version, :version)
+
+      {:ok, [connection | extra]}
+    end
+  end
+
+  defp endpoint_option(endpoint) when is_binary(endpoint) and endpoint !== "" do
+    cond do
+      String.starts_with?(endpoint, "unix://") ->
+        {:ok, {:socket, String.replace_prefix(endpoint, "unix://", "")}}
+
+      Path.type(endpoint) === :absolute and not String.contains?(endpoint, "://") ->
+        {:ok, {:socket, endpoint}}
+
+      true ->
+        {:ok, {:host, endpoint}}
+    end
+  end
+
+  defp endpoint_option(other) do
+    {:error,
+     validate_error(
+       "a Docker endpoint is required, got: #{inspect(other)}. " <>
+         ~s(Pass a socket path like "unix:///var/run/docker.sock" or a host like "tcp://10.0.0.1:2376".)
+     )}
+  end
+
+  defp tools_from(opts) do
+    %{
+      git_path: Keyword.get(opts, :git_path),
+      git_env: Keyword.get(opts, :git_env),
+      tar_path: Keyword.get(opts, :tar_path),
+      tar_env: Keyword.get(opts, :tar_env),
+      tar_extra_args: Keyword.get(opts, :tar_extra_args, []),
+      container_staging_root: Keyword.get(opts, :container_staging_root, "/tmp")
+    }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Pipeline — spec and staging validation
+  # ---------------------------------------------------------------------------
+
+  # Re-checked here, not only at the Dockd boundary: @enforce_keys stops an
+  # incomplete %Spec{} literal, but not one built with an explicit nil.
+  defp validate_spec(spec), do: Spec.validate(spec)
+
+  defp validate_temp_root(root) when is_binary(root) and root !== "" do
+    if Path.type(root) === :absolute,
+      do: :ok,
+      else: validate_error_tuple("temp_root must be an absolute path, got: #{inspect(root)}")
+  end
+
+  defp validate_temp_root(other),
+    do: validate_error_tuple("a host temp_root is required, got: #{inspect(other)}")
+
+  defp validate_error_tuple(message), do: {:error, validate_error(message)}
+
+  # `git` and `tar` are only needed when the spec actually clones a repo or
+  # copies a host file, so they are options rather than positional arguments on
+  # `run/6`. What matters is that a missing one is a hard `:validate` error at the
+  # point of need — there is no PATH lookup to fall back on.
+  defp validate_tools(%{repos: repos, copies: copies} = ctx) do
+    needs_git? = repos !== []
+    needs_tar? = repos !== [] or copies !== []
+
+    with :ok <- require_tool(ctx, needs_git?, :git_path, :git_env, ":repos"),
+         :ok <- require_tool(ctx, needs_tar?, :tar_path, :tar_env, ":copy or :repos") do
+      {:ok, ctx}
+    end
+  end
+
+  defp require_tool(_ctx, false, _path_key, _env_key, _because), do: :ok
+
+  defp require_tool(ctx, true, path_key, env_key, because) do
+    tool = String.replace_suffix(Atom.to_string(path_key), "_path", "")
+
+    cond do
+      not is_binary(Map.get(ctx.tools, path_key)) ->
+        validate_error_tuple(
+          "this spec uses #{because}, which needs #{tool}. " <>
+            "Pass #{inspect(path_key)} with the absolute path to the #{tool} executable."
+        )
+
+      not is_map(Map.get(ctx.tools, env_key)) ->
+        validate_error_tuple(
+          "this spec uses #{because}, which needs #{tool}. " <>
+            "Pass #{inspect(env_key)} with the environment to run #{tool} in (%{} for none)."
+        )
+
+      true ->
+        :ok
+    end
   end
 
   # ---------------------------------------------------------------------------
   # Pipeline — disk-mount policy
   # ---------------------------------------------------------------------------
 
-  defp enforce_disk_mount_policy(ctx, opts) do
-    case Keyword.get(opts, :disk_mount_enabled) do
-      nil ->
-        {:ok, ctx}
+  # No nil clause on purpose. This flag gates every host-exposing feature, so an
+  # absent value must be a caller error, never an implicit grant.
+  defp enforce_disk_mount_policy(ctx, true), do: {:ok, ctx}
 
-      true ->
-        {:ok, ctx}
+  defp enforce_disk_mount_policy(ctx, false),
+    do: {:ok, %{ctx | spec: strip_host_exposure(ctx.spec)}}
 
-      false ->
-        {:ok, %{ctx | spec: strip_host_exposure(ctx.spec)}}
-
-      other ->
-        {:error, validate_error(":disk_mount_enabled must be a boolean, got: #{inspect(other)}")}
-    end
-  end
+  defp enforce_disk_mount_policy(_ctx, other),
+    do: validate_error_tuple("disk_mount_enabled must be a boolean, got: #{inspect(other)}")
 
   defp strip_host_exposure(%Spec{} = spec) do
     spec
@@ -176,20 +302,40 @@ defmodule Dockd.Provisioner do
   # Pipeline — env resolution
   # ---------------------------------------------------------------------------
 
+  @doc """
+  Resolves a spec's `:env` entries against `host_env` into `"NAME=value"` strings.
+
+  Pure, and the same code the pipeline runs, so the resolution rules can be
+  checked without a daemon. Each entry resolves as:
+
+    - `"NAME=value"` — passed through verbatim
+    - `"NAME"` — looked up in `host_env`; absent is a `:validate` error
+    - `{"NAME", value: v}` — `v` verbatim, no lookup
+    - `{"NAME", default: d}` — `d`, **even when `host_env` has the name**. An
+      explicitly-passed default outranks the environment; the reverse would let
+      ambient state silently override a value the caller wrote down.
+    - `{"NAME", optional: true}` — dropped when `host_env` lacks the name
+    - `{"NAME", []}` — required; absent from `host_env` is a `:validate` error
+  """
+  @spec resolve_env(Spec.t(), %{optional(binary()) => binary()}) ::
+          {:ok, [binary()]} | {:error, Error.t()}
+  def resolve_env(%Spec{env: entries}, host_env) when is_list(entries) and is_map(host_env),
+    do: resolve_env_entries(entries, host_env)
+
+  def resolve_env(%Spec{}, _host_env),
+    do: {:error, validate_error(":env must be a list")}
+
   defp expand_env(%{spec: %Spec{env: []}} = ctx), do: {:ok, ctx}
 
-  defp expand_env(%{spec: %Spec{env: entries} = spec} = ctx) when is_list(entries) do
-    with {:ok, expanded} <- resolve_env_entries(entries) do
+  defp expand_env(%{spec: %Spec{} = spec, host_env: host_env} = ctx) do
+    with {:ok, expanded} <- resolve_env(spec, host_env) do
       {:ok, %{ctx | spec: %{spec | env: expanded}}}
     end
   end
 
-  defp expand_env(_ctx),
-    do: {:error, validate_error(":env must be a list")}
-
-  defp resolve_env_entries(entries) do
+  defp resolve_env_entries(entries, host_env) do
     Enum.reduce_while(entries, {:ok, []}, fn entry, {:ok, acc} ->
-      case resolve_env_entry(entry) do
+      case resolve_env_entry(entry, host_env) do
         {:ok, :drop} -> {:cont, {:ok, acc}}
         {:ok, str} -> {:cont, {:ok, acc ++ [str]}}
         {:error, _} = err -> {:halt, err}
@@ -197,52 +343,57 @@ defmodule Dockd.Provisioner do
     end)
   end
 
-  defp resolve_env_entry(entry) when is_binary(entry) do
+  defp resolve_env_entry(entry, host_env) when is_binary(entry) do
     if String.contains?(entry, "=") do
       {:ok, entry}
     else
-      case System.fetch_env(entry) do
+      case Map.fetch(host_env, entry) do
         {:ok, val} ->
           {:ok, "#{entry}=#{val}"}
 
         :error ->
-          {:error, validate_error(":env references unset host var: #{entry}")}
+          {:error, validate_error(":env references a name absent from host_env: #{entry}")}
       end
     end
   end
 
-  defp resolve_env_entry({name, opts}) when is_binary(name) and is_list(opts) do
+  defp resolve_env_entry({name, opts}, host_env) when is_binary(name) and is_list(opts) do
     if Keyword.has_key?(opts, :value) do
       {:ok, "#{name}=#{Keyword.fetch!(opts, :value)}"}
     else
-      resolve_host_env(name, opts)
+      resolve_host_env(name, opts, host_env)
     end
   end
 
-  defp resolve_env_entry(other),
+  defp resolve_env_entry(other, _host_env),
     do:
       {:error,
        validate_error(
          ":env entries must be strings or {name, opts} tuples, got: #{inspect(other)}"
        )}
 
-  defp resolve_host_env(name, opts) do
-    case System.fetch_env(name) do
-      {:ok, val} -> {:ok, "#{name}=#{val}"}
-      :error -> resolve_unset_host_env(name, opts)
-    end
-  end
-
-  defp resolve_unset_host_env(name, opts) do
+  # An explicitly-supplied :default outranks host_env. The reverse would let
+  # ambient state silently override a value the caller wrote down.
+  defp resolve_host_env(name, opts, host_env) do
     case Keyword.fetch(opts, :default) do
       {:ok, default} when is_binary(default) ->
         {:ok, "#{name}=#{default}"}
 
       _ ->
+        resolve_from_host_env(name, opts, host_env)
+    end
+  end
+
+  defp resolve_from_host_env(name, opts, host_env) do
+    case Map.fetch(host_env, name) do
+      {:ok, val} ->
+        {:ok, "#{name}=#{val}"}
+
+      :error ->
         if Keyword.get(opts, :optional) === true do
           {:ok, :drop}
         else
-          {:error, validate_error(":env references unset host var: #{name}")}
+          {:error, validate_error(":env references a name absent from host_env: #{name}")}
         end
     end
   end
@@ -336,38 +487,38 @@ defmodule Dockd.Provisioner do
     end
   end
 
+  # No Path.expand: a relative string is simply not a local path dockd accepts,
+  # and expanding it here would make the check depend on the caller's CWD.
   defp do_validate_source(image, nil) do
-    expanded = Path.expand(image)
-
-    if File.regular?(expanded) or File.dir?(expanded) do
+    if File.regular?(image) or File.dir?(image) do
       {:error, "local image paths are not supported, use the :build option instead"}
     else
       :ok
     end
   end
 
+  # `Spec.validate/1` has already guaranteed an absolute path, so this only has
+  # to answer whether it exists.
   defp validate_dockerfile_path(dockerfile) do
-    expanded = Path.expand(dockerfile)
-
     cond do
-      File.regular?(expanded) ->
+      File.regular?(dockerfile) ->
         :ok
 
-      File.dir?(expanded) ->
-        validate_dockerfile_in_dir(expanded, dockerfile)
+      File.dir?(dockerfile) ->
+        validate_dockerfile_in_dir(dockerfile)
 
       true ->
         {:error, "dockerfile path does not exist: #{dockerfile}"}
     end
   end
 
-  defp validate_dockerfile_in_dir(expanded, dockerfile) do
-    candidate = Path.join(expanded, "Dockerfile")
+  defp validate_dockerfile_in_dir(dir) do
+    candidate = Path.join(dir, "Dockerfile")
 
     if File.regular?(candidate) do
       :ok
     else
-      {:error, "no Dockerfile found in directory: #{dockerfile}"}
+      {:error, "no Dockerfile found in directory: #{dir}"}
     end
   end
 
@@ -583,17 +734,18 @@ defmodule Dockd.Provisioner do
   end
 
   defp build_image(%{spec: %Spec{image: tag}, docker_options: docker_options} = ctx, build) do
+    # Both paths are absolute — `Spec.validate/1` rejects anything else, so there
+    # is no Path.expand here and no dependency on the caller's CWD.
     dockerfile = atomize_key(build, :dockerfile)
     context = atomize_key(build, :context)
-    expanded = Path.expand(dockerfile)
 
     {context_path, dockerfile_path} =
-      if File.dir?(expanded) do
-        {expanded, Path.join(expanded, "Dockerfile")}
+      if File.dir?(dockerfile) do
+        {dockerfile, Path.join(dockerfile, "Dockerfile")}
       else
         if context,
-          do: {Path.expand(context), expanded},
-          else: {Path.dirname(expanded), expanded}
+          do: {context, dockerfile},
+          else: {Path.dirname(dockerfile), dockerfile}
       end
 
     build_params = build_params_for_engine(build)
@@ -667,7 +819,7 @@ defmodule Dockd.Provisioner do
 
     labels = Map.merge(user_labels || %{}, Instance.managed_labels(spec))
 
-    case Docker.create_container(name, image, labels, create_options) do
+    case Docker.create_container(Spec.prefix_name(name), image, labels, create_options) do
       {:ok, container_id} ->
         {:ok, %{ctx | container_id: container_id}}
 
@@ -690,22 +842,53 @@ defmodule Dockd.Provisioner do
     end
   end
 
-  defp download_repos_to_host(
-         %{container_id: container_id, docker_options: docker_options, repos: repos} = ctx
-       ) do
-    case Dockd.Git.download_repos_to_host(repos, container_id, docker_options) do
+  defp download_repos_to_host(%{repos: []} = ctx), do: {:ok, ctx}
+
+  defp download_repos_to_host(ctx) do
+    result =
+      Dockd.Git.download_repos_to_host(
+        ctx.repos,
+        ctx.container_id,
+        ctx.temp_root,
+        ctx.tools.git_path,
+        ctx.tools.git_env,
+        ctx.docker_options,
+        copy_opts(ctx)
+      )
+
+    case result do
       :ok -> {:ok, ctx}
       {:error, error} -> {:error, attach_existing_instance(ctx, error)}
     end
   end
 
-  defp copy_files(
-         %{container_id: container_id, docker_options: docker_options, copies: copies} = ctx
-       ) do
-    case Dockd.FileCopy.copy_files(copies, container_id, docker_options) do
+  defp copy_files(%{copies: []} = ctx), do: {:ok, ctx}
+
+  defp copy_files(ctx) do
+    result =
+      Dockd.FileCopy.copy_files(
+        ctx.copies,
+        ctx.container_id,
+        ctx.temp_root,
+        ctx.tools.tar_path,
+        ctx.tools.tar_env,
+        ctx.docker_options,
+        copy_opts(ctx)
+      )
+
+    case result do
       :ok -> {:ok, ctx}
       {:error, error} -> {:error, attach_existing_instance(ctx, error)}
     end
+  end
+
+  defp copy_opts(ctx) do
+    [
+      tar_path: ctx.tools.tar_path,
+      tar_env: ctx.tools.tar_env,
+      tar_extra_args: ctx.tools.tar_extra_args,
+      container_staging_root: ctx.tools.container_staging_root
+    ]
   end
 
   defp run_steps(
@@ -844,7 +1027,8 @@ defmodule Dockd.Provisioner do
         Instance.from_inspect(body)
 
       {:error, _} ->
-        %Instance{id: container_id, name: spec.instance_name}
+        # %Instance.name is the container name, so it carries the prefix.
+        %Instance{id: container_id, name: Spec.prefix_name(spec.instance_name)}
     end
   end
 

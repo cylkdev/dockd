@@ -3,52 +3,10 @@ defmodule Dockd.PackagesTest do
 
   alias Dockd.Packages
 
-  setup do
-    previous_packages_path = Application.get_env(:dockd, :packages_path)
-    previous_env = System.get_env("DOCKD_PACKAGES_PATH")
-
-    on_exit(fn ->
-      restore_app_env(previous_packages_path)
-      restore_env(previous_env)
-    end)
-
-    :ok
-  end
-
-  describe "packages_root/1" do
-    test "defaults to ~/.dockd/packages" do
-      System.delete_env("DOCKD_PACKAGES_PATH")
-      Application.delete_env(:dockd, :packages_path)
-
-      assert Packages.packages_root() === Path.join(System.user_home!(), ".dockd/packages")
-    end
-
-    test "uses app config when set" do
-      System.delete_env("DOCKD_PACKAGES_PATH")
-      Application.put_env(:dockd, :packages_path, "/tmp/from-config")
-
-      assert Packages.packages_root() === "/tmp/from-config"
-    end
-
-    test "uses environment before app config" do
-      Application.put_env(:dockd, :packages_path, "/tmp/from-config")
-      System.put_env("DOCKD_PACKAGES_PATH", "/tmp/from-env")
-
-      assert Packages.packages_root() === "/tmp/from-env"
-    end
-
-    test "uses opts before environment and app config" do
-      Application.put_env(:dockd, :packages_path, "/tmp/from-config")
-      System.put_env("DOCKD_PACKAGES_PATH", "/tmp/from-env")
-
-      assert Packages.packages_root(packages_path: "/tmp/from-opts") === "/tmp/from-opts"
-    end
-  end
-
-  describe "resolve_path/1" do
-    test "bare name resolves to <packages_root>/<name>/package.json" do
+  describe "resolve_path/3" do
+    test "bare name resolves to <root>/<name>/package.json" do
       root = sandbox_dir("dockd-packages-root")
-      path = Packages.resolve_path("webapp", packages_path: root)
+      path = Packages.resolve_path(root, "webapp")
 
       assert Path.basename(path) === "package.json"
       assert Path.basename(Path.dirname(path)) === "webapp"
@@ -58,22 +16,22 @@ defmodule Dockd.PackagesTest do
     end
 
     test "directory path appends package.json" do
-      assert Packages.resolve_path("./mypkg") === "./mypkg/package.json"
-      assert Packages.resolve_path("/abs/mypkg") === "/abs/mypkg/package.json"
+      assert Packages.resolve_path("/root", "./mypkg") === "./mypkg/package.json"
+      assert Packages.resolve_path("/root", "/abs/mypkg") === "/abs/mypkg/package.json"
     end
 
     test "explicit .json path is used as-is" do
-      assert Packages.resolve_path("./mypkg/package.json") === "./mypkg/package.json"
-      assert Packages.resolve_path("/abs/path/spec.json") === "/abs/path/spec.json"
+      assert Packages.resolve_path("/root", "./mypkg/package.json") === "./mypkg/package.json"
+      assert Packages.resolve_path("/root", "/abs/path/spec.json") === "/abs/path/spec.json"
     end
   end
 
-  describe "list/0" do
+  describe "list/2" do
     test "lists every installed package with its parsed spec" do
       root = sandbox_dir("dockd-list-root")
       add_installed_package(root, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
 
-      results = Packages.list(packages_path: root)
+      results = Packages.list(root)
       assert is_list(results)
       assert Enum.map(results, & &1.name) === ["alpha"]
 
@@ -93,7 +51,7 @@ defmodule Dockd.PackagesTest do
         ~s({"instance_name": "env", "image": "busybox:1.37.0", "mounts": ["${DOCKD_TEST_UNSET}:/x"]})
       )
 
-      results = Packages.list(packages_path: root)
+      results = Packages.list(root)
 
       Enum.each(results, fn entry ->
         case entry.spec do
@@ -108,20 +66,20 @@ defmodule Dockd.PackagesTest do
     end
   end
 
-  describe "delete/2" do
+  describe "delete/3" do
     test "removes an installed package directory" do
       root = sandbox_dir("dockd-delete-root")
       add_installed_package(root, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
 
-      assert :ok = Packages.delete("alpha", packages_path: root)
+      assert :ok = Packages.delete(root, "alpha")
       refute File.exists?(Path.join(root, "alpha"))
     end
 
     test "is idempotent — deleting a missing package returns :ok" do
       root = sandbox_dir("dockd-delete-missing")
 
-      assert :ok = Packages.delete("nope", packages_path: root)
-      assert :ok = Packages.delete("nope", packages_path: root)
+      assert :ok = Packages.delete(root, "nope")
+      assert :ok = Packages.delete(root, "nope")
     end
 
     test "only removes the named package" do
@@ -129,15 +87,16 @@ defmodule Dockd.PackagesTest do
       add_installed_package(root, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
       add_installed_package(root, "beta", ~s({"instance_name": "beta", "image": "busybox:1.37.0"}))
 
-      assert :ok = Packages.delete("alpha", packages_path: root)
+      assert :ok = Packages.delete(root, "alpha")
       assert File.exists?(Path.join([root, "beta", "package.json"]))
     end
 
     test "rejects a reference that is not a bare package name" do
-      assert {:error, %Dockd.Error{phase: :validate}} = Packages.delete("../etc")
-      assert {:error, %Dockd.Error{phase: :validate}} = Packages.delete("a/b")
-      assert {:error, %Dockd.Error{phase: :validate}} = Packages.delete("pkg.json")
-      assert {:error, %Dockd.Error{phase: :validate}} = Packages.delete("")
+      root = sandbox_dir("dockd-delete-bare")
+
+      for bad <- ["../etc", "a/b", "pkg.json", ""] do
+        assert {:error, %Dockd.Error{phase: :validate}} = Packages.delete(root, bad)
+      end
     end
 
     test "refuses to delete a directory that is not a package" do
@@ -145,23 +104,23 @@ defmodule Dockd.PackagesTest do
       File.mkdir_p!(Path.join(root, "plain"))
 
       assert {:error, %Dockd.Error{phase: :destroy}} =
-               Packages.delete("plain", packages_path: root)
+               Packages.delete(root, "plain")
 
       assert File.exists?(Path.join(root, "plain"))
     end
   end
 
-  describe "Dockd.delete_package/2" do
+  describe "Dockd.delete_package/3" do
     test "removes an installed package by name" do
       root = sandbox_dir("dockd-api-delete-root")
       add_installed_package(root, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
 
-      assert :ok = Dockd.delete_package("alpha", packages_path: root)
-      assert Dockd.list_packages(packages_path: root) === []
+      assert :ok = Dockd.delete_package(root, "alpha")
+      assert Dockd.list_packages(root) === []
     end
   end
 
-  describe "install_from_git/2" do
+  describe "install_from_git/6" do
     @describetag :integration
 
     setup do
@@ -187,7 +146,7 @@ defmodule Dockd.PackagesTest do
       git_commit(repo, "add packages")
 
       assert {:ok, names} =
-               Packages.install_from_git("file://" <> repo, dest_dir: dest)
+               Packages.install_from_git(dest, "file://" <> repo, staging(), git_path(), git_env())
 
       assert Enum.sort(names) === ["alpha", "beta"]
       assert File.exists?(Path.join([dest, "alpha", "package.json"]))
@@ -207,7 +166,7 @@ defmodule Dockd.PackagesTest do
       git_commit(repo, "add alpha")
 
       assert {:ok, ["alpha"]} =
-               Packages.install_from_git("file://" <> repo, dest_dir: dest)
+               Packages.install_from_git(dest, "file://" <> repo, staging(), git_path(), git_env())
 
       refute File.exists?(Path.join([dest, "alpha", "stale.txt"]))
       assert File.exists?(Path.join([dest, "alpha", "package.json"]))
@@ -221,7 +180,7 @@ defmodule Dockd.PackagesTest do
       git_commit(repo, "add broken")
 
       assert {:error, err} =
-               Packages.install_from_git("file://" <> repo, dest_dir: dest)
+               Packages.install_from_git(dest, "file://" <> repo, staging(), git_path(), git_env())
 
       assert err.phase === :fetch
       assert err.message =~ "broken"
@@ -235,7 +194,7 @@ defmodule Dockd.PackagesTest do
       git_commit(repo, "init")
 
       assert {:error, err} =
-               Packages.install_from_git("file://" <> repo, dest_dir: dest)
+               Packages.install_from_git(dest, "file://" <> repo, staging(), git_path(), git_env())
 
       assert err.phase === :fetch
       assert err.message =~ "no top-level packages/ directory"
@@ -245,14 +204,14 @@ defmodule Dockd.PackagesTest do
       dest = sandbox_dir("dockd-install-bogus")
 
       assert {:error, err} =
-               Packages.install_from_git("file:///nonexistent/repo.git", dest_dir: dest)
+               Packages.install_from_git(dest, "file:///nonexistent/repo.git", staging(), git_path(), git_env())
 
       assert err.phase === :fetch
       assert err.message =~ "failed to clone"
     end
   end
 
-  describe "install_from_path/2" do
+  describe "install_from_path/3" do
     test "installs every packages/<name>/ dir from a local directory" do
       src = sandbox_dir("dockd-local-src")
       dest = sandbox_dir("dockd-local-dest")
@@ -263,7 +222,7 @@ defmodule Dockd.PackagesTest do
         dockerfile: "FROM busybox\n"
       )
 
-      assert {:ok, names} = Packages.install_from_path(src, dest_dir: dest)
+      assert {:ok, names} = Packages.install_from_path(dest, src)
 
       assert Enum.sort(names) === ["alpha", "beta"]
       assert File.exists?(Path.join([dest, "alpha", "package.json"]))
@@ -275,20 +234,20 @@ defmodule Dockd.PackagesTest do
       File.mkdir_p!(src)
       dest = sandbox_dir("dockd-local-empty-dest")
 
-      assert {:error, err} = Packages.install_from_path(src, dest_dir: dest)
+      assert {:error, err} = Packages.install_from_path(dest, src)
       assert err.phase === :fetch
       assert err.message =~ "no top-level packages/ directory"
     end
   end
 
-  describe "Dockd.install_packages/2" do
+  describe "Dockd.install_packages/3" do
     test "installs from a local directory when the ref is an existing dir" do
       src = sandbox_dir("dockd-dispatch-local")
       dest = sandbox_dir("dockd-dispatch-local-dest")
 
       add_package(src, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
 
-      assert {:ok, ["alpha"]} = Dockd.install_packages(src, dest_dir: dest)
+      assert {:ok, ["alpha"]} = Dockd.install_packages(dest, src)
       assert File.exists?(Path.join([dest, "alpha", "package.json"]))
     end
 
@@ -302,7 +261,11 @@ defmodule Dockd.PackagesTest do
         git_commit(repo, "add alpha")
 
         assert {:ok, ["alpha"]} =
-                 Dockd.install_packages("file://" <> repo, dest_dir: dest)
+                 Dockd.install_packages(dest, "file://" <> repo,
+                   staging_root: staging(),
+                   git_path: git_path(),
+                   git_env: git_env()
+                 )
 
         assert File.exists?(Path.join([dest, "alpha", "package.json"]))
       end
@@ -312,38 +275,42 @@ defmodule Dockd.PackagesTest do
       dest = sandbox_dir("dockd-dispatch-bogus")
 
       assert {:error, err} =
-               Dockd.install_packages("file:///nonexistent/repo.git", dest_dir: dest)
+               Dockd.install_packages(dest, "file:///nonexistent/repo.git",
+                 staging_root: staging(),
+                 git_path: git_path(),
+                 git_env: git_env()
+               )
 
       assert err.phase === :fetch
       assert err.message =~ "failed to clone"
     end
   end
 
-  describe "Dockd.list_packages/1" do
+  describe "Dockd.list_packages/2" do
     test "lists installed packages after an install" do
       src = sandbox_dir("dockd-list-src")
       root = sandbox_dir("dockd-list-root")
 
       add_package(src, "alpha", ~s({"instance_name": "alpha", "image": "busybox:1.37.0"}))
-      assert {:ok, ["alpha"]} = Dockd.install_packages(src, dest_dir: root)
+      assert {:ok, ["alpha"]} = Dockd.install_packages(root, src)
 
       assert [%{name: "alpha", path: path, spec: {:ok, spec}}] =
-               Dockd.list_packages(packages_path: root)
+               Dockd.list_packages(root)
 
       assert path === Path.join(root, "alpha")
       assert spec.image === "busybox:1.37.0"
     end
 
     test "returns [] when the packages root does not exist" do
-      assert Dockd.list_packages(packages_path: sandbox_dir("dockd-list-missing")) === []
+      assert Dockd.list_packages(sandbox_dir("dockd-list-missing")) === []
     end
   end
 
-  describe "Dockd.new_package/2" do
+  describe "Dockd.new_package/3" do
     test "writes package.json and Dockerfile into the given directory" do
       dir = Path.join(sandbox_dir("dockd-new-pkg"), "greeter")
 
-      assert {:ok, result} = Dockd.new_package(dir, from: "busybox:1.37.0")
+      assert {:ok, result} = Dockd.new_package(dir, "greeter", from: "busybox:1.37.0")
 
       assert result.instance_name === "greeter"
       assert result.path === dir
@@ -359,30 +326,32 @@ defmodule Dockd.PackagesTest do
 
     test "the generated package parses as a Spec" do
       dir = Path.join(sandbox_dir("dockd-new-parse"), "greeter")
-      assert {:ok, _} = Dockd.new_package(dir, image: "dockd-greeter:1")
+      assert {:ok, _} = Dockd.new_package(dir, "greeter", image: "dockd-greeter:1")
 
       root = Path.dirname(dir)
 
       assert [%{name: "greeter", spec: {:ok, spec}}] =
-               Dockd.list_packages(packages_path: root)
+               Dockd.list_packages(root)
 
       assert spec.image === "dockd-greeter:1"
-      assert spec.instance_name === "dockd-greeter"
+      assert spec.instance_name === "greeter"
       assert spec.build === %{dockerfile: Path.join(dir, "Dockerfile")}
     end
 
-    test "defaults the instance name to the directory basename" do
+    # The name used to default to the directory basename, which for a relative
+    # `dir` such as "." was really the calling process's working directory.
+    test "uses the instance name it is given, not the directory basename" do
       dir = Path.join(sandbox_dir("dockd-new-basename"), "webapp")
-      assert {:ok, %{instance_name: "webapp"}} = Dockd.new_package(dir)
+      assert {:ok, %{instance_name: "chosen"}} = Dockd.new_package(dir, "chosen")
 
       decoded = JSON.decode!(File.read!(Path.join(dir, "package.json")))
-      assert decoded["instance_name"] === "webapp"
-      assert decoded["image"] === "dockd-webapp:latest"
+      assert decoded["instance_name"] === "chosen"
+      assert decoded["image"] === "dockd-chosen:latest"
     end
 
     test "writes a package.json a human can edit" do
       dir = Path.join(sandbox_dir("dockd-new-pretty"), "greeter")
-      assert {:ok, _} = Dockd.new_package(dir)
+      assert {:ok, _} = Dockd.new_package(dir, "greeter")
 
       body = File.read!(Path.join(dir, "package.json"))
 
@@ -395,7 +364,7 @@ defmodule Dockd.PackagesTest do
       File.mkdir_p!(dir)
       File.write!(Path.join(dir, "keep.txt"), "mine")
 
-      assert {:error, err} = Dockd.new_package(dir)
+      assert {:error, err} = Dockd.new_package(dir, "greeter")
 
       assert err.phase === :generate
       assert err.message =~ "already exists"
@@ -408,7 +377,7 @@ defmodule Dockd.PackagesTest do
       File.mkdir_p!(dir)
       File.write!(Path.join(dir, "stale.txt"), "old")
 
-      assert {:ok, %{overwrote?: true}} = Dockd.new_package(dir, force: true)
+      assert {:ok, %{overwrote?: true}} = Dockd.new_package(dir, "greeter", force: true)
 
       refute File.exists?(Path.join(dir, "stale.txt"))
       assert File.exists?(Path.join(dir, "package.json"))
@@ -418,16 +387,16 @@ defmodule Dockd.PackagesTest do
       dir = Path.join(sandbox_dir("dockd-new-invalid"), "greeter")
 
       assert {:error, err} =
-               Dockd.new_package(dir, env: [{"FOO", value: "a", optional: true}])
+               Dockd.new_package(dir, "greeter", env: [{"FOO", value: "a", optional: true}])
 
       assert err.phase === :validate
       refute File.exists?(dir)
     end
 
     test "writes nothing when the instance name is unusable" do
-      dir = Path.join(sandbox_dir("dockd-new-badname"), "not a name")
+      dir = Path.join(sandbox_dir("dockd-new-badname"), "greeter")
 
-      assert {:error, err} = Dockd.new_package(dir)
+      assert {:error, err} = Dockd.new_package(dir, "not a name")
 
       assert err.phase === :validate
       refute File.exists?(dir)
@@ -509,9 +478,10 @@ defmodule Dockd.PackagesTest do
     File.write!(Path.join(dir, "package.json"), package_json)
   end
 
-  defp restore_app_env(nil), do: Application.delete_env(:dockd, :packages_path)
-  defp restore_app_env(value), do: Application.put_env(:dockd, :packages_path, value)
+  defp staging, do: sandbox_dir("dockd-staging")
 
-  defp restore_env(nil), do: System.delete_env("DOCKD_PACKAGES_PATH")
-  defp restore_env(value), do: System.put_env("DOCKD_PACKAGES_PATH", value)
+  # The library never discovers git; a test may, to know what to pass in.
+  defp git_path, do: System.find_executable("git")
+
+  defp git_env, do: %{"HOME" => System.user_home!()}
 end

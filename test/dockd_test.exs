@@ -11,24 +11,24 @@ defmodule DockdTest do
   describe "shell_command/2" do
     test "runs a string command and returns combined output with exit code" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert {:ok, %{output: "hello\n", exit_code: 0}} =
-               Dockd.shell_command(instance, "echo hello")
+               Dockd.shell_command(instance, "echo hello", endpoint())
     end
 
     test "runs an argv list verbatim and surfaces non-zero exit codes" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, ["true"])
+      assert {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, ["true"], endpoint())
 
       assert {:ok, %{exit_code: code}} =
-               Dockd.shell_command(instance, ["sh", "-c", "exit 3"])
+               Dockd.shell_command(instance, ["sh", "-c", "exit 3"], endpoint())
 
       assert code === 3
     end
@@ -37,11 +37,11 @@ defmodule DockdTest do
   describe "open_shell / shell_send / close_shell" do
     test "persistent shell preserves state between commands" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, shell} = Dockd.open_shell(instance)
+      assert {:ok, shell} = Dockd.open_shell(instance, endpoint())
       assert {:ok, {_, shell}} = Dockd.shell_send(shell, "cd /tmp")
       assert {:ok, {out, shell}} = Dockd.shell_send(shell, "pwd")
       assert String.contains?(out, "/tmp")
@@ -52,11 +52,11 @@ defmodule DockdTest do
       # "cat" echoes stdin verbatim, so a line sent comes straight back with no
       # shell evaluation — distinguishing it from a /bin/sh session.
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "cat", instance_name: unique_name())
+               create(@image, unique_name(), shell: "cat")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, shell} = Dockd.open_shell(instance)
+      assert {:ok, shell} = Dockd.open_shell(instance, endpoint())
       assert {:ok, {out, shell}} = Dockd.shell_send(shell, "ping123")
       assert String.contains?(out, "ping123")
       assert :ok = Dockd.close_shell(shell)
@@ -64,11 +64,11 @@ defmodule DockdTest do
 
     test "explicit shell opt overrides the configured program" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "cat", instance_name: unique_name())
+               create(@image, unique_name(), shell: "cat")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, shell} = Dockd.open_shell(instance, shell: ["/bin/sh"])
+      assert {:ok, shell} = Dockd.open_shell(instance, endpoint(), shell: ["/bin/sh"])
       assert {:ok, {_, shell}} = Dockd.shell_send(shell, "cd /tmp")
       assert {:ok, {out, shell}} = Dockd.shell_send(shell, "pwd")
       assert String.contains?(out, "/tmp")
@@ -79,9 +79,9 @@ defmodule DockdTest do
   describe "apply/2" do
     test "pulls an image and prepares a running container" do
       assert {:ok, %ApplyResult{instance: instance, step_results: step_results}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert is_binary(instance.id)
       assert String.starts_with?(instance.name, "dockd-")
@@ -94,16 +94,15 @@ defmodule DockdTest do
 
     test "runs setup steps in order and captures their results" do
       assert {:ok, %ApplyResult{instance: instance, step_results: step_results}} =
-               Dockd.apply(@image,
+               create(@image, unique_name(),
                  shell: "/bin/sh",
                  steps: [
                    %{step_name: "first", cmd: ["sh", "-lc", "echo first && touch /tmp/first"]},
                    %{step_name: "second", cmd: ["sh", "-lc", "echo second && ls /tmp/first"]}
-                 ],
-                 instance_name: unique_name()
+                 ]
                )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert Enum.map(step_results, & &1.step_name) === ["first", "second"]
       assert Enum.map(step_results, & &1.exit_code) === [0, 0]
@@ -113,17 +112,16 @@ defmodule DockdTest do
 
     test "returns the partial step_results and the instance when a setup step fails" do
       assert {:error, %Dockd.Error{} = error} =
-               Dockd.apply(@image,
+               create(@image, unique_name(),
                  shell: "/bin/sh",
                  steps: [
                    %{step_name: "first", cmd: ["sh", "-lc", "echo ok"]},
                    %{step_name: "fail", cmd: ["sh", "-lc", "echo nope && exit 7"]},
                    %{step_name: "never", cmd: ["sh", "-lc", "echo never"]}
-                 ],
-                 instance_name: unique_name()
+                 ]
                )
 
-      if error.instance, do: on_exit(fn -> Dockd.destroy(error.instance) end)
+      if error.instance, do: on_exit(fn -> Dockd.destroy(error.instance, endpoint()) end)
 
       assert error.phase === :setup
       assert error.exit_code === 7
@@ -134,13 +132,10 @@ defmodule DockdTest do
     end
 
     test "names the replacement when a step still uses the old :label key" do
-      spec =
-        Dockd.Spec.from_opts(@image,
-          instance_name: unique_name(),
-          steps: [%{label: "old", cmd: ["true"]}]
-        )
+      {:ok, spec} =
+        Dockd.Spec.new(@image, unique_name(), steps: [%{label: "old", cmd: ["true"]}])
 
-      assert {:error, error} = Dockd.apply(spec)
+      assert {:error, error} = Dockd.apply(spec, endpoint(), true, %{}, temp_root())
 
       assert error.phase === :validate
       assert error.message =~ ":label, which was renamed to :step_name"
@@ -155,13 +150,9 @@ defmodule DockdTest do
       tag = "dockd-test:dockerfile-#{System.unique_integer([:positive])}"
 
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(tag,
-                 shell: "/bin/sh",
-                 build: %{dockerfile: @dockerfile},
-                 instance_name: unique_name()
-               )
+               create(tag, unique_name(), shell: "/bin/sh", build: %{dockerfile: @dockerfile})
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert is_binary(instance.id)
       assert instance.image === tag
@@ -173,20 +164,19 @@ defmodule DockdTest do
       args_dockerfile = Path.join(@fixtures_dir, "Dockerfile.args")
 
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(tag,
+               create(tag, unique_name(),
                  shell: "/bin/sh",
                  build: %{
                    dockerfile: args_dockerfile,
                    context: @fixtures_dir,
                    args: %{"GREETING" => "hi-from-args"}
-                 },
-                 instance_name: unique_name()
+                 }
                )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert {:ok, %{output: output, exit_code: 0}} =
-               Dockd.shell_command(instance, "cat /tmp/greeting.txt")
+               Dockd.shell_command(instance, "cat /tmp/greeting.txt", endpoint())
 
       assert String.trim(output) === "hi-from-args"
     end
@@ -195,13 +185,12 @@ defmodule DockdTest do
       tag = "dockd-test:labels-#{System.unique_integer([:positive])}"
 
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(tag,
+               create(tag, unique_name(),
                  shell: "/bin/sh",
-                 build: %{dockerfile: @dockerfile, labels: %{"org.test" => "yes"}},
-                 instance_name: unique_name()
+                 build: %{dockerfile: @dockerfile, labels: %{"org.test" => "yes"}}
                )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert instance.image === tag
     end
@@ -210,13 +199,9 @@ defmodule DockdTest do
       tag = "dockd-test:dir-#{System.unique_integer([:positive])}"
 
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(tag,
-                 shell: "/bin/sh",
-                 build: %{dockerfile: @fixtures_dir},
-                 instance_name: unique_name()
-               )
+               create(tag, unique_name(), shell: "/bin/sh", build: %{dockerfile: @fixtures_dir})
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert is_binary(instance.id)
       assert Docker.container_running?(instance.id)
@@ -226,13 +211,12 @@ defmodule DockdTest do
       tag = "dockd-test:ctx-#{System.unique_integer([:positive])}"
 
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(tag,
+               create(tag, unique_name(),
                  shell: "/bin/sh",
-                 build: %{dockerfile: @dockerfile, context: @fixtures_dir},
-                 instance_name: unique_name()
+                 build: %{dockerfile: @dockerfile, context: @fixtures_dir}
                )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert is_binary(instance.id)
       assert Docker.container_running?(instance.id)
@@ -242,16 +226,13 @@ defmodule DockdTest do
       tag = "dockd-test:steps-#{System.unique_integer([:positive])}"
 
       assert {:ok, %ApplyResult{instance: instance, step_results: step_results}} =
-               Dockd.apply(tag,
+               create(tag, unique_name(),
                  shell: "/bin/sh",
                  build: %{dockerfile: @dockerfile},
-                 steps: [
-                   %{step_name: "check built file", cmd: ["cat", "/tmp/built.txt"]}
-                 ],
-                 instance_name: unique_name()
+                 steps: [%{step_name: "check built file", cmd: ["cat", "/tmp/built.txt"]}]
                )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert [%{step_name: "check built file", exit_code: 0, output: output}] = step_results
 
@@ -260,9 +241,8 @@ defmodule DockdTest do
 
     test "returns an error when the dockerfile path does not exist" do
       assert {:error, %Dockd.Error{} = error} =
-               Dockd.apply("nope:latest",
-                 build: %{dockerfile: "/nonexistent/Dockerfile"},
-                 instance_name: unique_name()
+               create("nope:latest", unique_name(),
+                 build: %{dockerfile: "/nonexistent/Dockerfile"}
                )
 
       assert error.phase === :validate
@@ -271,10 +251,7 @@ defmodule DockdTest do
 
     test "returns an error when directory has no Dockerfile" do
       assert {:error, %Dockd.Error{} = error} =
-               Dockd.apply("nope:latest",
-                 build: %{dockerfile: System.tmp_dir!()},
-                 instance_name: unique_name()
-               )
+               create("nope:latest", unique_name(), build: %{dockerfile: System.tmp_dir!()})
 
       assert error.phase === :validate
       assert error.message =~ "no Dockerfile found"
@@ -282,7 +259,7 @@ defmodule DockdTest do
 
     test "returns an error when :build is missing :dockerfile" do
       assert {:error, %Dockd.Error{} = error} =
-               Dockd.apply("nope:latest", build: %{nocache: true}, instance_name: unique_name())
+               create("nope:latest", unique_name(), build: %{nocache: true})
 
       assert error.phase === :validate
       assert error.message =~ ":build map must include a :dockerfile"
@@ -292,13 +269,9 @@ defmodule DockdTest do
       tag = "dockd-test:shell-cmd-#{System.unique_integer([:positive])}"
 
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(tag,
-                 build: %{dockerfile: @dockerfile},
-                 shell: "/bin/sh",
-                 instance_name: unique_name()
-               )
+               create(tag, unique_name(), build: %{dockerfile: @dockerfile}, shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert {:ok, body} = Docker.find_container(instance.id)
       assert body["Config"]["Cmd"] === ["/bin/sh"]
@@ -310,33 +283,35 @@ defmodule DockdTest do
   describe "destroy/1" do
     test "stops and removes an applied container" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      assert :ok = Dockd.destroy(instance)
+      assert :ok = Dockd.destroy(instance, endpoint())
       refute Docker.container_running?(instance.id)
       assert {:error, %{status: 404}} = Docker.find_container(instance.id)
     end
 
     test "accepts a name string and is idempotent on a missing container" do
       assert :ok =
-               Dockd.destroy("definitely-not-an-instance-#{System.unique_integer([:positive])}")
+               Dockd.destroy(
+                 "definitely-not-an-instance-#{System.unique_integer([:positive])}",
+                 endpoint()
+               )
     end
   end
 
   describe "list/1 and get/2 — Docker as source of truth" do
     test "list/0 discovers every applied instance; get/1 round-trips by name" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image,
-                 shell: "/bin/sh",
-                 instance_name: "list-roundtrip-#{System.unique_integer([:positive])}"
+               create(@image, "list-roundtrip-#{System.unique_integer([:positive])}",
+                 shell: "/bin/sh"
                )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, instances} = Dockd.list()
+      assert {:ok, instances} = Dockd.list(endpoint())
       assert Enum.any?(instances, fn i -> i.id === instance.id end)
 
-      assert {:ok, %Instance{} = hydrated} = Dockd.get(instance.name)
+      assert {:ok, %Instance{} = hydrated} = Dockd.get(instance.name, endpoint())
       assert hydrated.id === instance.id
       assert hydrated.name === instance.name
       assert hydrated.image === @image
@@ -358,16 +333,13 @@ defmodule DockdTest do
       File.write!(src, "world")
 
       assert {:ok, %ApplyResult{instance: instance, step_results: step_results}} =
-               Dockd.apply(@image,
+               create(@image, unique_name(),
                  shell: "/bin/sh",
                  copy: [%{src: src, dest: "/etc/app/hello.txt"}],
-                 steps: [
-                   %{step_name: "read", cmd: ["cat", "/etc/app/hello.txt"]}
-                 ],
-                 instance_name: unique_name()
+                 steps: [%{step_name: "read", cmd: ["cat", "/etc/app/hello.txt"]}]
                )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert hd(step_results).output === "world"
     end
@@ -383,76 +355,54 @@ defmodule DockdTest do
       File.write!(src, "shh")
 
       assert {:ok, %ApplyResult{instance: instance, step_results: step_results}} =
-               Dockd.apply(@image,
+               create(@image, unique_name(),
                  shell: "/bin/sh",
                  copy: [%{src: src, dest: "/root/secret", mode: "0600"}],
-                 steps: [
-                   %{step_name: "stat", cmd: ["sh", "-lc", "stat -c '%a' /root/secret"]}
-                 ],
-                 instance_name: unique_name()
+                 steps: [%{step_name: "stat", cmd: ["sh", "-lc", "stat -c '%a' /root/secret"]}]
                )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert String.trim(hd(step_results).output) === "600"
     end
 
     test "errors with :validate when :dest is not absolute" do
       assert {:error, %Dockd.Error{phase: :validate, message: msg}} =
-               Dockd.apply(@image,
-                 copy: [%{src: "/tmp/x", dest: "relative/path"}],
-                 instance_name: unique_name()
-               )
+               create(@image, unique_name(), copy: [%{src: "/tmp/x", dest: "relative/path"}])
 
       assert msg =~ "must be an absolute path"
     end
 
     test "errors with :copy when :src does not exist" do
       assert {:error, %Dockd.Error{phase: :copy, message: msg} = error} =
-               Dockd.apply(@image,
+               create(@image, unique_name(),
                  shell: "/bin/sh",
-                 copy: [%{src: "/does/not/exist", dest: "/tmp/missing"}],
-                 instance_name: unique_name()
+                 copy: [%{src: "/does/not/exist", dest: "/tmp/missing"}]
                )
 
-      if error.instance, do: on_exit(fn -> Dockd.destroy(error.instance) end)
+      if error.instance, do: on_exit(fn -> Dockd.destroy(error.instance, endpoint()) end)
       assert msg =~ "copy source does not exist"
     end
   end
 
-  describe "apply/2 with :disk_mount_enabled" do
-    # Use a path that exists locally so validate_source/1 short-circuits with a
-    # :validate error after enforce_disk_mount_policy/1 has already emitted its
-    # logs - exercising the policy without needing a Docker daemon.
+  describe "disk_mount_enabled policy" do
+    # Uses a path that exists locally so validate_source/1 short-circuits with a
+    # :validate error after enforce_disk_mount_policy/2 has already emitted its
+    # logs — exercising the policy without needing a Docker daemon.
     @local_image "."
 
-    test "default leaves host-exposing options intact and emits no strip log" do
+    test "true leaves host-exposing options intact and emits no strip log" do
       log =
         capture_log(fn ->
           assert {:error, %Dockd.Error{phase: :validate, message: msg}} =
-                   Dockd.apply(@local_image,
+                   create_with(@local_image, true,
                      mounts: ["/h:/c"],
                      repos: [%{url: "https://example.invalid/r", dest: "/r"}],
                      copy: [%{src: "/tmp", dest: "/d"}],
-                     env: ["LITERAL=value"],
-                     instance_name: unique_name()
+                     env: ["LITERAL=value"]
                    )
 
           assert msg =~ "local image paths"
-        end)
-
-      refute log =~ "disk_mount_enabled=false"
-    end
-
-    test "true is equivalent to default" do
-      log =
-        capture_log(fn ->
-          assert {:error, %Dockd.Error{phase: :validate}} =
-                   Dockd.apply(@local_image,
-                     disk_mount_enabled: true,
-                     mounts: ["/h:/c"],
-                     instance_name: unique_name()
-                   )
         end)
 
       refute log =~ "disk_mount_enabled=false"
@@ -462,11 +412,7 @@ defmodule DockdTest do
       log =
         capture_log(fn ->
           assert {:error, %Dockd.Error{phase: :validate}} =
-                   Dockd.apply(@local_image,
-                     disk_mount_enabled: false,
-                     mounts: ["/h:/c"],
-                     instance_name: unique_name()
-                   )
+                   create_with(@local_image, false, mounts: ["/h:/c"])
         end)
 
       assert log =~ "disk_mount_enabled=false stripped :mounts"
@@ -477,11 +423,9 @@ defmodule DockdTest do
       log =
         capture_log(fn ->
           assert {:error, %Dockd.Error{phase: :validate}} =
-                   Dockd.apply(@local_image,
-                     disk_mount_enabled: false,
+                   create_with(@local_image, false,
                      repos: [%{url: "https://example.invalid/r", dest: "/r"}],
-                     copy: [%{src: "/tmp", dest: "/d"}],
-                     instance_name: unique_name()
+                     copy: [%{src: "/tmp", dest: "/d"}]
                    )
         end)
 
@@ -493,10 +437,8 @@ defmodule DockdTest do
       log =
         capture_log(fn ->
           assert {:error, %Dockd.Error{phase: :validate}} =
-                   Dockd.apply(@local_image,
-                     disk_mount_enabled: false,
-                     env: ["FOO", "BAR=baz", {"QUX", default: "x"}],
-                     instance_name: unique_name()
+                   create_with(@local_image, false,
+                     env: ["FOO", "BAR=baz", {"QUX", default: "x"}]
                    )
         end)
 
@@ -509,11 +451,7 @@ defmodule DockdTest do
       log =
         capture_log(fn ->
           assert {:error, %Dockd.Error{phase: :validate}} =
-                   Dockd.apply(@local_image,
-                     disk_mount_enabled: false,
-                     env: ["LITERAL=value"],
-                     instance_name: unique_name()
-                   )
+                   create_with(@local_image, false, env: ["LITERAL=value"])
         end)
 
       refute log =~ "disk_mount_enabled=false"
@@ -523,45 +461,39 @@ defmodule DockdTest do
       log =
         capture_log(fn ->
           assert {:error, %Dockd.Error{phase: :validate}} =
-                   Dockd.apply(@local_image,
-                     disk_mount_enabled: false,
-                     mounts: [],
-                     repos: [],
-                     copy: [],
-                     instance_name: unique_name()
-                   )
+                   create_with(@local_image, false, mounts: [], repos: [], copy: [])
         end)
 
       refute log =~ "disk_mount_enabled=false"
     end
 
-    test "non-boolean :disk_mount_enabled is rejected at :validate" do
-      assert {:error, %Dockd.Error{phase: :validate, message: msg}} =
-               Dockd.apply(@local_image, disk_mount_enabled: "yes", instance_name: unique_name())
+    # There is no clause that accepts a non-boolean, and in particular none that
+    # reads an absent value as permission to expose the host.
+    test "a non-boolean disk_mount_enabled is rejected at :validate" do
+      for bad <- ["yes", nil, 1] do
+        assert {:error, %Dockd.Error{phase: :validate, message: msg}} =
+                 create_with(@local_image, bad, [])
 
-      assert msg =~ ":disk_mount_enabled must be a boolean"
+        assert msg =~ "disk_mount_enabled must be a boolean"
+      end
     end
   end
 
   describe "apply/2 with :repos" do
     test "clones a repo on the host and uploads it into the container" do
       assert {:ok, %ApplyResult{instance: instance, step_results: step_results}} =
-               Dockd.apply(@image,
+               create(@image, unique_name(),
                  shell: "/bin/sh",
                  repos: [
-                   %{
-                     url: "https://github.com/octocat/Hello-World.git",
-                     dest: "/instance/hello"
-                   }
+                   %{url: "https://github.com/octocat/Hello-World.git", dest: "/instance/hello"}
                  ],
                  steps: [
                    %{step_name: "ls", cmd: ["ls", "/instance/hello"]},
                    %{step_name: "no-git", cmd: ["sh", "-lc", "[ ! -d /instance/hello/.git ]"]}
-                 ],
-                 instance_name: unique_name()
+                 ]
                )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert Enum.map(step_results, & &1.exit_code) === [0, 0]
       assert hd(step_results).output =~ "README"
@@ -569,16 +501,15 @@ defmodule DockdTest do
 
     test "errors with :validate when :url is missing" do
       assert {:error, %Dockd.Error{phase: :validate, message: msg}} =
-               Dockd.apply(@image, repos: [%{dest: "/instance/x"}], instance_name: unique_name())
+               create(@image, unique_name(), repos: [%{dest: "/instance/x"}])
 
       assert msg =~ "must include a non-empty :url"
     end
 
     test "errors with :validate when :dest is not absolute" do
       assert {:error, %Dockd.Error{phase: :validate, message: msg}} =
-               Dockd.apply(@image,
-                 repos: [%{url: "https://github.com/foo/bar", dest: "rel"}],
-                 instance_name: unique_name()
+               create(@image, unique_name(),
+                 repos: [%{url: "https://github.com/foo/bar", dest: "rel"}]
                )
 
       assert msg =~ "must be an absolute path"
@@ -588,72 +519,72 @@ defmodule DockdTest do
   describe "start/2, stop/2, running?/2" do
     test "stop transitions a running instance to stopped; start brings it back" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, true} = Dockd.running?(instance)
+      assert {:ok, true} = Dockd.running?(instance, endpoint())
       assert Docker.container_running?(instance.id)
 
-      assert :ok = Dockd.stop(instance)
-      assert {:ok, false} = Dockd.running?(instance)
+      assert :ok = Dockd.stop(instance, endpoint())
+      assert {:ok, false} = Dockd.running?(instance, endpoint())
       refute Docker.container_running?(instance.id)
 
-      assert :ok = Dockd.start(instance)
-      assert {:ok, true} = Dockd.running?(instance)
+      assert :ok = Dockd.start(instance, endpoint())
+      assert {:ok, true} = Dockd.running?(instance, endpoint())
       assert Docker.container_running?(instance.id)
     end
 
     test "start on an already-running instance is :ok" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert :ok = Dockd.start(instance)
-      assert {:ok, true} = Dockd.running?(instance)
+      assert :ok = Dockd.start(instance, endpoint())
+      assert {:ok, true} = Dockd.running?(instance, endpoint())
     end
 
     test "stop on an already-stopped instance is :ok" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert :ok = Dockd.stop(instance)
-      assert :ok = Dockd.stop(instance)
-      assert {:ok, false} = Dockd.running?(instance)
+      assert :ok = Dockd.stop(instance, endpoint())
+      assert :ok = Dockd.stop(instance, endpoint())
+      assert {:ok, false} = Dockd.running?(instance, endpoint())
     end
 
     test "accepts a short name as well as a struct" do
       name = "lifecycle-name-#{System.unique_integer([:positive])}"
 
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: name)
+               create(@image, name, shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert :ok = Dockd.stop(name)
-      assert {:ok, false} = Dockd.running?(name)
-      assert :ok = Dockd.start(name)
-      assert {:ok, true} = Dockd.running?(name)
+      assert :ok = Dockd.stop(name, endpoint())
+      assert {:ok, false} = Dockd.running?(name, endpoint())
+      assert :ok = Dockd.start(name, endpoint())
+      assert {:ok, true} = Dockd.running?(name, endpoint())
     end
   end
 
   describe "restart/2" do
     test "stops then starts; container ends up running with a fresh StartedAt" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, before} = Dockd.inspect(instance)
+      assert {:ok, before} = Dockd.inspect(instance, endpoint())
       started_before = get_in(before, ["State", "StartedAt"])
 
-      assert :ok = Dockd.restart(instance)
-      assert {:ok, true} = Dockd.running?(instance)
+      assert :ok = Dockd.restart(instance, endpoint())
+      assert {:ok, true} = Dockd.running?(instance, endpoint())
 
-      assert {:ok, after_} = Dockd.inspect(instance)
+      assert {:ok, after_} = Dockd.inspect(instance, endpoint())
       started_after = get_in(after_, ["State", "StartedAt"])
 
       assert is_binary(started_before)
@@ -665,31 +596,31 @@ defmodule DockdTest do
   describe "logs/2" do
     test "returns the container log binary; :tail and :timestamps pass through" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, logs} = Dockd.logs(instance)
+      assert {:ok, logs} = Dockd.logs(instance, endpoint())
       assert is_binary(logs)
 
-      assert {:ok, tailed} = Dockd.logs(instance, tail: 1, timestamps: true)
+      assert {:ok, tailed} = Dockd.logs(instance, endpoint(), tail: 1, timestamps: true)
       assert is_binary(tailed)
     end
 
     test "wraps a missing container as an error" do
       assert {:error, _} =
-               Dockd.logs("definitely-missing-#{System.unique_integer([:positive])}")
+               Dockd.logs("definitely-missing-#{System.unique_integer([:positive])}", endpoint())
     end
   end
 
   describe "inspect/2" do
     test "returns the raw Docker inspect payload" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, body} = Dockd.inspect(instance)
+      assert {:ok, body} = Dockd.inspect(instance, endpoint())
       assert body["Id"] === instance.id
       assert is_map(body["State"])
       assert is_map(body["NetworkSettings"])
@@ -698,21 +629,24 @@ defmodule DockdTest do
 
     test "wraps a missing container as a :discover error" do
       assert {:error, %Dockd.Error{phase: :discover}} =
-               Dockd.inspect("definitely-missing-#{System.unique_integer([:positive])}")
+               Dockd.inspect(
+                 "definitely-missing-#{System.unique_integer([:positive])}",
+                 endpoint()
+               )
     end
   end
 
   describe "refresh/2" do
     test "returns a fresh Instance with current :running? after a stop" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert instance.running? === true
-      assert :ok = Dockd.stop(instance)
+      assert :ok = Dockd.stop(instance, endpoint())
 
-      assert {:ok, %Instance{} = fresh} = Dockd.refresh(instance)
+      assert {:ok, %Instance{} = fresh} = Dockd.refresh(instance, endpoint())
       assert fresh.id === instance.id
       assert fresh.running? === false
       assert instance.running? === true
@@ -722,11 +656,11 @@ defmodule DockdTest do
       name = "refresh-name-#{System.unique_integer([:positive])}"
 
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: name)
+               create(@image, name, shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert {:ok, %Instance{} = fresh} = Dockd.refresh(name)
+      assert {:ok, %Instance{} = fresh} = Dockd.refresh(name, endpoint())
       assert fresh.id === instance.id
     end
   end
@@ -743,58 +677,97 @@ defmodule DockdTest do
       File.write!(src, "from-copy-to")
 
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
-      assert :ok = Dockd.copy_to(instance, [%{src: src, dest: "/tmp/greet.txt"}])
+      assert :ok =
+               Dockd.copy_to(
+                 instance,
+                 [%{src: src, dest: "/tmp/greet.txt"}],
+                 temp_root(),
+                 endpoint(),
+                 tool_opts()
+               )
 
       assert {:ok, %{output: output, exit_code: 0}} =
-               Dockd.shell_command(instance, "cat /tmp/greet.txt")
+               Dockd.shell_command(instance, "cat /tmp/greet.txt", endpoint())
 
       assert output =~ "from-copy-to"
     end
 
     test "surfaces a copy-phase error for a missing source" do
       assert {:ok, %ApplyResult{instance: instance}} =
-               Dockd.apply(@image, shell: "/bin/sh", instance_name: unique_name())
+               create(@image, unique_name(), shell: "/bin/sh")
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert {:error, %Dockd.Error{phase: :copy}} =
-               Dockd.copy_to(instance, [%{src: "/tmp/dockd-nope", dest: "/tmp/x"}])
+               Dockd.copy_to(
+                 instance,
+                 [%{src: "/tmp/dockd-nope", dest: "/tmp/x"}],
+                 temp_root(),
+                 endpoint(),
+                 tool_opts()
+               )
     end
   end
 
   describe "list_temp_files/1, delete_temp_files/1, info/1" do
-    test "delete_temp_files clears the staging directory and info reports zero under :temp_files" do
-      assert :ok = Dockd.delete_temp_files()
-      assert {:ok, []} = Dockd.list_temp_files()
+    test "delete_temp_files clears the named root and info then reports zero" do
+      root = scaffold_dir()
+      File.mkdir_p!(Path.join(root, "dockd-copy-1"))
+      File.write!(Path.join([root, "dockd-copy-1", "staged"]), "leftover")
 
-      assert {:ok, %{temp_files: temp_files}} = Dockd.info()
+      assert {:ok, [_]} = Dockd.list_temp_files(root)
+
+      assert :ok = Dockd.delete_temp_files(root)
+      assert {:ok, []} = Dockd.list_temp_files(root)
+
+      assert {:ok, %{temp_files: temp_files}} = Dockd.info(root)
       assert temp_files.count === 0
       assert temp_files.total_bytes === 0
       assert temp_files.oldest_at === nil
       assert temp_files.newest_at === nil
+
+      # The root itself survives a sweep of its children.
+      assert File.dir?(root)
+    end
+
+    # This deletes recursively, so a root the caller never named is refused.
+    test "refuses a root that would sweep too much" do
+      assert {:error, %Dockd.Error{}} = Dockd.delete_temp_files("/")
+      assert {:error, %Dockd.Error{}} = Dockd.delete_temp_files("")
+      assert {:error, %Dockd.Error{}} = Dockd.delete_temp_files("relative/dir")
     end
   end
 
-  describe "new_package/2 end to end" do
+  describe "new_package/3 end to end" do
     test "a scaffolded package can be applied directly" do
       root = scaffold_dir()
       pkg = Path.join(root, unique_name("greeter"))
 
       assert {:ok, _} =
-               Dockd.new_package(pkg,
+               Dockd.new_package(pkg, Path.basename(pkg),
                  image: "dockd-scaffold-test:#{System.unique_integer([:positive])}",
                  from: @image,
                  shell: "/bin/sh"
                )
 
-      assert {:ok, %ApplyResult{instance: instance}} = Dockd.apply_package(pkg)
-      on_exit(fn -> Dockd.destroy(instance) end)
+      assert {:ok, %ApplyResult{instance: instance}} =
+               Dockd.apply_package(
+                 Path.dirname(pkg),
+                 pkg,
+                 endpoint(),
+                 true,
+                 host_env(),
+                 temp_root(),
+                 tool_opts()
+               )
 
-      assert {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, ["true"])
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
+
+      assert {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, ["true"], endpoint())
     end
 
     test "a scaffolded package set installs and applies by name" do
@@ -803,27 +776,109 @@ defmodule DockdTest do
       name = unique_name("greeter")
 
       assert {:ok, _} =
-               Dockd.new_package(Path.join([root, "src", "packages", name]),
+               Dockd.new_package(Path.join([root, "src", "packages", name]), name,
                  image: "dockd-scaffold-set:#{System.unique_integer([:positive])}",
                  dockerfile: "FROM #{@image}\nRUN echo scaffolded > /etc/greeting\n",
                  shell: "/bin/sh",
                  steps: [%{step_name: "verify", cmd: ["sh", "-c", "test -f /etc/greeting"]}]
                )
 
-      assert {:ok, [^name]} = Dockd.install_packages(Path.join(root, "src"), dest_dir: dest)
+      assert {:ok, [^name]} = Dockd.install_packages(dest, Path.join(root, "src"))
 
       assert {:ok, %ApplyResult{instance: instance, step_results: step_results}} =
-               Dockd.apply_package(name, packages_path: dest)
+               Dockd.apply_package(
+                 dest,
+                 name,
+                 endpoint(),
+                 true,
+                 host_env(),
+                 temp_root(),
+                 tool_opts()
+               )
 
-      on_exit(fn -> Dockd.destroy(instance) end)
+      on_exit(fn -> Dockd.destroy(instance, endpoint()) end)
 
       assert Enum.map(step_results, & &1.step_name) === ["verify"]
 
       assert {:ok, %{output: output, exit_code: 0}} =
-               Dockd.shell_command(instance, "cat /etc/greeting")
+               Dockd.shell_command(instance, "cat /etc/greeting", endpoint())
 
       assert String.trim(output) === "scaffolded"
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  #
+  # dockd itself reads nothing from the environment, so the suite has to decide
+  # what to pass. A test *may* discover these — that is the point of the change:
+  # the choice is visible here rather than buried in the library.
+  # ---------------------------------------------------------------------------
+
+  defp endpoint do
+    System.get_env("DOCKD_TEST_ENDPOINT") || "unix:///var/run/docker.sock"
+  end
+
+  defp temp_root, do: System.tmp_dir!()
+
+  defp git_path, do: System.find_executable("git")
+
+  defp tar_path, do: System.find_executable("tar")
+
+  # Host tooling is passed on every call so any spec with :repos or :copy works.
+  defp tool_opts do
+    [
+      git_path: git_path(),
+      git_env: %{"HOME" => System.user_home!()},
+      tar_path: tar_path(),
+      tar_env: %{},
+      tar_extra_args: tar_extra_args()
+    ]
+  end
+
+  # BSD tar needs these to avoid embedding macOS metadata; GNU tar rejects them.
+  # The library no longer guesses from :os.type(), so the caller decides.
+  defp tar_extra_args do
+    case System.cmd(tar_path(), ["--version"], stderr_to_stdout: true) do
+      {out, 0} -> if String.contains?(out, "bsdtar"), do: bsd_tar_args(), else: []
+      _ -> []
+    end
+  end
+
+  defp bsd_tar_args, do: ["--no-xattrs", "--no-acls", "--no-mac-metadata"]
+
+  defp create(image, instance_name, opts) do
+    create_with(image, instance_name, true, opts)
+  end
+
+  # Arity-3 form used by the disk-mount tests, where the policy is the variable
+  # under test and the name does not matter.
+  defp create_with(image, disk_mount_enabled, opts) when is_list(opts) do
+    create_with(image, unique_name(), disk_mount_enabled, opts)
+  end
+
+  defp create_with(image, instance_name, disk_mount_enabled, opts) do
+    Dockd.apply_image(
+      image,
+      instance_name,
+      endpoint(),
+      disk_mount_enabled,
+      host_env(),
+      temp_root(),
+      Keyword.merge(tool_opts(), opts)
+    )
+  end
+
+  # An explicit slice of the host environment, rather than all of it.
+  defp host_env do
+    ~w(HOME PATH USER)
+    |> Enum.flat_map(fn name ->
+      case System.fetch_env(name) do
+        {:ok, value} -> [{name, value}]
+        :error -> []
+      end
+    end)
+    |> Map.new()
   end
 
   defp unique_name(prefix \\ "test") do

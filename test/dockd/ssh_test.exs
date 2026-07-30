@@ -34,11 +34,9 @@ defmodule Dockd.SshTest do
   end
 
   describe "resolve_source/1" do
-    test "nil with no cwd file resolves to the bundled template", %{tmp: tmp} do
-      File.cd!(tmp, fn ->
-        assert {:ok, {:default, desc}} = Dockd.Ssh.resolve_source(nil)
-        assert desc =~ "bundled"
-      end)
+    test ":default resolves to the bundled template" do
+      assert {:ok, {:default, desc}} = Dockd.Ssh.resolve_source(:default)
+      assert desc =~ "bundled"
     end
 
     test "explicit existing path is used verbatim", %{tmp: tmp} do
@@ -50,6 +48,18 @@ defmodule Dockd.SshTest do
     test "explicit missing path errors" do
       assert {:error, msg} = Dockd.Ssh.resolve_source("/no/such/file.sh")
       assert msg =~ "does not exist"
+    end
+
+    # An earlier version accepted nil and preferred ./docker_dial_stdio_script.sh
+    # from the CWD, so the same call installed a different script depending on
+    # where it ran. A relative path is refused for the same reason.
+    test "refuses a relative path rather than resolving it against the cwd", %{tmp: tmp} do
+      File.write!(Path.join(tmp, "my_script.sh"), "#!/bin/sh\n")
+
+      File.cd!(tmp, fn ->
+        assert {:error, msg} = Dockd.Ssh.resolve_source("my_script.sh")
+        assert msg =~ "must be absolute"
+      end)
     end
   end
 end

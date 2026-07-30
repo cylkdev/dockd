@@ -64,7 +64,7 @@ defmodule Dockd.InstanceTest do
 
   describe "managed_labels/1" do
     test "produces the discovery marker and short instance name" do
-      spec = Spec.from_opts("busybox:latest", instance_name: "my-box")
+      {:ok, spec} = Spec.new("busybox:latest", "my-box")
       labels = Instance.managed_labels(spec)
 
       assert labels["org.dockd.instance"] === "true"

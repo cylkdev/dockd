@@ -46,12 +46,6 @@ defmodule Dockd.Spec.ParserTest do
       assert error.message =~ "unknown package key"
     end
 
-    test "errors when instance_name is missing" do
-      assert {:error, error} = Parser.parse(~s({"image": "x"}))
-      assert error.phase === :validate
-      assert error.message =~ ~s(non-empty string "instance_name")
-    end
-
     test "names the replacement when a package still uses the old \"name\" key" do
       assert {:error, error} = Parser.parse(~s({"name": "demo", "image": "x"}))
       assert error.phase === :validate
@@ -66,36 +60,12 @@ defmodule Dockd.Spec.ParserTest do
       assert decoded["env"] === [%{"name" => "FOO", "optional" => true}]
     end
 
-    test "errors when instance_name is empty" do
-      assert {:error, error} = Parser.parse(~s({"instance_name": "", "image": "x"}))
-      assert error.phase === :validate
-      assert error.message =~ ~s(non-empty string "instance_name")
-    end
-
-    test "errors when instance_name is not a string" do
-      assert {:error, error} = Parser.parse(~s({"instance_name": 42, "image": "x"}))
-      assert error.phase === :validate
-      assert error.message =~ ~s(non-empty string "instance_name")
-    end
-
     test "errors when description is not a string" do
       json = ~s({"instance_name": "demo", "description": 7, "image": "x"})
 
       assert {:error, error} = Parser.parse(json)
       assert error.phase === :validate
       assert error.message =~ ~s("description" must be a string)
-    end
-
-    test "errors when image is missing" do
-      assert {:error, error} = Parser.parse(~s({"instance_name": "demo", "shell": "/bin/sh"}))
-      assert error.phase === :validate
-      assert error.message =~ ~s(missing required key: "image")
-    end
-
-    test "errors when image is not a string" do
-      assert {:error, error} = Parser.parse(~s({"instance_name": "demo", "image": 42}))
-      assert error.phase === :validate
-      assert error.message =~ ~s("image" must be a string)
     end
   end
 
@@ -114,6 +84,70 @@ defmodule Dockd.Spec.ParserTest do
       assert {:error, error} = Parser.parse_file("/no/such/file.json")
       assert error.phase === :validate
       assert error.message =~ "could not read file"
+    end
+
+    # Presence and usability of "image" / "instance_name" are semantic, not
+    # structural, so they belong to Dockd.Spec.validate/1 — one rule, one place,
+    # one error shape for every construction path. Parser deliberately accepts
+    # these documents; the load path is what rejects them (see the describe
+    # below).
+    test "accepts a document missing image or instance_name — that is Spec's rule" do
+      assert {:ok, _} = Parser.parse(~s({"image": "x"}))
+      assert {:ok, _} = Parser.parse(~s({"instance_name": "demo", "shell": "/bin/sh"}))
+      assert {:ok, _} = Parser.parse(~s({"instance_name": "", "image": "x"}))
+    end
+  end
+
+  # Where those rules actually live now: the whole read path, which is what a
+  # caller of Dockd.apply_package/7 goes through.
+  describe "the load path rejects what Parser passes through" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "dockd-parser-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(dir, "pkg"))
+      on_exit(fn -> File.rm_rf!(dir) end)
+      {:ok, root: dir}
+    end
+
+    test "a missing instance_name", %{root: root} do
+      write(root, ~s({"image": "x"}))
+
+      assert {:error, error} = Dockd.load_package_spec(root, "pkg", %{})
+      assert error.phase === :validate
+      assert error.message =~ "non-empty binary :instance_name"
+    end
+
+    test "an empty or non-string instance_name", %{root: root} do
+      for bad <- [~s(""), "42"] do
+        write(root, ~s({"instance_name": #{bad}, "image": "x"}))
+
+        assert {:error, error} = Dockd.load_package_spec(root, "pkg", %{})
+        assert error.message =~ "non-empty binary :instance_name"
+      end
+    end
+
+    test "a missing or non-string image", %{root: root} do
+      for doc <- [
+            ~s({"instance_name": "demo", "shell": "/bin/sh"}),
+            ~s({"instance_name": "demo", "image": 42})
+          ] do
+        write(root, doc)
+
+        assert {:error, error} = Dockd.load_package_spec(root, "pkg", %{})
+        assert error.message =~ "non-empty binary :image"
+      end
+    end
+
+    # The file path is added at the boundary, so an error names the package that
+    # caused it even though the rule itself lives in Dockd.Spec.
+    test "names the offending file in the message", %{root: root} do
+      write(root, ~s({"image": "x"}))
+
+      assert {:error, error} = Dockd.load_package_spec(root, "pkg", %{})
+      assert error.message =~ Path.join([root, "pkg", "package.json"])
+    end
+
+    defp write(root, body) do
+      File.write!(Path.join([root, "pkg", "package.json"]), body)
     end
   end
 end

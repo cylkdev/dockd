@@ -12,6 +12,7 @@ defmodule Dockd.Spec.Encoder do
   """
 
   alias Dockd.Error
+  alias Dockd.Spec
 
   # Preferred key order, applied at every nesting level; anything unlisted
   # follows alphabetically. `url` and `src` precede `dest` (they never
@@ -34,17 +35,17 @@ defmodule Dockd.Spec.Encoder do
   @name_pattern ~r/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/
 
   @doc """
-  Builds the string-keyed JSON document from `opts`.
+  Builds the string-keyed JSON document for `instance_name` from `opts`.
 
-  Requires `:instance_name`. `:image` defaults to
-  `"dockd-<instance_name>:latest"` — with the build always wired up, the image
-  is the tag the build produces rather than something to pull.
+  `instance_name` is a required positional argument. `:image` defaults to
+  `default_image/1` — with the build always wired up, the image is the tag the
+  build produces rather than something to pull.
 
   Only the keys present in `opts` are emitted.
   """
-  @spec document(keyword()) :: {:ok, map()} | {:error, Error.t()}
-  def document(opts) when is_list(opts) do
-    with {:ok, instance_name} <- fetch_instance_name(opts),
+  @spec document(binary(), keyword()) :: {:ok, map()} | {:error, Error.t()}
+  def document(instance_name, opts) when is_list(opts) do
+    with {:ok, instance_name} <- validate_instance_name(instance_name),
          {:ok, env} <- encode_env(Keyword.get(opts, :env, [])) do
       document =
         %{
@@ -90,33 +91,50 @@ defmodule Dockd.Spec.Encoder do
   @spec dockerfile_name() :: binary()
   def dockerfile_name, do: @dockerfile_name
 
+  @doc """
+  The base image a generated `Dockerfile` uses when `:from` is omitted.
+
+  Exposed so a caller can see, name, and override the choice rather than
+  discovering a pinned Debian release in a file dockd wrote for them.
+  """
+  @spec default_from() :: binary()
+  def default_from, do: @default_from
+
+  @doc """
+  The image tag a package builds when `:image` is omitted.
+
+  Derives from `Dockd.Spec.prefix_name/1`, so the tag and the container name
+  cannot drift apart.
+  """
+  @spec default_image(binary()) :: binary()
+  def default_image(instance_name) when is_binary(instance_name),
+    do: Spec.prefix_name(instance_name) <> ":latest"
+
   # ---------------------------------------------------------------------------
   # Document assembly
   # ---------------------------------------------------------------------------
 
-  defp fetch_instance_name(opts) do
-    case Keyword.get(opts, :instance_name) do
-      name when is_binary(name) and name !== "" ->
-        if Regex.match?(@name_pattern, name) do
-          {:ok, name}
-        else
-          {:error,
-           validate_error(
-             "instance name #{inspect(name)} must start with a letter or digit and " <>
-               "contain only letters, digits, dots, dashes or underscores"
-           )}
-        end
-
-      other ->
-        {:error,
-         validate_error("instance name must be a non-empty string, got: #{inspect(other)}")}
+  defp validate_instance_name(name) when is_binary(name) and name !== "" do
+    if Regex.match?(@name_pattern, name) do
+      {:ok, name}
+    else
+      {:error,
+       validate_error(
+         "instance name #{inspect(name)} must start with a letter or digit and " <>
+           "contain only letters, digits, dots, dashes or underscores"
+       )}
     end
   end
+
+  defp validate_instance_name(other),
+    do:
+      {:error,
+       validate_error("instance name must be a non-empty string, got: #{inspect(other)}")}
 
   defp image(opts, instance_name) do
     case Keyword.get(opts, :image) do
       image when is_binary(image) and image !== "" -> image
-      _ -> "dockd-#{instance_name}:latest"
+      _ -> default_image(instance_name)
     end
   end
 

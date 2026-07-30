@@ -9,48 +9,74 @@ defmodule Dockd do
   instance name as `org.dockd.instance.name`, so a fresh BEAM can rediscover the
   full set of managed instances by querying Docker alone.
 
+  ## Every required input is an argument
+
+  Dockd reads no environment variable, no application config, no home directory,
+  no current working directory, and no system temp directory. There is nothing to
+  configure, because there is no configuration: anything a function needs, it
+  takes as an argument.
+
+  Four runtime inputs recur across the API and none of them has a default:
+
+    - `endpoint` — the Docker daemon, e.g. `"unix:///var/run/docker.sock"` or
+      `"tcp://10.0.0.1:2376"`. Without it the underlying client would fall back to
+      `DOCKER_HOST`, which would make *which daemon your containers land on*
+      depend on ambient process state.
+    - `disk_mount_enabled` — whether host mounts, repo clones, file copies, and
+      host-derived env are permitted. It fails **closed**: there is no clause that
+      reads an absent value as permission to expose the host.
+    - `host_env` — the map that `:env` entries and `${VAR}` interpolation resolve
+      against. Pass `%{}` and a package can reach nothing from the host; pass the
+      specific names it should see, and nothing more.
+    - `temp_root` — the host directory used to stage repo clones and file copies.
+
+  Host tooling (`:git_path`, `:git_env`, `:tar_path`, `:tar_env`) stays in `opts`
+  because only some specs need it — but a spec that clones a repo or copies a file
+  without it is a `:validate` error, never a `PATH` lookup.
+
   ## Getting Started
 
   With a Docker daemon running locally, apply an installed package by name and
   you have a live instance:
 
-      > {:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("webapp")
+      > endpoint = "unix:///var/run/docker.sock"
+      > {:ok, %Dockd.ApplyResult{instance: instance}} =
+      ...>   Dockd.apply_package(root, "webapp", endpoint, false, %{}, System.tmp_dir!())
 
   ### One-shot commands
 
-  `shell_command/3` runs a single command and returns its output and
+  `shell_command/4` runs a single command and returns its output and
   exit code. Each call is independent — no shell state carries over
   between calls.
 
       > {:ok, %{output: _, running: false, exit_code: 0}} =
-      ...>   Dockd.shell_command(instance, ["echo", "hello"])
+      ...>   Dockd.shell_command(instance, ["echo", "hello"], endpoint)
 
       # Fresh exec each time — `cd` in one call does not affect the next.
-      > {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, "cd /tmp")
-      > {:ok, %{output: "/\\n"}} = Dockd.shell_command(instance, "pwd")
+      > {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, "cd /tmp", endpoint)
+      > {:ok, %{output: "/\\n"}} = Dockd.shell_command(instance, "pwd", endpoint)
 
   ### Longer-term interactive shells
 
   When you need state to persist across commands (cwd, environment
   variables, an authenticated session), open a single shell with
-  `open_shell/2` and thread the handle through `shell_send/3`. Close
+  `open_shell/3` and thread the handle through `shell_send/3`. Close
   it with `close_shell/2` when done.
 
-      > {:ok, shell} = Dockd.open_shell(instance)
+      > {:ok, shell} = Dockd.open_shell(instance, endpoint)
       > {:ok, {_, shell}} = Dockd.shell_send(shell, "cd /tmp")
       > {:ok, {"/tmp\\n", shell}} = Dockd.shell_send(shell, "pwd")
       > {:ok, {_, shell}} = Dockd.shell_send(shell, "export FOO=bar")
       > {:ok, {"bar\\n", shell}} = Dockd.shell_send(shell, "echo $FOO")
       > :ok = Dockd.close_shell(shell)
 
-      > :ok = Dockd.destroy(instance)
+      > :ok = Dockd.destroy(instance, endpoint)
 
   For a shell a *human* drives, in a real terminal window with its own TTY, see
-  `Dockd.Shell` instead — `open_shell/2` is the programmatic form.
+  `Dockd.Shell` instead — `open_shell/3` is the programmatic form.
 
-  `apply_package/2` resolves package names through the configured packages
-  root and runs the full
-  provisioning pipeline (pull or build, create, start, fetch repos,
+  `apply_package/7` resolves package names against the `root` you pass and runs
+  the full provisioning pipeline (pull or build, create, start, fetch repos,
   copy files, run setup steps). The returned `Dockd.Instance` is a
   view of the live container — pass it (or its name) to any other
   function in this module. See "Packages" below for the full
@@ -59,108 +85,117 @@ defmodule Dockd do
 
   ## Lifecycle
 
-    - `apply/2` — create a container from a `Dockd.Spec`. Returns a
+    - `apply/6` — create a container from a `Dockd.Spec`. Returns a
       `Dockd.ApplyResult` carrying the resulting `Dockd.Instance` and any
       step results from provisioning.
-    - `apply_package/2` — same as `apply/2` but loads the `Spec` from a
-      JSON package file (see "Packages" below).
-    - `list/1` — enumerate every dockd-managed `Instance` currently on the
+    - `apply_image/7` — the same, building the spec from an image and an
+      instance name.
+    - `apply_package/7` — the same, loading the spec from a JSON package file
+      (see "Packages" below). `load_package_spec/3` is the read half on its own.
+    - `list/2` — enumerate every dockd-managed `Instance` currently on the
       daemon.
-    - `get/2` — fetch one `Instance` by its instance name.
-    - `start/2` / `stop/2` / `restart/2` — control the container without
+    - `get/3` — fetch one `Instance` by its instance name.
+    - `start/3` / `stop/3` / `restart/3` — control the container without
       destroying it.
-    - `destroy/2` — stop and remove an instance.
+    - `destroy/3` — stop and remove an instance.
 
   ## Packages on disk
 
-    - `install_packages/2` — install a package set from a git repository or a
+    - `install_packages/3` — install a package set from a git repository or a
       local directory.
-    - `new_package/2` — scaffold a new package's files on disk.
-    - `list_packages/1` — enumerate installed packages.
-    - `delete_package/2` — remove an installed package from the packages root.
+    - `new_package/3` — scaffold a new package's files on disk.
+    - `list_packages/2` — enumerate installed packages.
+    - `delete_package/3` — remove an installed package from a packages root.
 
   ## Packages
 
-  A package is a directory under the configured packages root containing a
+  A package is a directory under a packages `root` containing a
   `package.json` (the serialized `Dockd.Spec`: image, shell, env,
   mounts, repos, copies, setup steps, etc.) plus any supporting files
   the spec references — typically a `Dockerfile` for `build`-based
   packages. The directory name is the package's identity.
 
-  `apply_package/2` resolves its reference as follows:
+  `apply_package/7` resolves its reference as follows:
 
     - any string ending in `.json` is treated as a literal file path
     - any other string containing `/` is treated as a package directory
       and resolves to `<dir>/package.json`
-    - any other string is resolved against
-      `<packages_root>/<name>/package.json`
+    - any other string is resolved against `<root>/<name>/package.json`
 
-  The packages root is `opts[:packages_path]`, else `DOCKD_PACKAGES_PATH`, else
-  `config :dockd, packages_path: ...`, else `~/.dockd/packages`.
+  `root` is an argument. There is no configured packages root and no
+  `DOCKD_PACKAGES_PATH`: `~/.dockd/packages` is a fine choice, but it is the
+  caller's choice to make and to write down.
 
-  Packages generated or installed into the package root can be applied by
-  basename:
+  Packages generated or installed into a root can be applied by basename:
 
-      # Resolves to <packages_root>/webapp/package.json
+      root = Path.join(System.user_home!(), ".dockd/packages")
+
+      # Resolves to <root>/webapp/package.json
       {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply_package("webapp")
+        Dockd.apply_package(root, "webapp", endpoint, false, %{}, System.tmp_dir!())
 
-      # Same, with per-call Docker options.
+      # Explicit directory, or explicit file path. `root` is unused for these,
+      # but still passed so the argument list keeps one shape.
       {:ok, result} =
-        Dockd.apply_package("webapp", socket: "/var/run/docker.sock")
+        Dockd.apply_package(root, "./my-stack", endpoint, false, %{}, tmp)
 
-      # Explicit directory.
-      {:ok, result} = Dockd.apply_package("./my-stack")
+      {:ok, result} =
+        Dockd.apply_package(root, "./my-stack/package.json", endpoint, false, %{}, tmp)
 
-      # Explicit file path.
-      {:ok, result} = Dockd.apply_package("./my-stack/package.json")
-
-  Additional packages are installed with `install_packages/2`, from either a
+  Additional packages are installed with `install_packages/3`, from either a
   git repository or a local directory. Every `<source>/packages/<name>/`
-  directory that contains a `package.json` is copied into
-  `<packages_root>/<name>/`, after which the package can be applied by name.
-  `list_packages/1` enumerates what is currently installed, and
-  `delete_package/2` removes a package by name.
+  directory that contains a `package.json` is copied into `<root>/<name>/`, after
+  which the package can be applied by name. `list_packages/2` enumerates what is
+  currently installed, and `delete_package/3` removes a package by name.
 
-      {:ok, ["webapp"]} = Dockd.install_packages("github.com/me/recipes")
-      {:ok, ["webapp"]} = Dockd.install_packages("./my-recipes")
+      {:ok, ["webapp"]} = Dockd.install_packages(root, "./my-recipes")
 
-      [%{name: "webapp"}] = Dockd.list_packages()
+      [%{name: "webapp"}] = Dockd.list_packages(root)
 
   ## Visibility
 
-    - `running?/2` — boolean liveness check.
-    - `logs/2` — fetch container stdout/stderr as a binary.
-    - `inspect/2` — return the raw Docker inspect map (escape hatch for
+    - `running?/3` — boolean liveness check.
+    - `logs/3` — fetch container stdout/stderr as a binary.
+    - `inspect/3` — return the raw Docker inspect map (escape hatch for
       ports, networks, exit code, started_at, etc.).
-    - `refresh/2` — re-fetch a fresh `Instance` from Docker after a state
+    - `refresh/3` — re-fetch a fresh `Instance` from Docker after a state
       change.
 
   ## Operating on instances
 
-    - `shell_command/3` — one-shot exec, captures combined stdout+stderr
+    - `shell_command/4` — one-shot exec, captures combined stdout+stderr
       (as `:output`) and the exit code.
-    - `open_shell/2` / `shell_send/3` / `close_shell/2` — persistent
+    - `open_shell/3` / `shell_send/3` / `close_shell/2` — persistent
       interactive shell, state preserved between commands.
-    - `copy_to/3` — upload host files into an existing instance.
+    - `copy_to/5` — upload host files into an existing instance.
 
   ## Host-side staging
 
-  Dockd writes copied files and cloned repos to a staging dir under
-  `<system_tmp>/dockd/` before uploading them into containers. These
-  functions report and clean up that local staging dir:
+  Dockd writes copied files and cloned repos to a staging dir under the
+  `temp_root` you pass before uploading them into containers. These functions
+  report and clean up that staging dir, and each takes the root as its argument:
 
     - `list_temp_files/1`
-    - `delete_temp_files/1`
+    - `delete_temp_files/1` — deletes recursively, so it refuses `""`, a relative
+      path, and `"/"`. The directory a destructive sweep targets has to be one
+      the caller named.
 
   And the broader, extension-friendly aggregate:
 
     - `info/1` — returns `%{temp_files: %{...}}` today, more keys later.
 
-  All public functions accept a per-call `opts` keyword list for caller
-  runtime context: `:socket`, `:host`, `:api_version`, `:platform`,
-  `:networks`, `:network_mode`, and the policy flag `:disk_mount_enabled`.
-  None of these survive on the container.
+  ## Options
+
+  Beyond the required positional arguments, public functions take a trailing
+  `opts` keyword list for genuinely optional caller context: `:api_version`,
+  `:platform`, `:networks`, `:network_mode`, and the host tooling
+  (`:git_path`, `:git_env`, `:tar_path`, `:tar_env`, `:tar_extra_args`,
+  `:container_staging_root`). See `option_keys/0`. None of these survive on the
+  container.
+
+  Keys that used to live here and are now positional — `:socket`, `:host`,
+  `:disk_mount_enabled`, `:packages_path`, `:dest_dir` — are rejected with a
+  message naming their replacement, rather than silently ignored.
   """
 
   alias Dockd.ApplyResult
@@ -174,27 +209,55 @@ defmodule Dockd do
   alias Dockd.Spec.Normalizer
   alias Dockd.Spec.Parser
 
+  @typedoc """
+  The host environment `:env` entries and `${VAR}` interpolation resolve against.
+
+  Always an explicit argument, never `System.get_env/0`: a package or spec can
+  only reach the values the caller chose to hand it. `%{}` resolves nothing.
+  """
+  @type host_env :: %{optional(binary()) => binary()}
+
   @log_param_keys [:tail, :since, :until, :follow]
   @log_option_keys [:stdout, :stderr, :timestamps]
 
+  # The daemon endpoint and :disk_mount_enabled are absent on purpose — they are
+  # positional arguments, so they cannot be forgotten and silently defaulted.
   @apply_opts [
-    :disk_mount_enabled,
-    :socket,
-    :host,
     :api_version,
     :platform,
     :networks,
-    :network_mode
+    :network_mode,
+    :git_path,
+    :git_env,
+    :tar_path,
+    :tar_env,
+    :tar_extra_args,
+    :container_staging_root
   ]
 
-  @doc """
-  Returns the caller-runtime option keys accepted by `apply/2`.
+  # Retired keys, kept only so a caller still passing one gets a pointed error
+  # instead of a silent no-op.
+  @retired_opts %{
+    socket: "the positional `endpoint` argument",
+    host: "the positional `endpoint` argument",
+    disk_mount_enabled: "the positional `disk_mount_enabled` argument",
+    packages_path: "the positional `root` argument",
+    dest_dir: "the positional `root` argument",
+    launcher_path: "the positional `launcher_path` argument of Dockd.Shell.open_window/6",
+    instance_name: "the positional `instance_name` argument"
+  }
 
-  These keys configure the Docker daemon connection and provisioning policy —
-  `:disk_mount_enabled`, `:socket`, `:host`, `:api_version`, `:platform`,
-  `:networks`, and `:network_mode` — rather than the workspace itself. They are
-  the options split away from `Dockd.Spec` options (see `Dockd.Spec.option_keys/0`)
-  before a spec is built, and `apply/2` rejects any unknown caller option.
+  @doc """
+  Returns the caller-runtime option keys accepted by `apply/6`.
+
+  These are genuinely optional: Docker request tuning (`:api_version`,
+  `:platform`, `:networks`, `:network_mode`) and the host tooling a spec needs
+  only when it clones a repo or copies a file (`:git_path`, `:git_env`,
+  `:tar_path`, `:tar_env`, `:tar_extra_args`, `:container_staging_root`).
+
+  The daemon endpoint and `disk_mount_enabled` are *not* here — they are required
+  positional arguments. `apply/6` rejects any unknown caller option, and names the
+  positional replacement for keys that used to live here.
   """
   @spec option_keys() :: [atom()]
   def option_keys do
@@ -202,114 +265,149 @@ defmodule Dockd do
   end
 
   @doc """
-  Creates a Docker container from `spec_or_image` and returns the result.
+  Creates a Docker container from `spec` and returns the result.
 
-  Two input shapes are accepted:
+  Takes a `%Dockd.Spec{}` and its four required runtime inputs:
 
-    - a `%Dockd.Spec{}` — used as-is
-    - an image string plus a keyword list of spec options (the Elixir-native
-      shape; equivalent to calling `Dockd.Spec.from_opts/2` first)
+    - `endpoint` — the Docker daemon, e.g. `"unix:///var/run/docker.sock"`
+    - `disk_mount_enabled` — `true` permits host mounts, repo clones, file copies
+      and host-derived env; `false` strips them
+    - `host_env` — the environment `:env` entries resolve against. `%{}` resolves
+      nothing from the host
+    - `temp_root` — absolute host directory to stage repo clones and file copies in
 
-  An `:instance_name` is always required — there is no auto-generated container name.
-  Calling `apply/2` with an image string and no `:instance_name` returns a `:validate`
-  error.
+  None of them has a default. `disk_mount_enabled` in particular used to treat an
+  absent value as `true`, which meant forgetting it granted maximum host exposure.
 
-  Per-call options (Docker connection settings and `:disk_mount_enabled`)
-  and spec options share the same flat keyword list as the second
-  argument. `Dockd.Spec.option_keys/0` decides the split: any key it
-  claims is routed into `Spec.from_opts/2`, anything else is treated as
-  a per-call option. Unknown keys are rejected.
+  To build a spec from an image string, use `apply_image/7`, or `Dockd.Spec.new/3`
+  followed by this function.
 
   ## Examples
 
-      # Image plus spec options.
-      {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply("busybox:1.37.0",
-          instance_name: "smoke",
+      {:ok, spec} =
+        Dockd.Spec.new("busybox:1.37.0", "smoke",
           shell: "/bin/sh",
           env: ["FOO=bar"],
           steps: [%{step_name: "workdir", cmd: ["mkdir", "-p", "/work"]}]
         )
 
-      # :instance_name is required.
-      {:error, %Dockd.Error{phase: :validate}} = Dockd.apply("busybox:1.37.0")
-
-      # Spec options and per-call options share one flat keyword list.
-      {:ok, result} =
-        Dockd.apply("busybox:1.37.0",
-          instance_name: "smoke",
-          shell: "/bin/sh",
-          socket: "/var/run/docker.sock"
-        )
-
-      # A pre-built %Dockd.Spec{} struct — opts is the per-call options list.
-      spec = Dockd.Spec.from_opts("busybox:1.37.0", instance_name: "smoke", shell: "/bin/sh")
-      {:ok, result} = Dockd.apply(spec, socket: "/var/run/docker.sock")
+      {:ok, %Dockd.ApplyResult{instance: instance}} =
+        Dockd.apply(spec, "unix:///var/run/docker.sock", false, %{}, System.tmp_dir!())
 
       # Failure path: the error may carry the partially-created instance so
       # the caller can clean up.
-      steps = [%{step_name: "fail", cmd: ["sh", "-c", "exit 1"]}]
+      {:ok, spec} =
+        Dockd.Spec.new("busybox:1.37.0", "smoke",
+          steps: [%{step_name: "fail", cmd: ["sh", "-c", "exit 1"]}]
+        )
 
-      case Dockd.apply("busybox:1.37.0", instance_name: "smoke", steps: steps) do
+      case Dockd.apply(spec, endpoint, false, %{}, tmp) do
         {:ok, %Dockd.ApplyResult{instance: instance}} ->
           instance
 
         {:error, %Dockd.Error{instance: instance}} when not is_nil(instance) ->
-          Dockd.destroy(instance)
+          Dockd.destroy(instance, endpoint)
       end
   """
-  @spec apply(Spec.t() | binary(), keyword()) ::
+  @spec apply(Spec.t(), binary(), boolean(), host_env(), Path.t(), keyword()) ::
           {:ok, ApplyResult.t()} | {:error, Error.t()}
-  def apply(spec_or_image, opts \\ [])
-
-  def apply(%Spec{} = spec, opts) when is_list(opts) do
+  def apply(%Spec{} = spec, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ [])
+      when is_list(opts) do
     with :ok <- check_call_opts(opts) do
-      Provisioner.run(spec, opts)
-    end
-  end
-
-  def apply(image, opts) when is_binary(image) and is_list(opts) do
-    {spec_opts, call_opts} = Keyword.split(opts, Spec.option_keys())
-
-    with :ok <- check_call_opts(call_opts),
-         :ok <- check_spec_instance_name(spec_opts) do
-      spec = Spec.from_opts(image, spec_opts)
-      Provisioner.run(spec, call_opts)
+      Provisioner.run(spec, endpoint, disk_mount_enabled, host_env, temp_root, opts)
     end
   end
 
   @doc """
-  Loads a JSON package file and applies it.
+  Builds a `Dockd.Spec` from `image` and `instance_name`, then applies it.
+
+  The convenience form of `apply/6`. `instance_name` is positional because it is
+  required — there is no auto-generated container name — and `image` cannot carry
+  it as an option without the two being separable only by a lookup table.
+
+  Spec options and caller options share the trailing keyword list;
+  `Dockd.Spec.option_keys/0` decides the split, and unknown keys are rejected.
+
+  ## Examples
+
+      {:ok, %Dockd.ApplyResult{instance: instance}} =
+        Dockd.apply_image("busybox:1.37.0", "smoke",
+          "unix:///var/run/docker.sock", false, %{}, System.tmp_dir!(),
+          shell: "/bin/sh"
+        )
+  """
+  @spec apply_image(binary(), binary(), binary(), boolean(), host_env(), Path.t(), keyword()) ::
+          {:ok, ApplyResult.t()} | {:error, Error.t()}
+  def apply_image(image, instance_name, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ [])
+      when is_list(opts) do
+    {spec_opts, call_opts} = Keyword.split(opts, Spec.option_keys())
+
+    with :ok <- check_call_opts(call_opts),
+         {:ok, spec} <- Spec.new(image, instance_name, spec_opts) do
+      Provisioner.run(spec, endpoint, disk_mount_enabled, host_env, temp_root, call_opts)
+    end
+  end
+
+  @doc """
+  Loads a JSON package from `root` and applies it.
 
   Resolves the package reference as described in the "Packages" section:
 
     - `<name>.json` or any path containing `/` is treated as a file path
-    - any other string is resolved against `<packages_root>/<name>/package.json`
+    - any other string is resolved against `<root>/<name>/package.json`
 
-  The document is read, parsed, environment-interpolated against
-  `System.get_env/0`, and normalized into spec attributes. The package must
-  declare a non-empty `"name"`.
+  The document is read, parsed, interpolated against `host_env`, and normalized
+  into spec attributes. `host_env` is the same map `:env` entries resolve against,
+  so `${VAR}` in a package expands only to values the caller supplied — pass `%{}`
+  to substitute nothing.
 
   ## Examples
 
-      # Resolved against <packages_root>/elixir/package.json.
-      {:ok, %Dockd.ApplyResult{instance: instance}} = Dockd.apply_package("elixir")
+      # Resolved against <root>/elixir/package.json.
+      {:ok, %Dockd.ApplyResult{instance: instance}} =
+        Dockd.apply_package(root, "elixir", endpoint, false, %{}, tmp)
 
-      # Explicit path — anything with `/` or ending in `.json`.
-      {:ok, result} = Dockd.apply_package("./packages/my-stack.json")
-      {:ok, result} = Dockd.apply_package("/abs/path/stack.json")
-
-      # With per-call Docker options.
+      # Explicit path — anything with `/` or ending in `.json`. `root` is unused
+      # for these, but still required so the argument list does not change shape.
       {:ok, result} =
-        Dockd.apply_package("elixir", socket: "/var/run/docker.sock")
-  """
-  @spec apply_package(binary(), keyword()) ::
-          {:ok, ApplyResult.t()} | {:error, Error.t()}
-  def apply_package(ref, opts \\ []) when is_binary(ref) and is_list(opts) do
-    path = Packages.resolve_path(ref, opts)
+        Dockd.apply_package(root, "/abs/path/stack.json", endpoint, false, %{}, tmp)
 
-    with {:ok, spec} <- load_package_spec(path) do
-      Provisioner.run(spec, opts)
+      # Interpolating ${HOME} in the package requires passing it deliberately.
+      {:ok, result} =
+        Dockd.apply_package(root, "elixir", endpoint, true,
+          %{"HOME" => System.user_home!()}, tmp)
+  """
+  @spec apply_package(Path.t(), binary(), binary(), boolean(), host_env(), Path.t(), keyword()) ::
+          {:ok, ApplyResult.t()} | {:error, Error.t()}
+  def apply_package(root, ref, endpoint, disk_mount_enabled, host_env, temp_root, opts \\ [])
+      when is_binary(ref) and is_list(opts) do
+    with :ok <- check_call_opts(opts),
+         {:ok, spec} <- load_package_spec(root, ref, host_env) do
+      Provisioner.run(spec, endpoint, disk_mount_enabled, host_env, temp_root, opts)
+    end
+  end
+
+  @doc """
+  Loads a package from `root` into a `Dockd.Spec` without applying it.
+
+  The read half of `apply_package/7`: resolve the reference, parse the JSON,
+  substitute `${VAR}` from `host_env`, normalize, and validate. Useful for
+  inspecting or adjusting a spec before handing it to `apply/6`, and the
+  lower-arity path when the four runtime inputs are not all in hand yet.
+  """
+  @spec load_package_spec(Path.t(), binary(), host_env()) ::
+          {:ok, Spec.t()} | {:error, Error.t()}
+  def load_package_spec(root, ref, host_env)
+      when is_binary(root) and is_binary(ref) and is_map(host_env) do
+    path = Packages.resolve_path(root, ref)
+
+    with {:ok, decoded} <- Parser.parse_file(path),
+         {:ok, substituted} <- Interpolator.substitute(decoded, host_env),
+         {:ok, attrs} <- Normalizer.normalize(substituted, Path.dirname(path)) do
+      case Spec.from_attrs(attrs) do
+        {:ok, spec} -> {:ok, spec}
+        {:error, error} -> {:error, prefix_message(error, path)}
+      end
     end
   end
 
@@ -320,7 +418,7 @@ defmodule Dockd do
   `ref` selects the source: an existing directory on the host installs from
   that directory, anything else is treated as a git URL and cloned with the
   host `git` binary. Either way, every `<source>/packages/<name>/` directory
-  containing a `package.json` is copied into `<packages_root>/<name>/`, and an
+  containing a `package.json` is copied into `<root>/<name>/`, and an
   existing target directory is replaced.
 
   A git URL can be anything `git clone` accepts (HTTPS, SSH, or the
@@ -331,29 +429,46 @@ defmodule Dockd do
 
     - `:ref` — git branch or tag to clone. Ignored when installing from a
       local directory, which is used exactly as it is on disk.
-    - `:packages_path` — override the configured packages root.
+    - `:packages_subdir` — the subdirectory of the source to read packages from.
+      Defaults to `"packages"`.
+
+  A git install additionally requires `:staging_root`, `:git_path`, and `:git_env`
+  — the clone directory, the `git` executable, and the exact environment to run it
+  in. They are options rather than positional arguments because a local-directory
+  install has no use for them, but a git install without them is a `:fetch` error,
+  never a PATH lookup.
 
   Returns `{:ok, [name]}` with the installed package names.
 
   ## Examples
 
+      # From a local checkout — anything that is an existing directory.
+      {:ok, ["foo", "bar"]} = Dockd.install_packages(root, "./my-recipes")
+
       # From a remote repository.
       {:ok, ["foo", "bar"]} =
-        Dockd.install_packages("https://github.com/me/recipes")
-
-      {:ok, _} =
-        Dockd.install_packages("github.com/me/recipes", ref: "v1.2.0")
-
-      # From a local checkout — anything that is an existing directory.
-      {:ok, ["foo", "bar"]} = Dockd.install_packages("./my-recipes")
+        Dockd.install_packages(root, "https://github.com/me/recipes",
+          staging_root: System.tmp_dir!(),
+          git_path: "/usr/bin/git",
+          git_env: %{"HOME" => System.user_home!()},
+          ref: "v1.2.0"
+        )
   """
-  @spec install_packages(binary(), keyword()) ::
+  @spec install_packages(Path.t(), binary(), keyword()) ::
           {:ok, [binary()]} | {:error, Error.t()}
-  def install_packages(ref, opts \\ []) when is_binary(ref) and is_list(opts) do
+  def install_packages(root, ref, opts \\ [])
+      when is_binary(root) and is_binary(ref) and is_list(opts) do
     if File.dir?(ref) do
-      Packages.install_from_path(ref, opts)
+      Packages.install_from_path(root, ref, opts)
     else
-      Packages.install_from_git(ref, opts)
+      Packages.install_from_git(
+        root,
+        ref,
+        Keyword.get(opts, :staging_root),
+        Keyword.get(opts, :git_path),
+        Keyword.get(opts, :git_env),
+        opts
+      )
     end
   end
 
@@ -361,23 +476,24 @@ defmodule Dockd do
   Scaffolds a new package into `dir`, so you never have to hand-write
   `package.json` and `Dockerfile`.
 
-  `dir` **is** the package directory. The generated package always builds its
-  own image from the generated `Dockerfile`, so `:image` is the tag that build
-  produces and `:from` is the Dockerfile's base image.
+  `dir` **is** the package directory, and `instance_name` is the container name
+  the package will create. The generated package always builds its own image from
+  the generated `Dockerfile`, so `:image` is the tag that build produces and
+  `:from` is the Dockerfile's base image.
 
   Only the keys you pass are written. Refuses to touch an existing directory
   unless `force: true`, and validates before writing anything — a rejected call
-  leaves nothing behind. See `Dockd.Packages.new/2` for the full option list.
+  leaves nothing behind. See `Dockd.Packages.new/3` for the full option list.
 
   ## Examples
 
-      # Minimal — instance name from the directory, image defaults to
-      # dockd-greeter:latest, Dockerfile defaults to FROM debian:trixie.
-      {:ok, %{files: _}} = Dockd.new_package("./greeter")
+      # Minimal — image defaults to dockd-greeter:latest, Dockerfile to
+      # FROM Dockd.Spec.Encoder.default_from/0.
+      {:ok, %{files: _}} = Dockd.new_package("./greeter", "greeter")
 
-      # Into a shareable package set, ready for install_packages/2.
+      # Into a shareable package set, ready for install_packages/3.
       {:ok, %{instance_name: "greeter"}} =
-        Dockd.new_package("./my-recipes/packages/greeter",
+        Dockd.new_package("./my-recipes/packages/greeter", "greeter",
           image: "dockd-greeter:1",
           from: "busybox:1.37.0",
           shell: "/bin/sh",
@@ -385,9 +501,9 @@ defmodule Dockd do
           steps: [%{step_name: "verify", cmd: ["sh", "-c", "test -f /etc/greeting"]}]
         )
 
-      {:ok, ["greeter"]} = Dockd.install_packages("./my-recipes")
+      {:ok, ["greeter"]} = Dockd.install_packages(root, "./my-recipes")
   """
-  @spec new_package(Path.t(), keyword()) ::
+  @spec new_package(Path.t(), binary(), keyword()) ::
           {:ok,
            %{
              instance_name: binary(),
@@ -396,12 +512,13 @@ defmodule Dockd do
              overwrote?: boolean()
            }}
           | {:error, Error.t()}
-  def new_package(dir, opts \\ []) when is_binary(dir) and is_list(opts) do
-    Packages.new(dir, opts)
+  def new_package(dir, instance_name, opts \\ [])
+      when is_binary(dir) and is_binary(instance_name) and is_list(opts) do
+    Packages.new(dir, instance_name, opts)
   end
 
   @doc """
-  Lists every package installed under the configured packages root.
+  Lists every package installed under `root`.
 
   A subdirectory counts as an installed package when it contains a readable
   `package.json`. Each entry is a map with `:name`, `:path`, and `:spec`,
@@ -411,56 +528,52 @@ defmodule Dockd do
   `{:error, %Dockd.Error{}}` — so one malformed `package.json` surfaces its own
   parse error instead of hiding every other installed package.
 
-  Never fails: an unreadable or missing packages root returns `[]`.
+  Never fails: an unreadable or missing `root` returns `[]`.
 
   Note that specs are parsed without `${VAR}` interpolation, so this is safe to
-  call for metadata (image, shell, description) even when the host environment
-  does not define the variables a package references.
+  call for metadata (image, shell, description) even for a package that
+  references variables you have no values for.
 
   ## Examples
 
-      [%{name: "webapp", path: path, spec: {:ok, spec}}] = Dockd.list_packages()
+      [%{name: "webapp", path: path, spec: {:ok, spec}}] = Dockd.list_packages(root)
 
-      # Against a specific packages root.
-      [] = Dockd.list_packages(packages_path: "/tmp/empty")
+      [] = Dockd.list_packages("/tmp/empty")
   """
-  @spec list_packages(keyword()) :: [
+  @spec list_packages(Path.t(), keyword()) :: [
           %{
             name: binary(),
             path: Path.t(),
             spec: {:ok, Spec.t()} | {:error, Error.t()}
           }
         ]
-  def list_packages(opts \\ []) when is_list(opts) do
-    Packages.list(opts)
+  def list_packages(root, opts \\ []) when is_binary(root) and is_list(opts) do
+    Packages.list(root, opts)
   end
 
   @doc """
-  Deletes an installed package from the configured packages root.
+  Deletes an installed package from `root`.
 
-  Takes a bare package name — the same name `apply_package/2` resolves and
-  `list_packages/1` reports. Paths and `.json` references are rejected with a
-  `:validate` error, so nothing outside the packages root can be removed.
+  Takes a bare package name — the same name `apply_package/7` resolves and
+  `list_packages/2` reports. Paths and `.json` references are rejected with a
+  `:validate` error, so nothing outside `root` can be removed.
 
   Idempotent — deleting a package that is not installed returns `:ok`. Running
   instances created from the package are not touched; a package is only the
   recipe on disk.
 
-  Options:
-
-    - `:packages_path` — override the configured packages root.
-
   ## Examples
 
-      {:ok, ["webapp"]} = Dockd.install_packages("./my-recipes")
-      :ok = Dockd.delete_package("webapp")
+      {:ok, ["webapp"]} = Dockd.install_packages(root, "./my-recipes")
+      :ok = Dockd.delete_package(root, "webapp")
 
       # Already gone — still :ok.
-      :ok = Dockd.delete_package("webapp")
+      :ok = Dockd.delete_package(root, "webapp")
   """
-  @spec delete_package(binary(), keyword()) :: :ok | {:error, Error.t()}
-  def delete_package(name, opts \\ []) when is_binary(name) and is_list(opts) do
-    Packages.delete(name, opts)
+  @spec delete_package(Path.t(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  def delete_package(root, name, opts \\ [])
+      when is_binary(root) and is_binary(name) and is_list(opts) do
+    Packages.delete(root, name, opts)
   end
 
   @doc """
@@ -472,25 +585,23 @@ defmodule Dockd do
 
   ## Examples
 
-      {:ok, instances} = Dockd.list()
+      {:ok, instances} = Dockd.list("unix:///var/run/docker.sock")
       Enum.map(instances, & &1.name)
       #=> ["dockd-smoke", "dockd-builder"]
-
-      # Against a specific Docker daemon.
-      {:ok, instances} = Dockd.list(socket: "/var/run/docker.sock")
   """
-  @spec list(keyword()) :: {:ok, [Instance.t()]} | {:error, Error.t()}
-  def list(opts \\ []) when is_list(opts) do
-    docker_options = Provisioner.docker_options_from(opts)
-    marker = "#{Instance.marker_label()}=true"
+  @spec list(binary(), keyword()) :: {:ok, [Instance.t()]} | {:error, Error.t()}
+  def list(endpoint, opts \\ []) when is_list(opts) do
+    with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
+      marker = "#{Instance.marker_label()}=true"
 
-    case Docker.list_containers(%{all: true}, [labels: [marker]] ++ docker_options) do
-      {:ok, summaries} ->
-        hydrate_each(summaries, docker_options, [])
+      case Docker.list_containers(%{all: true}, [labels: [marker]] ++ docker_options) do
+        {:ok, summaries} ->
+          hydrate_each(summaries, docker_options, [])
 
-      {:error, reason} ->
-        {:error,
-         Error.docker_phase_error(:discover, "failed to list Docker containers", reason, nil)}
+        {:error, reason} ->
+          {:error,
+           Error.docker_phase_error(:discover, "failed to list Docker containers", reason, nil)}
+      end
     end
   end
 
@@ -502,26 +613,25 @@ defmodule Dockd do
 
   ## Examples
 
-      {:ok, %Dockd.Instance{} = instance} = Dockd.get("smoke")
-      {:ok, %Dockd.Instance{} = instance} = Dockd.get("dockd-smoke")
+      {:ok, %Dockd.Instance{} = instance} = Dockd.get("smoke", endpoint)
+      {:ok, %Dockd.Instance{} = instance} = Dockd.get("dockd-smoke", endpoint)
 
-      case Dockd.get("not-here") do
+      case Dockd.get("not-here", endpoint) do
         {:ok, instance} -> instance
         {:error, %Dockd.Error{} = err} -> err
       end
   """
-  @spec get(binary(), keyword()) :: {:ok, Instance.t()} | {:error, Error.t()}
-  def get(name, opts \\ []) when is_binary(name) and is_list(opts) do
-    docker_options = Provisioner.docker_options_from(opts)
-    prefixed = Spec.prefix_name(name)
+  @spec get(binary(), binary(), keyword()) :: {:ok, Instance.t()} | {:error, Error.t()}
+  def get(name, endpoint, opts \\ []) when is_binary(name) and is_list(opts) do
+    with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
+      case Docker.find_container(Spec.prefix_name(name), docker_options) do
+        {:ok, body} ->
+          {:ok, Instance.from_inspect(body)}
 
-    case Docker.find_container(prefixed, docker_options) do
-      {:ok, body} ->
-        {:ok, Instance.from_inspect(body)}
-
-      {:error, reason} ->
-        {:error,
-         Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
+        {:error, reason} ->
+          {:error,
+           Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
+      end
     end
   end
 
@@ -541,31 +651,24 @@ defmodule Dockd do
   ## Examples
 
       # By instance struct (typical when you've just created it).
-      {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply("busybox:1.37.0", instance_name: "smoke")
+      :ok = Dockd.destroy(instance, endpoint)
 
-      :ok = Dockd.destroy(instance)
-
-      # By short name.
-      :ok = Dockd.destroy("smoke")
-
-      # By full container name.
-      :ok = Dockd.destroy("dockd-smoke")
+      # By short name, or by full container name.
+      :ok = Dockd.destroy("smoke", endpoint)
+      :ok = Dockd.destroy("dockd-smoke", endpoint)
 
       # Idempotent — destroying something that's already gone is :ok.
-      :ok = Dockd.destroy("smoke")
-      :ok = Dockd.destroy("smoke")
+      :ok = Dockd.destroy("smoke", endpoint)
   """
-  @spec destroy(Instance.t() | binary(), keyword()) :: :ok | {:error, Error.t()}
-  def destroy(instance_or_ref, opts \\ [])
+  @spec destroy(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  def destroy(instance_or_ref, endpoint, opts \\ [])
 
-  def destroy(%Instance{id: id}, opts) when is_binary(id) and is_list(opts) do
-    Provisioner.destroy(id, opts)
+  def destroy(%Instance{id: id}, endpoint, opts) when is_binary(id) and is_list(opts) do
+    Provisioner.destroy(id, endpoint, opts)
   end
 
-  def destroy(ref, opts) when is_binary(ref) and is_list(opts) do
-    prefixed = Spec.prefix_name(ref)
-    Provisioner.destroy(prefixed, opts)
+  def destroy(ref, endpoint, opts) when is_binary(ref) and is_list(opts) do
+    Provisioner.destroy(Spec.prefix_name(ref), endpoint, opts)
   end
 
   @doc """
@@ -575,23 +678,23 @@ defmodule Dockd do
 
   ## Examples
 
-      :ok = Dockd.start(instance)
-      :ok = Dockd.start("smoke")
+      :ok = Dockd.start(instance, endpoint)
+      :ok = Dockd.start("smoke", endpoint)
   """
-  @spec start(Instance.t() | binary(), keyword()) :: :ok | {:error, Error.t()}
-  def start(instance_or_ref, opts \\ []) do
-    {ref, docker_options} = resolve_ref(instance_or_ref, opts)
+  @spec start(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  def start(instance_or_ref, endpoint, opts \\ []) do
+    with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
+      case Docker.start_container(ref, docker_options) do
+        {:ok, _} ->
+          :ok
 
-    case Docker.start_container(ref, docker_options) do
-      {:ok, _} ->
-        :ok
+        {:error, %{status: 304}} ->
+          :ok
 
-      {:error, %{status: 304}} ->
-        :ok
-
-      {:error, reason} ->
-        {:error,
-         Error.docker_phase_error(:lifecycle, "failed to start Docker container", reason, nil)}
+        {:error, reason} ->
+          {:error,
+           Error.docker_phase_error(:lifecycle, "failed to start Docker container", reason, nil)}
+      end
     end
   end
 
@@ -602,40 +705,40 @@ defmodule Dockd do
 
   ## Examples
 
-      :ok = Dockd.stop(instance)
-      :ok = Dockd.stop("smoke")
+      :ok = Dockd.stop(instance, endpoint)
+      :ok = Dockd.stop("smoke", endpoint)
   """
-  @spec stop(Instance.t() | binary(), keyword()) :: :ok | {:error, Error.t()}
-  def stop(instance_or_ref, opts \\ []) do
-    {ref, docker_options} = resolve_ref(instance_or_ref, opts)
+  @spec stop(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  def stop(instance_or_ref, endpoint, opts \\ []) do
+    with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
+      case Docker.stop_container(ref, docker_options) do
+        {:ok, _} ->
+          :ok
 
-    case Docker.stop_container(ref, docker_options) do
-      {:ok, _} ->
-        :ok
+        {:error, %{status: 304}} ->
+          :ok
 
-      {:error, %{status: 304}} ->
-        :ok
-
-      {:error, reason} ->
-        {:error,
-         Error.docker_phase_error(:lifecycle, "failed to stop Docker container", reason, nil)}
+        {:error, reason} ->
+          {:error,
+           Error.docker_phase_error(:lifecycle, "failed to stop Docker container", reason, nil)}
+      end
     end
   end
 
   @doc """
   Stops then starts an instance.
 
-  Equivalent to `stop/2` followed by `start/2`. If the stop step fails
+  Equivalent to `stop/3` followed by `start/3`. If the stop step fails
   the start step is skipped and the stop error is returned.
 
   ## Examples
 
-      :ok = Dockd.restart(instance)
+      :ok = Dockd.restart(instance, endpoint)
   """
-  @spec restart(Instance.t() | binary(), keyword()) :: :ok | {:error, Error.t()}
-  def restart(instance_or_ref, opts \\ []) do
-    with :ok <- stop(instance_or_ref, opts) do
-      start(instance_or_ref, opts)
+  @spec restart(Instance.t() | binary(), binary(), keyword()) :: :ok | {:error, Error.t()}
+  def restart(instance_or_ref, endpoint, opts \\ []) do
+    with :ok <- stop(instance_or_ref, endpoint, opts) do
+      start(instance_or_ref, endpoint, opts)
     end
   end
 
@@ -646,13 +749,15 @@ defmodule Dockd do
 
   ## Examples
 
-      {:ok, true} = Dockd.running?(instance)
-      {:ok, false} = Dockd.running?("smoke")
+      {:ok, true} = Dockd.running?(instance, endpoint)
+      {:ok, false} = Dockd.running?("smoke", endpoint)
   """
-  @spec running?(Instance.t() | binary(), keyword()) :: {:ok, boolean()}
-  def running?(instance_or_ref, opts \\ []) do
-    {ref, docker_options} = resolve_ref(instance_or_ref, opts)
-    {:ok, Docker.container_running?(ref, docker_options)}
+  @spec running?(Instance.t() | binary(), binary(), keyword()) ::
+          {:ok, boolean()} | {:error, Error.t()}
+  def running?(instance_or_ref, endpoint, opts \\ []) do
+    with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
+      {:ok, Docker.container_running?(ref, docker_options)}
+    end
   end
 
   @doc """
@@ -668,20 +773,21 @@ defmodule Dockd do
     - `:timestamps` — boolean
     - `:stdout` / `:stderr` — booleans (default both `true`)
 
-  Other keys in `opts` are treated as the usual per-call connection
-  options (`:socket`, `:host`, …).
+  Other keys in `opts` are treated as the usual per-call Docker options.
 
   ## Examples
 
-      {:ok, logs} = Dockd.logs(instance)
-      {:ok, tail} = Dockd.logs(instance, tail: 100, timestamps: true)
-      {:ok, stderr} = Dockd.logs("smoke", stdout: false, stderr: true)
+      {:ok, logs} = Dockd.logs(instance, endpoint)
+      {:ok, tail} = Dockd.logs(instance, endpoint, tail: 100, timestamps: true)
+      {:ok, stderr} = Dockd.logs("smoke", endpoint, stdout: false, stderr: true)
   """
-  @spec logs(Instance.t() | binary(), keyword()) :: Docker.result(binary())
-  def logs(instance_or_ref, opts \\ []) do
-    {ref, docker_options} = resolve_ref(instance_or_ref, opts)
-    {params, log_options} = split_log_opts(opts)
-    Docker.container_logs(ref, params, log_options ++ docker_options)
+  @spec logs(Instance.t() | binary(), binary(), keyword()) ::
+          Docker.result(binary()) | {:error, Error.t()}
+  def logs(instance_or_ref, endpoint, opts \\ []) do
+    with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
+      {params, log_options} = split_log_opts(opts)
+      Docker.container_logs(ref, params, log_options ++ docker_options)
+    end
   end
 
   @doc """
@@ -693,46 +799,47 @@ defmodule Dockd do
 
   ## Examples
 
-      {:ok, raw} = Dockd.inspect(instance)
+      {:ok, raw} = Dockd.inspect(instance, endpoint)
       raw["State"]["StartedAt"]
       raw["NetworkSettings"]["IPAddress"]
   """
-  @spec inspect(Instance.t() | binary(), keyword()) :: {:ok, map()} | {:error, Error.t()}
-  def inspect(instance_or_ref, opts \\ []) do
-    {ref, docker_options} = resolve_ref(instance_or_ref, opts)
+  @spec inspect(Instance.t() | binary(), binary(), keyword()) ::
+          {:ok, map()} | {:error, Error.t()}
+  def inspect(instance_or_ref, endpoint, opts \\ []) do
+    with {:ok, {ref, docker_options}} <- resolve_ref(instance_or_ref, endpoint, opts) do
+      case Docker.find_container(ref, docker_options) do
+        {:ok, body} ->
+          {:ok, body}
 
-    case Docker.find_container(ref, docker_options) do
-      {:ok, body} ->
-        {:ok, body}
-
-      {:error, reason} ->
-        {:error,
-         Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
+        {:error, reason} ->
+          {:error,
+           Error.docker_phase_error(:discover, "failed to inspect Docker container", reason, nil)}
+      end
     end
   end
 
   @doc """
   Re-fetches an instance from Docker, returning a fresh `%Dockd.Instance{}`.
 
-  Useful after `start/2`, `stop/2`, or `restart/2` to refresh the
+  Useful after `start/3`, `stop/3`, or `restart/3` to refresh the
   `:running?` field (and anything else hydrated from Docker inspect).
 
   ## Examples
 
-      {:ok, fresh} = Dockd.refresh(instance)
-      {:ok, fresh} = Dockd.refresh("smoke")
+      {:ok, fresh} = Dockd.refresh(instance, endpoint)
+      {:ok, fresh} = Dockd.refresh("smoke", endpoint)
   """
-  @spec refresh(Instance.t() | binary(), keyword()) :: {:ok, Instance.t()} | {:error, Error.t()}
-  def refresh(%Instance{} = instance, opts) when is_list(opts) do
-    get(Instance.short_name(instance), opts)
+  @spec refresh(Instance.t() | binary(), binary(), keyword()) ::
+          {:ok, Instance.t()} | {:error, Error.t()}
+  def refresh(instance_or_ref, endpoint, opts \\ [])
+
+  def refresh(%Instance{} = instance, endpoint, opts) when is_list(opts) do
+    get(Instance.short_name(instance), endpoint, opts)
   end
 
-  def refresh(ref, opts) when is_binary(ref) and is_list(opts) do
-    get(ref, opts)
+  def refresh(ref, endpoint, opts) when is_binary(ref) and is_list(opts) do
+    get(ref, endpoint, opts)
   end
-
-  @spec refresh(Instance.t() | binary()) :: {:ok, Instance.t()} | {:error, Error.t()}
-  def refresh(instance_or_ref), do: refresh(instance_or_ref, [])
 
   @doc """
   Runs `command` inside the instance and returns the combined output plus
@@ -741,27 +848,25 @@ defmodule Dockd do
 
   ## Examples
 
-      {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply("busybox:1.37.0", instance_name: "smoke", shell: "/bin/sh")
-
       # String form — invoked through the instance's configured shell.
       # `:output` is stdout and stderr combined into one binary.
       {:ok, %{output: "hello\\n", exit_code: 0}} =
-        Dockd.shell_command(instance, "echo hello")
+        Dockd.shell_command(instance, "echo hello", endpoint)
 
       # Argv form — exec'd verbatim, no shell parsing.
-      {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, ["true"])
+      {:ok, %{exit_code: 0}} = Dockd.shell_command(instance, ["true"], endpoint)
       {:ok, %{exit_code: 3}} =
-        Dockd.shell_command(instance, ["sh", "-c", "exit 3"])
+        Dockd.shell_command(instance, ["sh", "-c", "exit 3"], endpoint)
 
       # Also accepts an instance name instead of the struct.
-      {:ok, _} = Dockd.shell_command("smoke", "uname -a")
+      {:ok, _} = Dockd.shell_command("smoke", "uname -a", endpoint)
   """
-  @spec shell_command(Instance.t() | binary(), [binary()] | binary(), keyword()) ::
-          Docker.result(Docker.exec_result())
-  def shell_command(instance_or_ref, command, opts \\ []) do
-    {ref, instance_opts} = resolve_ref(instance_or_ref, opts)
-    Docker.Terminal.run_with_status(ref, command, instance_opts)
+  @spec shell_command(Instance.t() | binary(), [binary()] | binary(), binary(), keyword()) ::
+          Docker.result(Docker.exec_result()) | {:error, Error.t()}
+  def shell_command(instance_or_ref, command, endpoint, opts \\ []) do
+    with {:ok, {ref, instance_opts}} <- resolve_ref(instance_or_ref, endpoint, opts) do
+      Docker.Terminal.run_with_status(ref, command, instance_opts)
+    end
   end
 
   @doc """
@@ -771,7 +876,7 @@ defmodule Dockd do
   preserves shell state (cwd, env, shell variables) across
   `shell_send/3` calls. The same handle is threaded back through
   `shell_send/3` and finally `close_shell/2`. Pair every successful
-  `open_shell/2` with `close_shell/2`.
+  `open_shell/3` with `close_shell/2`.
 
   When no `:shell` option is given, the session program defaults to the
   instance's configured shell (`Instance.shell`, i.e. the container's
@@ -780,39 +885,32 @@ defmodule Dockd do
 
   ## Examples
 
-      {:ok, %Dockd.ApplyResult{instance: instance}} =
-        Dockd.apply("busybox:1.37.0", shell: "/bin/sh")
-
-      {:ok, shell} = Dockd.open_shell(instance)
+      {:ok, shell} = Dockd.open_shell(instance, endpoint)
       {:ok, {_, shell}} = Dockd.shell_send(shell, "cd /tmp")
       {:ok, {"/tmp\\n", shell}} = Dockd.shell_send(shell, "pwd")
       :ok = Dockd.close_shell(shell)
 
       # Also accepts an instance name.
-      {:ok, shell} = Dockd.open_shell("smoke")
+      {:ok, shell} = Dockd.open_shell("smoke", endpoint)
   """
-  @spec open_shell(Instance.t() | binary(), keyword()) ::
-          Docker.result(Docker.Terminal.handle())
-  def open_shell(instance_or_ref, opts \\ []) do
-    {ref, instance_opts} = resolve_ref(instance_or_ref, opts)
+  @spec open_shell(Instance.t() | binary(), binary(), keyword()) ::
+          Docker.result(Docker.Terminal.handle()) | {:error, Error.t()}
+  def open_shell(instance_or_ref, endpoint, opts \\ []) do
+    with {:ok, {ref, instance_opts}} <- resolve_ref(instance_or_ref, endpoint, opts),
+         {:ok, configured} <- configured_shell_for(instance_or_ref, endpoint, opts) do
+      open_opts = instance_opts ++ resolve_shell_arg(opts, configured)
 
-    configured =
-      if Keyword.has_key?(opts, :shell),
-        do: nil,
-        else: configured_shell(instance_or_ref, opts)
-
-    open_opts = instance_opts ++ resolve_shell_arg(opts, configured)
-
-    case Docker.Terminal.open(ref, open_opts) do
-      {:ok, _session} -> {:ok, ref}
-      {:error, _} = err -> err
+      case Docker.Terminal.open(ref, open_opts) do
+        {:ok, _session} -> {:ok, ref}
+        {:error, _} = err -> err
+      end
     end
   end
 
   @doc """
   Decides the `:shell` option to add when opening a shell into an instance.
 
-  Exposed because `open_shell/2`'s shell precedence is worth being able to
+  Exposed because `open_shell/3`'s shell precedence is worth being able to
   reason about (and test) on its own. Returns the keyword list to append to the
   Docker options — either `[shell: [program]]` or `[]`.
 
@@ -884,23 +982,41 @@ defmodule Dockd do
   @doc """
   Copies host files or directories into an existing instance.
 
-  `copies` is a list of `%{src:, dest:}` maps — the same shape accepted
-  by `Dockd.Spec`'s `:copy` field. Uses the same tar + put_archive
-  pipeline that `apply/2` uses at create time.
+  `copies` is a list of `%{src:, dest:}` maps — the same shape accepted by
+  `Dockd.Spec`'s `:copy` field, with `src` required to be an absolute path. Uses
+  the same tar + put_archive pipeline that `apply/6` uses at create time, so it
+  needs the same `temp_root` to stage in and the same `:tar_path` / `:tar_env`.
 
   ## Examples
 
       :ok =
-        Dockd.copy_to(instance, [
-          %{src: "./config/app.env", dest: "/etc/app/app.env"},
-          %{src: "./scripts", dest: "/opt/scripts"}
-        ])
+        Dockd.copy_to(
+          instance,
+          [
+            %{src: "/srv/config/app.env", dest: "/etc/app/app.env"},
+            %{src: "/srv/scripts", dest: "/opt/scripts"}
+          ],
+          System.tmp_dir!(),
+          endpoint,
+          tar_path: "/usr/bin/tar",
+          tar_env: %{}
+        )
   """
-  @spec copy_to(Instance.t() | binary(), [map()], keyword()) :: :ok | {:error, Error.t()}
-  def copy_to(instance_or_ref, copies, opts \\ []) when is_list(copies) and is_list(opts) do
-    case resolve_container_id(instance_or_ref, opts) do
+  @spec copy_to(Instance.t() | binary(), [map()], Path.t(), binary(), keyword()) ::
+          :ok | {:error, Error.t()}
+  def copy_to(instance_or_ref, copies, temp_root, endpoint, opts \\ [])
+      when is_list(copies) and is_list(opts) do
+    case resolve_container_id(instance_or_ref, endpoint, opts) do
       {:ok, container_id, docker_options} ->
-        FileCopy.copy_files(copies, container_id, docker_options)
+        FileCopy.copy_files(
+          copies,
+          container_id,
+          temp_root,
+          Keyword.get(opts, :tar_path),
+          Keyword.get(opts, :tar_env),
+          docker_options,
+          opts
+        )
 
       {:error, _} = err ->
         err
@@ -908,31 +1024,35 @@ defmodule Dockd do
   end
 
   @doc """
-  Lists the staging directories dockd has left under
-  `<system_tmp>/dockd/` on the local node.
+  Lists the staging directories dockd has left under `temp_root` on the local
+  node.
 
-  These are created during file copies and git repo fetches when
-  preparing data for upload into a container. They are usually cleaned
-  up automatically; this function exposes whatever is left.
+  These are created during file copies and git repo fetches when preparing data
+  for upload into a container. They are usually cleaned up automatically; this
+  function exposes whatever is left.
 
-  Reports only the local node's staging directory.
+  `temp_root` is the same directory you passed to `apply/6` or `copy_to/5`.
   """
-  @spec list_temp_files(keyword()) :: {:ok, [Path.t()]}
-  def list_temp_files(_opts \\ []) do
-    {:ok, FileCopy.list_temp_files()}
+  @spec list_temp_files(Path.t()) :: {:ok, [Path.t()]}
+  def list_temp_files(temp_root) when is_binary(temp_root) do
+    {:ok, FileCopy.list_temp_files(temp_root)}
   end
 
   @doc """
-  Deletes every staging directory dockd has left under
-  `<system_tmp>/dockd/` on the local node.
+  Deletes every staging directory dockd has left under `temp_root` on the local
+  node, leaving `temp_root` itself in place.
+
+  This deletes recursively, so `temp_root` is a required argument rather than a
+  value read from the environment: the directory a destructive sweep targets must
+  be one the caller named. `""`, a relative path, and `"/"` are refused.
   """
-  @spec delete_temp_files(keyword()) :: :ok
-  def delete_temp_files(_opts \\ []) do
-    FileCopy.delete_temp_files()
+  @spec delete_temp_files(Path.t()) :: :ok | {:error, Error.t()}
+  def delete_temp_files(temp_root) do
+    FileCopy.delete_temp_files(temp_root)
   end
 
   @doc """
-  Returns an aggregate info map about dockd's state on the local node.
+  Returns an aggregate info map about dockd's staging state under `temp_root`.
 
   The shape is `%{temp_files: %{...}}` and is intentionally
   extension-friendly: callers should pattern-match on the keys they
@@ -941,9 +1061,9 @@ defmodule Dockd do
   Currently included:
 
     - `:temp_files` — `%{count, total_bytes, oldest_at, newest_at}` for
-      the staging dir under `<system_tmp>/dockd/`.
+      the staging dirs under `temp_root`.
   """
-  @spec info(keyword()) ::
+  @spec info(Path.t()) ::
           {:ok,
            %{
              temp_files: %{
@@ -953,38 +1073,55 @@ defmodule Dockd do
                newest_at: DateTime.t() | nil
              }
            }}
-  def info(_opts \\ []) do
-    {:ok, %{temp_files: FileCopy.temp_files_info()}}
+  def info(temp_root) when is_binary(temp_root) do
+    {:ok, %{temp_files: FileCopy.temp_files_info(temp_root)}}
   end
 
   # ---------------------------------------------------------------------------
 
   # Reads the instance's configured program. Avoids I/O when we already hold the
-  # hydrated struct; auto-hydrates a bare ref via get/2 (threading Docker opts).
-  defp configured_shell(%Instance{shell: shell}, _opts), do: shell
-
-  defp configured_shell(ref, opts) when is_binary(ref) do
-    case get(ref, opts) do
-      {:ok, %Instance{shell: shell}} -> shell
-      _ -> nil
+  # hydrated struct; auto-hydrates a bare ref via get/3. An explicit opts[:shell]
+  # wins, so there is nothing to look up.
+  defp configured_shell_for(instance_or_ref, endpoint, opts) do
+    cond do
+      Keyword.has_key?(opts, :shell) -> {:ok, nil}
+      match?(%Instance{}, instance_or_ref) -> {:ok, instance_or_ref.shell}
+      true -> hydrated_shell(instance_or_ref, endpoint, opts)
     end
   end
 
-  defp resolve_ref(%Instance{id: id}, opts) when is_binary(id) do
-    {id, Provisioner.docker_options_from(opts)}
+  defp hydrated_shell(ref, endpoint, opts) do
+    case get(ref, endpoint, opts) do
+      {:ok, %Instance{shell: shell}} -> {:ok, shell}
+      _ -> {:ok, nil}
+    end
   end
 
-  defp resolve_ref(ref, opts) when is_binary(ref) do
-    {Spec.prefix_name(ref), Provisioner.docker_options_from(opts)}
+  defp resolve_ref(%Instance{id: id}, endpoint, opts) when is_binary(id) do
+    with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
+      {:ok, {id, docker_options}}
+    end
   end
 
-  defp resolve_container_id(%Instance{id: id}, opts) when is_binary(id) do
-    {:ok, id, Provisioner.docker_options_from(opts)}
+  defp resolve_ref(ref, endpoint, opts) when is_binary(ref) do
+    with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
+      {:ok, {Spec.prefix_name(ref), docker_options}}
+    end
   end
 
-  defp resolve_container_id(ref, opts) when is_binary(ref) do
-    docker_options = Provisioner.docker_options_from(opts)
+  defp resolve_container_id(%Instance{id: id}, endpoint, opts) when is_binary(id) do
+    with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
+      {:ok, id, docker_options}
+    end
+  end
 
+  defp resolve_container_id(ref, endpoint, opts) when is_binary(ref) do
+    with {:ok, docker_options} <- Provisioner.docker_options_from(endpoint, opts) do
+      lookup_container_id(ref, docker_options)
+    end
+  end
+
+  defp lookup_container_id(ref, docker_options) do
     case Docker.find_container(Spec.prefix_name(ref), docker_options) do
       {:ok, %{"Id" => id}} ->
         {:ok, id, docker_options}
@@ -1031,8 +1168,20 @@ defmodule Dockd do
     end
   end
 
+  # Retired keys get a message naming their positional replacement, so a caller
+  # who still passes one is told where the value moved rather than having it
+  # silently dropped.
   defp check_call_opts(call_opts) do
-    case Keyword.keys(call_opts) -- @apply_opts do
+    keys = Keyword.keys(call_opts)
+
+    case Enum.find(keys, &Map.has_key?(@retired_opts, &1)) do
+      nil -> check_unknown_opts(keys)
+      key -> {:error, retired_option_error(key)}
+    end
+  end
+
+  defp check_unknown_opts(keys) do
+    case keys -- @apply_opts do
       [] ->
         :ok
 
@@ -1041,37 +1190,14 @@ defmodule Dockd do
     end
   end
 
-  defp check_spec_instance_name(spec_opts) do
-    case Keyword.get(spec_opts, :instance_name) do
-      name when is_binary(name) and name !== "" ->
-        :ok
-
-      _ ->
-        {:error,
-         %Error{phase: :validate, message: "Dockd.apply/2 requires a non-empty :instance_name option"}}
-    end
+  defp retired_option_error(key) do
+    %Error{
+      phase: :validate,
+      message:
+        "#{Kernel.inspect(key)} is no longer an option; pass #{Map.fetch!(@retired_opts, key)}"
+    }
   end
 
-  defp check_attrs_instance_name(attrs) do
-    case Map.get(attrs, :instance_name) do
-      name when is_binary(name) and name !== "" ->
-        :ok
-
-      _ ->
-        {:error,
-         %Error{
-           phase: :validate,
-           message: ~s(package is missing a non-empty "instance_name" field)
-         }}
-    end
-  end
-
-  defp load_package_spec(path) do
-    with {:ok, decoded} <- Parser.parse_file(path),
-         {:ok, substituted} <- Interpolator.substitute(decoded, System.get_env()),
-         {:ok, attrs} <- Normalizer.normalize(substituted, Path.dirname(path)),
-         :ok <- check_attrs_instance_name(attrs) do
-      {:ok, Spec.from_attrs(attrs)}
-    end
-  end
+  defp prefix_message(%Error{message: message} = error, path),
+    do: %{error | message: "#{path}: #{message}"}
 end

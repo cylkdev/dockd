@@ -7,9 +7,12 @@ defmodule Dockd.Spec.Parser do
 
     - be a JSON object
     - contain only keys recognized by `Dockd.Spec`
-    - have a non-empty string `"instance_name"` key
-    - have a string `"image"` key
     - have a `"description"` value that is a string when present
+
+  Checks *shape*, not semantic required-ness. Whether `"image"` and
+  `"instance_name"` are present and usable is `Dockd.Spec.validate/1`'s job, so
+  that rule lives in exactly one place and reports one way for every
+  construction path.
 
   Does no `${VAR}` substitution and no attribute normalization — those belong to
   `Dockd.Spec.Interpolator` and `Dockd.Spec.Normalizer`.
@@ -50,11 +53,12 @@ defmodule Dockd.Spec.Parser do
   def parse(json_string) when is_binary(json_string) do
     with {:ok, value} <- decode_json(json_string),
          :ok <- ensure_object(value),
-         :ok <- check_unknown_keys(value),
-         :ok <- require_instance_name(value),
-         :ok <- check_description(value),
-         :ok <- require_image(value) do
-      {:ok, value}
+         :ok <- check_unknown_keys(value) do
+      check_description(value)
+      |> case do
+        :ok -> {:ok, value}
+        err -> err
+      end
     end
   end
 
@@ -96,19 +100,6 @@ defmodule Dockd.Spec.Parser do
 
   defp unknown_key_message(key), do: "unknown package key: #{inspect(key)}"
 
-  defp require_instance_name(map) do
-    case Map.get(map, "instance_name") do
-      instance_name when is_binary(instance_name) and instance_name !== "" ->
-        :ok
-
-      _ ->
-        {:error,
-         %Error{
-           phase: :validate,
-           message: ~s(package JSON requires a non-empty string "instance_name")
-         }}
-    end
-  end
 
   defp check_description(map) do
     case Map.get(map, "description") do
@@ -124,17 +115,4 @@ defmodule Dockd.Spec.Parser do
     end
   end
 
-  defp require_image(map) do
-    case Map.get(map, "image") do
-      nil ->
-        {:error,
-         %Error{phase: :validate, message: ~s(package JSON is missing required key: "image")}}
-
-      val when not is_binary(val) ->
-        {:error, %Error{phase: :validate, message: ~s(package JSON key "image" must be a string)}}
-
-      _ ->
-        :ok
-    end
-  end
 end
